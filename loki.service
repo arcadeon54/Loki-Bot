@@ -1,0 +1,32 @@
+[Unit]
+Description=Loki Discord Bot
+# Wait for network to be available before starting
+After=network.target
+
+[Service]
+# Run as your user (replace YOUR_USERNAME with your actual Linux username)
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+
+# Path to the bot folder
+WorkingDirectory=/home/YOUR_USERNAME/loki-bot
+
+# Command to start the bot using the virtual environment's Python
+ExecStart=/home/YOUR_USERNAME/loki-bot/venv/bin/python loki_bot.py
+
+# Auto-restart if the bot crashes
+Restart=always
+# Wait 10 seconds before restarting
+RestartSec=10
+
+# Environment (the .env file is loaded by the bot itself, but this ensures
+# the working directory is correct)
+Environment=PYTHONUNBUFFERED=1
+
+# Logging — sends output to journalctl
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Start automatically when the system boots
+WantedBy=multi-user.target
