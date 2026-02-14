@@ -116,6 +116,31 @@ The bot supports custom personalities per server. The `.env` `SYSTEM_PROMPT` is 
 
 Personalities are stored in the database and survive restarts.
 
+## Member Identity Mapping
+
+The bot includes each user's Discord ID in messages sent to the LLM, formatted as `[DisplayName (ID:123456789)]: message`. This allows the bot to recognize users even when they change their Discord nickname.
+
+To take advantage of this, include an identity map in your server's personality prompt using `/set_personality`. Add a block like this:
+
+```
+CRITICAL IDENTITY RULE: Each user message is formatted as [DisplayName (ID:number)].
+Use the ID number to identify who is talking, NOT the display name — people change
+their nicknames constantly. Here are the real identities:
+ID:123456789 = Alice.
+ID:987654321 = Bob.
+When you see a message from ID:123456789, that is ALWAYS Alice regardless of display name.
+When you see a message from ID:987654321, that is ALWAYS Bob regardless of display name.
+Always address them by their real name, not their display name.
+```
+
+### How to Get a User's Discord ID
+
+1. Open Discord **Settings > Advanced** and enable **Developer Mode**
+2. Right-click any user and select **Copy User ID**
+3. Add their ID and real name to your personality prompt as shown above
+
+This is especially useful when your personality prompt references specific people by name — the bot will always know who's who, even if someone's display name is completely different from their real name.
+
 ## License
 
 MIT
