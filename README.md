@@ -29,14 +29,15 @@ A conversational AI Discord bot with persistent memory, image recognition, voice
 
 ## Requirements
 
-- Linux (Ubuntu/Debian recommended)
 - Python 3.10+
 - ffmpeg (for voice features)
 - A Discord bot token
 - An OpenAI API key **or** a local LLM with an OpenAI-compatible API
 - (Optional) A Google Gemini API key for image recognition (free)
 
-## Quick Install
+---
+
+## Install on Linux
 
 ```bash
 git clone https://github.com/arcadeon54/Loki-Bot.git
@@ -50,9 +51,7 @@ The install script will:
 3. Install Python packages
 4. Set up the systemd service
 
-## Configuration
-
-After running the installer:
+### Configuration (Linux)
 
 1. **Edit the `.env` file** with your tokens:
    ```bash
@@ -69,7 +68,7 @@ After running the installer:
    - `OPENAI_MODEL` — Change the model (default: `gpt-4o`)
    - `CONTEXT_MESSAGE_COUNT` — How many past messages to include as context (default: 50)
 
-## Running the Bot
+### Running the Bot (Linux)
 
 **Test manually first:**
 ```bash
@@ -83,15 +82,101 @@ sudo systemctl enable loki
 sudo systemctl start loki
 ```
 
-**Check status:**
+**Check status / view logs:**
 ```bash
 sudo systemctl status loki
-```
-
-**View live logs:**
-```bash
 sudo journalctl -u loki -f
 ```
+
+---
+
+## Install on Windows
+
+### Prerequisites
+
+1. **Python 3.10+** — Download from [python.org](https://www.python.org/downloads/)
+   - **Important:** Check **"Add Python to PATH"** during installation
+2. **ffmpeg** (required for voice features) — Install using one of these methods:
+   - `winget install Gyan.FFmpeg` (Windows 10/11 with App Installer)
+   - `choco install ffmpeg` (if you have [Chocolatey](https://chocolatey.org/))
+   - Or download manually from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
+3. **Git** (optional) — [git-scm.com](https://git-scm.com/download/win), or just download the ZIP from GitHub
+
+### Quick Install (Windows)
+
+**Option A — With Git:**
+```cmd
+git clone https://github.com/arcadeon54/Loki-Bot.git
+cd Loki-Bot
+install_windows.bat
+```
+
+**Option B — Without Git:**
+1. Download the ZIP from the green **Code** button on GitHub
+2. Extract it to a folder (e.g., `C:\Loki-Bot`)
+3. Double-click `install_windows.bat`
+
+The install script will:
+1. Check that Python and ffmpeg are available
+2. Create a Python virtual environment
+3. Install Python packages
+4. Create a `.env` template file
+
+### Configuration (Windows)
+
+1. **Edit the `.env` file** with your tokens:
+   ```cmd
+   notepad .env
+   ```
+
+2. **Required settings:**
+   - `DISCORD_TOKEN` — Your Discord bot token ([get one here](https://discord.com/developers/applications))
+   - `OPENAI_API_KEY` — Your OpenAI API key ([get one here](https://platform.openai.com/api-keys)), **or** set `LLM_PROVIDER=local` and configure `LOCAL_LLM_URL`
+
+3. **Optional settings:**
+   - `GEMINI_API_KEY` — For image/GIF recognition ([free key here](https://aistudio.google.com/app/apikey))
+   - `SYSTEM_PROMPT` — The default personality prompt (server admins can override per-server)
+   - `OPENAI_MODEL` — Change the model (default: `gpt-4o`)
+   - `CONTEXT_MESSAGE_COUNT` — How many past messages to include as context (default: 50)
+
+### Running the Bot (Windows)
+
+**Test manually first:**
+```cmd
+venv\Scripts\activate
+python loki_bot.py
+```
+
+**Run on startup with Task Scheduler:**
+
+1. Open **Task Scheduler** (search for it in the Start menu)
+2. Click **Create Basic Task**
+3. Name it `Loki Bot` and click Next
+4. Trigger: **When the computer starts** → Next
+5. Action: **Start a program** → Next
+6. Program/script: Browse to `pythonw.exe` inside your venv:
+   ```
+   C:\Loki-Bot\venv\Scripts\pythonw.exe
+   ```
+7. Add arguments:
+   ```
+   loki_bot.py
+   ```
+8. Start in:
+   ```
+   C:\Loki-Bot
+   ```
+9. Check **Open the Properties dialog** → Finish
+10. In Properties, check **Run whether user is logged on or not**
+
+**Alternatively, create a simple start script** — save this as `start_loki.bat` in your Loki-Bot folder:
+```bat
+@echo off
+cd /d "%~dp0"
+call venv\Scripts\activate
+python loki_bot.py
+```
+Double-click it to start the bot, or add it to your Startup folder (`shell:startup`).
 
 ## Discord Bot Setup
 
