@@ -8,7 +8,6 @@ A conversational AI Discord bot with:
   - Voice chat with male TTS voice
   - Summarize command
   - Support for ChatGPT API or local LLM
-  - Per-server personality prompts
 =============================================================================
 """
 
@@ -16,11 +15,13 @@ import os
 import io
 import re
 import json
+import time
 import sqlite3
 import asyncio
 import logging
 import datetime
 from pathlib import Path
+from collections import defaultdict
 from dotenv import load_dotenv
 
 import discord
@@ -40,6 +41,7 @@ OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o")
 LOCAL_LLM_URL        = os.getenv("LOCAL_LLM_URL", "http://localhost:1234/v1")
 LOCAL_LLM_MODEL      = os.getenv("LOCAL_LLM_MODEL", "local-model")
 GEMINI_API_KEY       = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL         = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 SYSTEM_PROMPT        = os.getenv("SYSTEM_PROMPT", "You are Loki, the God of Mischief.")
 MEMORY_DB_PATH       = os.getenv("MEMORY_DB_PATH", "loki_memory.db")
 CONTEXT_MESSAGE_COUNT = int(os.getenv("CONTEXT_MESSAGE_COUNT", "50"))
@@ -57,7 +59,17 @@ log = logging.getLogger("LokiBot")
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 # Names the bot responds to (case-insensitive matching is done in code)
-TRIGGER_NAMES = ["loki"]
+TRIGGER_NAMES = ["loki", "asshole"]
+
+# Special user & emoji response
+SPECIAL_USER_ID = 444718168225611776
+SPECIAL_EMOJI   = "👀"
+SPECIAL_RESPONSE = (
+    "<:emoji_10:1429477074913071174> Sheridan, please!!!"
+    "<:emoji_10:1429477074913071174> Those eyes are HELLA DELULU "
+    "<:emoji_10:1429477074913071174> It seems you just love pushing "
+    "those buttons, huh? <:emoji_10:1429477074913071174>"
+)
 
 
 # =============================================================================
@@ -105,6 +117,15 @@ class MemoryDB:
                 timestamp   TEXT
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS personality_additions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    TEXT,
+                addition    TEXT,
+                added_by    TEXT,
+                timestamp   TEXT
+            )
+        """)
         self.conn.commit()
 
     def store_message(self, guild_id, channel_id, user_id, username, role,
@@ -125,7 +146,7 @@ class MemoryDB:
     def get_recent_messages(self, channel_id, limit=50):
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT user_id, username, role, content, image_desc, timestamp
+            SELECT username, role, content, image_desc, timestamp
             FROM messages
             WHERE channel_id = ?
             ORDER BY id DESC
@@ -189,28 +210,101 @@ class MemoryDB:
         )
         self.conn.commit()
 
+    # ── Personality Additions (append without replacing) ──────────────────
+    def add_personality_addition(self, guild_id, addition, added_by):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO personality_additions
+                (guild_id, addition, added_by, timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (
+            str(guild_id), addition, added_by,
+            datetime.datetime.utcnow().isoformat()
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_personality_additions(self, guild_id):
+        """Returns list of (id, addition, added_by, timestamp)."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT id, addition, added_by, timestamp
+            FROM personality_additions
+            WHERE guild_id = ?
+            ORDER BY id ASC
+        """, (str(guild_id),))
+        return cursor.fetchall()
+
+    def remove_personality_addition(self, addition_id, guild_id):
+        """Remove a specific addition by ID. Returns True if something was deleted."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM personality_additions WHERE id = ? AND guild_id = ?",
+            (addition_id, str(guild_id))
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def clear_personality_additions(self, guild_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM personality_additions WHERE guild_id = ?",
+            (str(guild_id),)
+        )
+        self.conn.commit()
+
 
 # =============================================================================
 #  IMAGE RECOGNITION — Google Gemini (Free Tier)
 # =============================================================================
 class VisionHandler:
-    """Handles image/GIF analysis using Google Gemini's free API."""
+    """Handles image/GIF analysis using Google Gemini's free API.
+    Includes rate limiting to avoid burning through the free tier quota."""
 
     def __init__(self, api_key: str):
         if api_key:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel("gemini-2.0-flash")
+            # Use 1.5 Flash by default — more generous free tier (15 RPM vs 10 RPM)
+            # Configurable via GEMINI_MODEL in .env
+            self.model = genai.GenerativeModel(GEMINI_MODEL)
             self.enabled = True
-            log.info("Gemini vision initialized")
+            log.info(f"Gemini vision initialized ({GEMINI_MODEL})")
         else:
             self.enabled = False
             log.warning("No GEMINI_API_KEY — image recognition disabled")
+
+        # Rate limiting: max 8 requests/minute, 200/hour to stay safe
+        self._minute_requests: list[float] = []
+        self._hour_requests: list[float] = []
+        self.MAX_PER_MINUTE = 8
+        self.MAX_PER_HOUR = 200
+
+    def _rate_limit_ok(self) -> bool:
+        """Check if we're within rate limits. Returns True if safe to proceed."""
+        now = time.time()
+        # Clean old entries
+        self._minute_requests = [t for t in self._minute_requests if now - t < 60]
+        self._hour_requests = [t for t in self._hour_requests if now - t < 3600]
+
+        if len(self._minute_requests) >= self.MAX_PER_MINUTE:
+            log.warning("Gemini rate limit: per-minute cap reached, skipping image")
+            return False
+        if len(self._hour_requests) >= self.MAX_PER_HOUR:
+            log.warning("Gemini rate limit: per-hour cap reached, skipping image")
+            return False
+
+        self._minute_requests.append(now)
+        self._hour_requests.append(now)
+        return True
 
     async def describe_image(self, image_bytes: bytes, mime_type: str,
                              context: str = "") -> str:
         """Send image to Gemini and get a description."""
         if not self.enabled:
             return "[Image recognition not available]"
+
+        if not self._rate_limit_ok():
+            return "[Image skipped — rate limit reached, will resume shortly]"
 
         try:
             prompt = (
@@ -269,7 +363,7 @@ class LLMHandler:
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_completion_tokens": 1024,
+            "max_tokens": 1024,
             "temperature": 0.85,
         }
 
@@ -300,49 +394,50 @@ class VoiceHandler:
 
     async def join(self, voice_channel: discord.VoiceChannel) -> discord.VoiceClient:
         guild_id = voice_channel.guild.id
-        guild = voice_channel.guild
 
-        # Clean up stale/dead connections from our dict
+        # Clean up stale connection if one exists
         if guild_id in self.voice_clients:
-            existing = self.voice_clients[guild_id]
-            if existing.is_connected():
-                await existing.move_to(voice_channel)
-                return existing
+            old_vc = self.voice_clients[guild_id]
+            if old_vc.is_connected():
+                # Already connected — just move to the new channel
+                await old_vc.move_to(voice_channel)
+                return old_vc
             else:
-                # Ghost connection — force cleanup
-                log.warning(f"Cleaning up stale voice connection for guild {guild_id}")
+                # Stale/dead connection — clean it up
                 try:
-                    await existing.disconnect(force=True)
+                    await old_vc.disconnect(force=True)
                 except Exception:
                     pass
                 del self.voice_clients[guild_id]
 
-        # Also clean up Discord's own tracked voice client if out of sync
-        if guild.voice_client is not None:
-            log.warning(f"Cleaning up orphaned guild.voice_client for guild {guild_id}")
+        # Also check if the bot is somehow connected via guild.voice_client
+        # (this catches connections that survived a restart or weren't tracked)
+        if voice_channel.guild.voice_client:
             try:
-                await guild.voice_client.disconnect(force=True)
+                await voice_channel.guild.voice_client.disconnect(force=True)
             except Exception:
                 pass
 
-        vc = await voice_channel.connect()
-        self.voice_clients[guild_id] = vc
-        return vc
+        try:
+            vc = await voice_channel.connect(timeout=30.0, reconnect=True)
+            self.voice_clients[guild_id] = vc
+            return vc
+        except discord.ClientException as e:
+            # "Already connected" edge case — force disconnect and retry
+            log.warning(f"Voice connect ClientException: {e} — forcing reconnect")
+            if voice_channel.guild.voice_client:
+                await voice_channel.guild.voice_client.disconnect(force=True)
+            vc = await voice_channel.connect(timeout=30.0, reconnect=True)
+            self.voice_clients[guild_id] = vc
+            return vc
 
-    async def leave(self, guild_id: int, guild: discord.Guild = None):
+    async def leave(self, guild_id: int):
         if guild_id in self.voice_clients:
             try:
                 await self.voice_clients[guild_id].disconnect(force=True)
             except Exception:
                 pass
             del self.voice_clients[guild_id]
-
-        # Also disconnect Discord's own tracked client if present
-        if guild and guild.voice_client is not None:
-            try:
-                await guild.voice_client.disconnect(force=True)
-            except Exception:
-                pass
 
     async def speak(self, vc: discord.VoiceClient, text: str):
         """Generate TTS audio with a male voice and play it."""
@@ -358,6 +453,10 @@ class VoiceHandler:
             communicate = edge_tts.Communicate(text, voice)
             audio_path = "/tmp/loki_tts.mp3"
             await communicate.save(audio_path)
+
+            if not vc.is_connected():
+                log.error("Voice client disconnected before TTS could play")
+                return
 
             if vc.is_playing():
                 vc.stop()
@@ -402,31 +501,26 @@ def is_trigger(text: str) -> bool:
     return False
 
 
-SERIOUS_PROMPT = (
-    "You are Loki, but the user has requested a serious response. "
-    "Drop the mischief, sarcasm, and theatrics. Answer genuinely, "
-    "thoughtfully, and directly — like someone intelligent who actually "
-    "gives a damn. Be honest, be helpful, no character games."
-)
-
-
-def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
-                       serious: bool = False) -> list[dict]:
+def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "") -> list[dict]:
     """Build the messages list for the LLM, including system prompt,
     recent memory, and any extra user message.
     Uses per-server personality if one is set, otherwise falls back to
     the default SYSTEM_PROMPT from .env."""
 
-    # Serious mode overrides everything
-    if serious:
-        prompt = SERIOUS_PROMPT
-    else:
-        # Check for a server-specific personality first
-        prompt = SYSTEM_PROMPT
-        if guild_id:
-            server_personality = memory.get_server_personality(guild_id)
-            if server_personality:
-                prompt = server_personality[0]  # (prompt, set_by, timestamp)
+    # Check for a server-specific personality first
+    prompt = SYSTEM_PROMPT
+    if guild_id:
+        server_personality = memory.get_server_personality(guild_id)
+        if server_personality:
+            prompt = server_personality[0]  # (prompt, set_by, timestamp)
+
+    # Append any personality additions for this server
+    if guild_id:
+        additions = memory.get_personality_additions(guild_id)
+        if additions:
+            extra_traits = "\n\nAdditional personality traits and instructions:\n"
+            extra_traits += "\n".join(f"- {a[1]}" for a in additions)
+            prompt += extra_traits
 
     msgs = [{"role": "system", "content": prompt}]
 
@@ -440,11 +534,11 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
 
     # Add recent conversation history
     recent = memory.get_recent_messages(channel_id, CONTEXT_MESSAGE_COUNT)
-    for user_id, username, role, content, image_desc, ts in recent:
+    for username, role, content, image_desc, ts in recent:
         if role == "assistant":
             msgs.append({"role": "assistant", "content": content})
         else:
-            text = f"[{username} (ID:{user_id})]: {content}"
+            text = f"[{username}]: {content}"
             if image_desc:
                 text += f"\n[Image in message: {image_desc}]"
             msgs.append({"role": "user", "content": text})
@@ -473,6 +567,12 @@ async def on_message(message: discord.Message):
     # Never reply to ourselves
     if message.author.id == bot.user.id:
         return
+
+    # ── Special Emoji Response for Sheridan ────────────────────────────────
+    if (message.author.id == SPECIAL_USER_ID
+            and SPECIAL_EMOJI in message.content):
+        await message.channel.send(SPECIAL_RESPONSE)
+        # Don't return — still process the rest in case she also said "Loki"
 
     # ── Process images / GIFs attached to ANY message for context ──────────
     image_desc = ""
@@ -512,18 +612,6 @@ async def on_message(message: discord.Message):
 
     image_desc = image_desc.strip()
 
-    # ── Store every message in memory (for context) ───────────────────────
-    memory.store_message(
-        guild_id=message.guild.id if message.guild else 0,
-        channel_id=message.channel.id,
-        user_id=message.author.id,
-        username=message.author.display_name,
-        role="user",
-        content=message.content,
-        has_image=bool(image_desc),
-        image_desc=image_desc
-    )
-
     # ── Check if bot should respond ───────────────────────────────────────
     should_respond = False
 
@@ -541,28 +629,32 @@ async def on_message(message: discord.Message):
             and message.reference.resolved.author.id == bot.user.id):
         should_respond = True
 
+    # ── Store every message in memory (for context) ───────────────────────
+    # NOTE: We store AFTER the trigger check but BEFORE calling the LLM,
+    # so it's in the DB when build_llm_messages pulls recent history.
+    # We do NOT pass it again as extra_user_msg to avoid duplication.
+    memory.store_message(
+        guild_id=message.guild.id if message.guild else 0,
+        channel_id=message.channel.id,
+        user_id=message.author.id,
+        username=message.author.display_name,
+        role="user",
+        content=message.content,
+        has_image=bool(image_desc),
+        image_desc=image_desc
+    )
+
     if not should_respond:
         await bot.process_commands(message)
         return
 
-    # ── Check for serious mode prefix (-s) ───────────────────────────────
-    serious = False
-    content_text = message.content
-    if content_text.lstrip().startswith("-s ") or content_text.lstrip() == "-s":
-        serious = True
-        content_text = content_text.lstrip().removeprefix("-s").strip()
-
     # ── Build prompt & get reply ──────────────────────────────────────────
     async with message.channel.typing():
-        user_text = f"[{message.author.display_name} (ID:{message.author.id})]: {content_text}"
-        if image_desc:
-            user_text += f"\n[They posted an image: {image_desc}]"
-
+        # The user's message is already in the DB from the store above,
+        # so build_llm_messages will pick it up — no extra_user_msg needed.
         messages_for_llm = build_llm_messages(
             message.channel.id,
             guild_id=message.guild.id if message.guild else None,
-            extra_user_msg=user_text,
-            serious=serious
         )
         reply = await llm.chat(messages_for_llm)
 
@@ -602,9 +694,9 @@ async def summarize(interaction: discord.Interaction):
         return
 
     convo_text = "\n".join(
-        f"[{ts}] {username} (ID:{user_id}): {content}"
+        f"[{ts}] {username}: {content}"
         + (f" [Image: {img}]" if img else "")
-        for user_id, username, role, content, img, ts in recent
+        for username, role, content, img, ts in recent
     )
 
     summary_prompt = [
@@ -651,15 +743,25 @@ async def loki_join(interaction: discord.Interaction):
     except Exception as e:
         log.error(f"Failed to join voice channel: {e}")
         await interaction.followup.send(
-            f"Failed to join the voice channel: {e}", ephemeral=True
+            f"Couldn't join the voice channel: `{e}`\n"
+            "Make sure I have **Connect** and **Speak** permissions.",
+            ephemeral=True
         )
 
 
 @bot.tree.command(name="loki_leave", description="Loki leaves the voice channel")
 async def loki_leave(interaction: discord.Interaction):
     guild_id = interaction.guild.id
+
+    # Check both our tracked dict AND Discord's own voice_client
     if guild_id in voice_h.voice_clients or interaction.guild.voice_client:
-        await voice_h.leave(guild_id, guild=interaction.guild)
+        await voice_h.leave(guild_id)
+        # Fallback: disconnect guild voice_client if it wasn't tracked
+        if interaction.guild.voice_client:
+            try:
+                await interaction.guild.voice_client.disconnect(force=True)
+            except Exception:
+                pass
         await interaction.response.send_message("Fine. I'll leave. For now. 🐍")
     else:
         await interaction.response.send_message("I'm not in a voice channel!", ephemeral=True)
@@ -697,7 +799,7 @@ async def loki_speak(interaction: discord.Interaction, question: str):
     messages_for_llm = build_llm_messages(
         interaction.channel.id,
         guild_id=interaction.guild.id if interaction.guild else None,
-        extra_user_msg=f"[{interaction.user.display_name} (ID:{interaction.user.id})]: {question}"
+        extra_user_msg=f"[{interaction.user.display_name}]: {question}"
     )
     reply = await llm.chat(messages_for_llm)
 
@@ -725,8 +827,7 @@ async def loki_speak(interaction: discord.Interaction, question: str):
     await interaction.followup.send(f"**Q:** {question}\n**Loki:** {reply}")
 
 
-@bot.tree.command(name="loki_reset", description="Clear Loki's memory for this channel (Admin only)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="loki_reset", description="Clear Loki's memory for this channel")
 async def loki_reset(interaction: discord.Interaction):
     cursor = memory.conn.cursor()
     cursor.execute(
@@ -774,9 +875,8 @@ async def set_personality(interaction: discord.Interaction, prompt: str):
 
 @bot.tree.command(
     name="view_personality",
-    description="View the current personality prompt for this server (Admin only)"
+    description="View the current personality prompt for this server"
 )
-@app_commands.checks.has_permissions(administrator=True)
 async def view_personality(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("This only works in a server!", ephemeral=True)
@@ -832,13 +932,141 @@ async def reset_personality(interaction: discord.Interaction):
 
 
 @set_personality.error
-@view_personality.error
 @reset_personality.error
-@loki_reset.error
-async def admin_permission_error(interaction: discord.Interaction, error):
+async def personality_permission_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
-            "⛔ Only server admins can use this command.", ephemeral=True
+            "⛔ Only server admins can change the personality.", ephemeral=True
+        )
+
+
+# ─── Personality Addition Commands ────────────────────────────────────────────
+
+@bot.tree.command(
+    name="add_trait",
+    description="Add a new trait/instruction to the personality without replacing it (Admin only)"
+)
+@app_commands.describe(trait="The new trait, behavior, or instruction to add")
+@app_commands.checks.has_permissions(administrator=True)
+async def add_trait(interaction: discord.Interaction, trait: str):
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server!", ephemeral=True)
+        return
+
+    row_id = memory.add_personality_addition(
+        guild_id=interaction.guild.id,
+        addition=trait,
+        added_by=interaction.user.display_name
+    )
+
+    # Count total additions
+    all_additions = memory.get_personality_additions(interaction.guild.id)
+    count = len(all_additions)
+
+    embed = discord.Embed(
+        title="✅ Personality Trait Added",
+        description=f"**#{count}:** {trait}",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=f"Added by {interaction.user.display_name} • Use /view_traits to see all • /remove_trait to remove")
+    await interaction.response.send_message(embed=embed)
+    log.info(f"Personality trait added for guild {interaction.guild.id}: {trait[:80]}...")
+
+
+@bot.tree.command(
+    name="view_traits",
+    description="View all personality additions for this server (Admin only)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def view_traits(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server!", ephemeral=True)
+        return
+
+    additions = memory.get_personality_additions(interaction.guild.id)
+
+    if not additions:
+        await interaction.response.send_message(
+            "No personality additions yet. Use `/add_trait` to add some!",
+            ephemeral=True
+        )
+        return
+
+    lines = []
+    for i, (row_id, addition, added_by, timestamp) in enumerate(additions, 1):
+        date = timestamp[:10] if timestamp else "?"
+        # Truncate long additions for the list view
+        preview = addition[:150] + "..." if len(addition) > 150 else addition
+        lines.append(f"**{i}.** (ID: {row_id}) {preview}\n   *— added by {added_by} on {date}*")
+
+    description = "\n\n".join(lines)
+    # Truncate if it exceeds embed limits
+    if len(description) > 3900:
+        description = description[:3900] + "\n\n*...truncated. Too many additions to display.*"
+
+    embed = discord.Embed(
+        title=f"🎭 Personality Additions ({len(additions)} total)",
+        description=description,
+        color=discord.Color.purple()
+    )
+    embed.set_footer(text="Use /remove_trait <ID number> to remove one, or /clear_traits to remove all")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="remove_trait",
+    description="Remove a specific personality addition by its ID (Admin only)"
+)
+@app_commands.describe(trait_id="The ID number shown in /view_traits (the number after 'ID:')")
+@app_commands.checks.has_permissions(administrator=True)
+async def remove_trait(interaction: discord.Interaction, trait_id: int):
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server!", ephemeral=True)
+        return
+
+    removed = memory.remove_personality_addition(trait_id, interaction.guild.id)
+
+    if removed:
+        await interaction.response.send_message(f"🗑️ Trait #{trait_id} removed.")
+    else:
+        await interaction.response.send_message(
+            f"Couldn't find trait with ID {trait_id} in this server. "
+            f"Use `/view_traits` to see current IDs.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(
+    name="clear_traits",
+    description="Remove ALL personality additions for this server (Admin only)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def clear_traits(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server!", ephemeral=True)
+        return
+
+    additions = memory.get_personality_additions(interaction.guild.id)
+    if not additions:
+        await interaction.response.send_message(
+            "No personality additions to clear.", ephemeral=True
+        )
+        return
+
+    memory.clear_personality_additions(interaction.guild.id)
+    await interaction.response.send_message(
+        f"🧹 Cleared {len(additions)} personality addition(s). Back to base prompt only."
+    )
+
+
+@add_trait.error
+@view_traits.error
+@remove_trait.error
+@clear_traits.error
+async def trait_permission_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "⛔ Only server admins can modify personality traits.", ephemeral=True
         )
 
 
