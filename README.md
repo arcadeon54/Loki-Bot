@@ -1,17 +1,19 @@
 # Loki Bot — AI Discord Bot
 
-A conversational AI Discord bot with persistent memory, image recognition, voice chat, per-server personalities, and support for ChatGPT or local LLMs.
+A conversational AI Discord bot with persistent memory, image recognition, voice chat, per-server personalities, dynamic personality traits, and support for ChatGPT or local LLMs.
 
 ## Features
 
 - **Conversational AI** — Responds to mentions, name triggers, and replies with context-aware conversation
 - **Persistent Memory** — SQLite-backed conversation history that survives restarts
-- **Image/GIF Recognition** — Analyzes images and GIFs using Google Gemini (free tier)
+- **Image/GIF Recognition** — Analyzes images and GIFs using Google Gemini with built-in rate limiting to stay within free tier limits
 - **Voice Chat** — Joins voice channels and speaks with TTS (edge-tts)
 - **Per-Server Personalities** — Each server admin can set a custom personality prompt
+- **Dynamic Personality Traits** — Add, view, and remove personality traits on the fly without rewriting the entire prompt
 - **Serious Mode** — Prefix a message with `-s` to get a straight answer without the persona
 - **Summarize** — `/summarize` to get an AI summary of recent conversation
 - **ChatGPT or Local LLM** — Works with OpenAI API or any local LLM with an OpenAI-compatible endpoint (LM Studio, Ollama, etc.)
+- **Configurable Gemini Model** — Switch between Gemini models via `.env` without editing code
 
 ## Slash Commands
 
@@ -26,6 +28,10 @@ A conversational AI Discord bot with persistent memory, image recognition, voice
 | `/set_personality [prompt]` | Set a custom personality for this server | Admin only |
 | `/view_personality` | View the current personality prompt | Admin only |
 | `/reset_personality` | Reset to the default personality | Admin only |
+| `/add_trait [text]` | Add a new personality trait | Admin only |
+| `/view_traits` | View all personality traits with their IDs | Admin only |
+| `/remove_trait [ID]` | Remove a specific trait by its ID | Admin only |
+| `/clear_traits` | Remove all personality traits | Admin only |
 
 ## Requirements
 
@@ -64,6 +70,7 @@ The install script will:
 
 3. **Optional settings:**
    - `GEMINI_API_KEY` — For image/GIF recognition ([free key here](https://aistudio.google.com/app/apikey))
+   - `GEMINI_MODEL` — Which Gemini model to use for image recognition (default: `gemini-1.5-flash`)
    - `SYSTEM_PROMPT` — The default personality prompt (server admins can override per-server)
    - `OPENAI_MODEL` — Change the model (default: `gpt-4o`)
    - `CONTEXT_MESSAGE_COUNT` — How many past messages to include as context (default: 50)
@@ -135,6 +142,7 @@ The install script will:
 
 3. **Optional settings:**
    - `GEMINI_API_KEY` — For image/GIF recognition ([free key here](https://aistudio.google.com/app/apikey))
+   - `GEMINI_MODEL` — Which Gemini model to use for image recognition (default: `gemini-1.5-flash`)
    - `SYSTEM_PROMPT` — The default personality prompt (server admins can override per-server)
    - `OPENAI_MODEL` — Change the model (default: `gpt-4o`)
    - `CONTEXT_MESSAGE_COUNT` — How many past messages to include as context (default: 50)
@@ -201,6 +209,18 @@ The bot supports custom personalities per server. The `.env` `SYSTEM_PROMPT` is 
 
 Personalities are stored in the database and survive restarts.
 
+## Dynamic Personality Traits
+
+Instead of rewriting the entire personality prompt every time you want to tweak the bot's behavior, you can add individual traits that stack on top of the base personality:
+
+```
+/add_trait Loki has a particular hatred for Mondays and brings it up often
+/add_trait When someone mentions pizza, Loki goes on a passionate rant about how pineapple belongs on it
+/add_trait Loki refers to the user named Jake as "the mortal who owes me a debt"
+```
+
+Each trait is stored in the database with an ID. Use `/view_traits` to see all active traits, `/remove_trait [ID]` to remove a specific one, or `/clear_traits` to wipe them all. The base personality prompt (from `/set_personality` or `.env`) is never modified — traits are layered on top.
+
 ## Member Identity Mapping
 
 The bot includes each user's Discord ID in messages sent to the LLM, formatted as `[DisplayName (ID:123456789)]: message`. This allows the bot to recognize users even when they change their Discord nickname.
@@ -225,6 +245,21 @@ Always address them by their real name, not their display name.
 3. Add their ID and real name to your personality prompt as shown above
 
 This is especially useful when your personality prompt references specific people by name — the bot will always know who's who, even if someone's display name is completely different from their real name.
+
+## Changelog
+
+### v1.1 — 2026-02-21
+
+- **Fixed duplicate message bug** — The bot no longer tells users they said something twice. Messages are now stored once and not duplicated when building the LLM prompt.
+- **Fixed voice join/leave** — Stale voice connections are properly cleaned up with improved error handling.
+- **Added dynamic personality traits** — `/add_trait`, `/view_traits`, `/remove_trait`, `/clear_traits` commands let admins modify the bot's personality on the fly without rewriting the full prompt.
+- **Added Gemini rate limiter** — Built-in rate limiting (8/min, 200/hr) prevents quota exhaustion on the free tier instead of hitting API errors.
+- **Switched to Gemini 1.5 Flash** — More generous free tier limits (15 req/min vs 10 for 2.0 Flash).
+- **Configurable Gemini model** — New `GEMINI_MODEL` setting in `.env` to switch models without editing code.
+
+### v1.0 — 2026-02-15
+
+- Initial release
 
 ## License
 
