@@ -363,7 +363,7 @@ class LLMHandler:
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 1024,
+            "max_completion_tokens": 1024,
             "temperature": 0.85,
         }
 
