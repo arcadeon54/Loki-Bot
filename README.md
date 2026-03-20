@@ -1,37 +1,111 @@
-# Loki Bot — AI Discord Bot
+# Project: L.O.K.I. [Learning Oriented Kinetic Intelligence]
 
-A conversational AI Discord bot with persistent memory, image recognition, voice chat, per-server personalities, dynamic personality traits, and support for ChatGPT or local LLMs.
+A feature-rich, personality-driven AI Discord bot with persistent memory, multi-LLM support, voice capabilities, media downloads, and deep conversation recall.
+
+---
 
 ## Features
 
-- **Conversational AI** — Responds to mentions, name triggers, and replies with context-aware conversation
+### Conversational AI
+- **Intent Classification** — Automatically classifies messages (chat, emotional, question, command, etc.) and routes to the appropriate LLM
+- **Emotion Detection** — Detects emotional tone per message for context-aware responses
+- **Smart Model Routing** — Routes cheap/simple tasks (intent classification, quick lookups) to a fast/cheap LLM, and complex tasks to a primary LLM
+- **Serious Mode** — Prefix any message with `-s` to get a straight, persona-free answer
+- **Correction Detection** — Learns from corrections and adjusts responses accordingly
+
+### Multi-LLM Support
+- **OpenAI** — Primary LLM provider (GPT-4o or any OpenAI-compatible model)
+- **Groq** — Fallback/cheap LLM for intent classification and simple tasks
+- **Local LLM** — Support for any OpenAI-compatible local endpoint (LM Studio, Ollama, text-generation-webui)
+
+### Memory & Learning
 - **Persistent Memory** — SQLite-backed conversation history that survives restarts
-- **Image/GIF Recognition** — Analyzes images and GIFs using Google Gemini with built-in rate limiting to stay within free tier limits
-- **Voice Chat** — Joins voice channels and speaks with TTS (edge-tts)
-- **Per-Server Personalities** — Each server admin can set a custom personality prompt
-- **Dynamic Personality Traits** — Add, view, and remove personality traits on the fly without rewriting the entire prompt
-- **Serious Mode** — Prefix a message with `-s` to get a straight answer without the persona
-- **Summarize** — `/summarize` to get an AI summary of recent conversation
-- **ChatGPT or Local LLM** — Works with OpenAI API or any local LLM with an OpenAI-compatible endpoint (LM Studio, Ollama, etc.)
-- **Configurable Gemini Model** — Switch between Gemini models via `.env` without editing code
+- **Deep Memory Search** — ChromaDB RAG integration for searching across full conversation history
+- **Self-Learning Personality** — Automatically writes personality learnings to a file every 6 hours
+- **Relationship Memory** — Per-user personality notes updated every 10 interactions
+- **Per-Server Personalities** — Each server admin can set a custom personality prompt via `/set_personality`
+
+### Voice Capabilities
+- **Voice Message Transcription** — Automatically transcribes Discord voice messages using Groq Whisper
+- **Voice Message Responses** — Responds with audio when triggered via voice message (voice-in = voice-out)
+- **TTS via ElevenLabs** — High-quality text-to-speech with configurable voice
+- **edge-tts Fallback** — Free, unlimited TTS fallback when ElevenLabs is unavailable
+- **Voice Chat** — Join voice channels and speak with `/loki_join`, `/loki_say`, `/loki_speak`
+
+### Image & GIF Recognition
+- **Google Gemini Vision** — Analyzes images and GIFs attached to messages (free tier)
+- **Context-Aware** — Incorporates image descriptions into conversation context
+
+### Media Downloads
+Downloads media from **10+ platforms** with an intelligent fallback chain:
+- **TikTok** — Watermark-free via Cobalt, with TikWM fallback
+- **Instagram** — Reels, posts, and stories via Cobalt, SnapInsta, and yt-dlp
+- **Twitter/X** — Via FxTwitter API and Cobalt
+- **YouTube** — Via Cobalt and yt-dlp
+- **Reddit** — Direct images, Cobalt, yt-dlp with cookies, gallery-dl
+- **Facebook** — Via FBDownloader scrapers
+- **Threads** — Via SaveThreads/ThreadSave scrapers
+- **Pinterest** — Via PinterestDownloader scraper
+- **Direct Image URLs** — Automatic detection and download with cookie support
+
+**Additional download features:**
+- **Self-hosted Cobalt** — Watermark-free downloads from multiple platforms
+- **Media File Server** — Automatic fallback to a file server URL for files too large for Discord upload
+- **Automatic Compression** — Attempts 480p then 360p compression before file server fallback
+- **Auto-Download** — Optionally auto-download TikTok/Instagram links from a specific user
+- **Natural Language Trigger** — Say "post this [url]" to trigger a download
+- **`/download` Command** — Manual download trigger
+
+### Conversation Features
+- **"What Did I Miss?"** — Natural language detection for catch-up summaries
+- **Unprompted Interjections** — Mood-aware interjections with drift (chill/active/hyped/late_night)
+- **Open Thread Detection** — Runs periodically to follow up on unresolved topics
+- **Tea Flagging** — Tracks drama/gossip moments with reactions and keywords
+- **@Mention Support** — Member directory injected into LLM context for accurate user identification
+
+### Web Search
+- **Tavily Integration** — Real-time web search for factual questions, automatically triggered by question intent
+
+### Natural Language Reminders
+- Supports "in X minutes/hours", "at 5pm", "tomorrow at X", "tonight at X"
+- Stored in SQLite, checked every minute
+- Fires with user ping
+
+### Wit & Quips
+- Snarky/roast quotes with configurable frequency
+- Rate-limited to prevent overuse
+- Only fires in non-serious conversations
+
+### Bot-to-Bot Coordination
+- Shared state file for coordinating with other bots
+- Prevents response conflicts and enables cooperative behavior
+
+### Claude Code Integration
+- `/cc` slash command for running Claude Code queries
+- Configurable binary path, workspace, and timeout
+
+### Channel Summarization
+- `/summarize` — AI-powered summary of recent channel conversation
+
+---
 
 ## Slash Commands
 
 | Command | Description | Permission |
 |---------|-------------|------------|
-| `/summarize` | Summarize the last ~20 messages | Everyone |
+| `/summarize` | Summarize recent conversation | Everyone |
+| `/download [url]` | Download media from a URL | Everyone |
+| `/cc [query]` | Run a Claude Code query | Everyone |
 | `/loki_join` | Bot joins your voice channel | Everyone |
 | `/loki_leave` | Bot leaves the voice channel | Everyone |
 | `/loki_say [text]` | Bot speaks text in voice chat | Everyone |
-| `/loki_speak [question]` | Ask a question and hear the answer in voice | Everyone |
-| `/loki_reset` | Clear bot memory for this channel | Admin only |
-| `/set_personality [prompt]` | Set a custom personality for this server | Admin only |
-| `/view_personality` | View the current personality prompt | Admin only |
-| `/reset_personality` | Reset to the default personality | Admin only |
-| `/add_trait [text]` | Add a new personality trait | Admin only |
-| `/view_traits` | View all personality traits with their IDs | Admin only |
-| `/remove_trait [ID]` | Remove a specific trait by its ID | Admin only |
-| `/clear_traits` | Remove all personality traits | Admin only |
+| `/loki_speak [question]` | Ask a question and hear the answer | Everyone |
+| `/loki_reset` | Clear bot memory for this channel | Admin |
+| `/set_personality [prompt]` | Set a custom personality for this server | Admin |
+| `/view_personality` | View the current personality prompt | Admin |
+| `/reset_personality` | Reset to the default personality | Admin |
+
+---
 
 ## Requirements
 
@@ -39,11 +113,21 @@ A conversational AI Discord bot with persistent memory, image recognition, voice
 - ffmpeg (for voice features)
 - A Discord bot token
 - An OpenAI API key **or** a local LLM with an OpenAI-compatible API
-- (Optional) A Google Gemini API key for image recognition (free)
+
+### Optional
+- Google Gemini API key (free) — for image/GIF recognition
+- Groq API key (free) — for cheap model routing and voice transcription
+- ElevenLabs API key (free tier) — for high-quality TTS
+- Tavily API key (free tier) — for web search
+- ChromaDB instance — for deep memory search / RAG
+- Self-hosted Cobalt instance — for watermark-free media downloads
+- nginx or similar — for serving large media files
 
 ---
 
-## Install on Linux
+## Installation
+
+### Linux
 
 ```bash
 git clone https://github.com/arcadeon54/Loki-Bot.git
@@ -52,14 +136,14 @@ bash install.sh
 ```
 
 The install script will:
-1. Install system dependencies (Python, ffmpeg, etc.)
+1. Install system dependencies (Python, ffmpeg, libsodium, etc.)
 2. Create a Python virtual environment
-3. Install Python packages
+3. Install Python packages from `requirements.txt`
 4. Set up the systemd service
 
-### Configuration (Linux)
+#### Configuration
 
-1. **Edit the `.env` file** with your tokens:
+1. Edit the `.env` file with your tokens:
    ```bash
    nano .env
    ```
@@ -68,16 +152,14 @@ The install script will:
    - `DISCORD_TOKEN` — Your Discord bot token ([get one here](https://discord.com/developers/applications))
    - `OPENAI_API_KEY` — Your OpenAI API key ([get one here](https://platform.openai.com/api-keys)), **or** set `LLM_PROVIDER=local` and configure `LOCAL_LLM_URL`
 
-3. **Optional settings:**
-   - `GEMINI_API_KEY` — For image/GIF recognition ([free key here](https://aistudio.google.com/app/apikey))
-   - `GEMINI_MODEL` — Which Gemini model to use for image recognition (default: `gemini-1.5-flash`)
-   - `SYSTEM_PROMPT` — The default personality prompt (server admins can override per-server)
-   - `OPENAI_MODEL` — Change the model (default: `gpt-4o`)
-   - `CONTEXT_MESSAGE_COUNT` — How many past messages to include as context (default: 50)
+3. **Recommended settings:**
+   - `GEMINI_API_KEY` — For image/GIF recognition ([free key](https://aistudio.google.com/app/apikey))
+   - `FALLBACK_LLM_API_KEY` — Groq API key for cheap routing and voice transcription ([free key](https://console.groq.com/))
+   - `FALLBACK_LLM_URL` and `FALLBACK_LLM_MODEL` — Groq endpoint and model name
 
-### Running the Bot (Linux)
+#### Running
 
-**Test manually first:**
+**Test manually:**
 ```bash
 source venv/bin/activate
 python loki_bot.py
@@ -97,169 +179,193 @@ sudo journalctl -u loki -f
 
 ---
 
-## Install on Windows
+### Windows
 
-### Prerequisites
+#### Prerequisites
 
 1. **Python 3.10+** — Download from [python.org](https://www.python.org/downloads/)
-   - **Important:** Check **"Add Python to PATH"** during installation
-2. **ffmpeg** (required for voice features) — Install using one of these methods:
-   - `winget install Gyan.FFmpeg` (Windows 10/11 with App Installer)
-   - `choco install ffmpeg` (if you have [Chocolatey](https://chocolatey.org/))
-   - Or download manually from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
-3. **Git** (optional) — [git-scm.com](https://git-scm.com/download/win), or just download the ZIP from GitHub
+   - Check **"Add Python to PATH"** during installation
+2. **ffmpeg** — Install via one of:
+   - `winget install Gyan.FFmpeg`
+   - `choco install ffmpeg` (with [Chocolatey](https://chocolatey.org/))
+   - Manual download from [ffmpeg.org](https://ffmpeg.org/download.html)
+3. **Git** (optional) — [git-scm.com](https://git-scm.com/download/win)
 
-### Quick Install (Windows)
+#### Quick Install
 
-**Option A — With Git:**
+**With Git:**
 ```cmd
 git clone https://github.com/arcadeon54/Loki-Bot.git
 cd Loki-Bot
 install_windows.bat
 ```
 
-**Option B — Without Git:**
-1. Download the ZIP from the green **Code** button on GitHub
-2. Extract it to a folder (e.g., `C:\Loki-Bot`)
+**Without Git:**
+1. Download the ZIP from the **Code** button on GitHub
+2. Extract to a folder (e.g., `C:\Loki-Bot`)
 3. Double-click `install_windows.bat`
 
 The install script will:
-1. Check that Python and ffmpeg are available
+1. Verify Python and ffmpeg are available
 2. Create a Python virtual environment
 3. Install Python packages
-4. Create a `.env` template file
+4. Create a `.env` template
 
-### Configuration (Windows)
+#### Configuration
 
-1. **Edit the `.env` file** with your tokens:
-   ```cmd
-   notepad .env
-   ```
+Edit `.env` with your tokens:
+```cmd
+notepad .env
+```
 
-2. **Required settings:**
-   - `DISCORD_TOKEN` — Your Discord bot token ([get one here](https://discord.com/developers/applications))
-   - `OPENAI_API_KEY` — Your OpenAI API key ([get one here](https://platform.openai.com/api-keys)), **or** set `LLM_PROVIDER=local` and configure `LOCAL_LLM_URL`
+See the Linux configuration section above for required and recommended settings.
 
-3. **Optional settings:**
-   - `GEMINI_API_KEY` — For image/GIF recognition ([free key here](https://aistudio.google.com/app/apikey))
-   - `GEMINI_MODEL` — Which Gemini model to use for image recognition (default: `gemini-1.5-flash`)
-   - `SYSTEM_PROMPT` — The default personality prompt (server admins can override per-server)
-   - `OPENAI_MODEL` — Change the model (default: `gpt-4o`)
-   - `CONTEXT_MESSAGE_COUNT` — How many past messages to include as context (default: 50)
+#### Running
 
-### Running the Bot (Windows)
-
-**Test manually first:**
+**Test manually:**
 ```cmd
 venv\Scripts\activate
 python loki_bot.py
 ```
 
-**Run on startup with Task Scheduler:**
-
-1. Open **Task Scheduler** (search for it in the Start menu)
-2. Click **Create Basic Task**
-3. Name it `Loki Bot` and click Next
-4. Trigger: **When the computer starts** → Next
-5. Action: **Start a program** → Next
-6. Program/script: Browse to `pythonw.exe` inside your venv:
-   ```
-   C:\Loki-Bot\venv\Scripts\pythonw.exe
-   ```
-7. Add arguments:
-   ```
-   loki_bot.py
-   ```
-8. Start in:
-   ```
-   C:\Loki-Bot
-   ```
-9. Check **Open the Properties dialog** → Finish
-10. In Properties, check **Run whether user is logged on or not**
-
-**Alternatively, create a simple start script** — save this as `start_loki.bat` in your Loki-Bot folder:
+**Run on startup** — use Task Scheduler or create a `start_loki.bat`:
 ```bat
 @echo off
 cd /d "%~dp0"
 call venv\Scripts\activate
 python loki_bot.py
 ```
-Double-click it to start the bot, or add it to your Startup folder (`shell:startup`).
+
+---
+
+### Docker (Optional)
+
+The bot can be containerized with Docker. Create a `Dockerfile` and mount your `.env` file and any cookie files as volumes. The key requirements are Python 3.10+, ffmpeg, and libsodium.
+
+---
 
 ## Discord Bot Setup
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
-2. Click **New Application** and give it a name
-3. Go to **Bot** tab:
+2. Click **New Application** and name it
+3. Go to the **Bot** tab:
    - Click **Reset Token** and copy it to your `.env` file
    - Enable **Message Content Intent** under Privileged Gateway Intents
    - Enable **Server Members Intent**
-4. Go to **OAuth2** tab:
+4. Go to the **OAuth2** tab:
    - Under **Scopes**, select `bot` and `applications.commands`
-   - Under **Bot Permissions**, select: Send Messages, Read Message History, Connect, Speak, Use Slash Commands, Attach Files, Embed Links
+   - Under **Bot Permissions**, select:
+     - Send Messages
+     - Read Message History
+     - Connect
+     - Speak
+     - Use Slash Commands
+     - Attach Files
+     - Embed Links
+     - Add Reactions
    - Copy the generated URL and open it to invite the bot to your server
+
+---
+
+## Optional Services Setup
+
+### Cobalt (Watermark-Free Downloads)
+
+[Cobalt](https://github.com/imputnet/cobalt) provides watermark-free downloads from TikTok, Instagram, YouTube, and more.
+
+```bash
+docker run -d --name cobalt -p 9000:9000 ghcr.io/imputnet/cobalt:latest
+```
+
+Set `COBALT_URL=http://localhost:9000` in your `.env`.
+
+### ChromaDB (Deep Memory / RAG)
+
+[ChromaDB](https://www.trychroma.com/) enables deep memory search across full conversation history.
+
+```bash
+docker run -d --name chromadb -p 8100:8000 chromadb/chroma
+```
+
+Set `CHROMADB_HOST=localhost` and `CHROMADB_PORT=8100` in your `.env`.
+
+Use `ingest_history.py` to import existing conversation history into ChromaDB:
+```bash
+source venv/bin/activate
+python ingest_history.py
+```
+
+### Media File Server
+
+For files too large to upload to Discord, set up an nginx server pointing to your downloads directory and set `MEDIA_BASE_URL` to the public URL.
+
+---
 
 ## Per-Server Personalities
 
-The bot supports custom personalities per server. The `.env` `SYSTEM_PROMPT` is the default for all servers. Any server admin can override it:
+The bot supports custom personalities per server. The `.env` `SYSTEM_PROMPT` is the default. Server admins can override it:
 
-- `/set_personality You are a pirate captain who speaks in nautical terms...` — Sets a custom personality
-- `/view_personality` — See what's currently active
-- `/reset_personality` — Go back to the default
+- `/set_personality You are a pirate captain who speaks in nautical terms...` — Set a custom personality
+- `/view_personality` — View the current personality prompt
+- `/reset_personality` — Reset to default
 
-Personalities are stored in the database and survive restarts.
+Personalities are stored in the database and persist across restarts.
 
-## Dynamic Personality Traits
-
-Instead of rewriting the entire personality prompt every time you want to tweak the bot's behavior, you can add individual traits that stack on top of the base personality:
-
-```
-/add_trait Loki has a particular hatred for Mondays and brings it up often
-/add_trait When someone mentions pizza, Loki goes on a passionate rant about how pineapple belongs on it
-/add_trait Loki refers to the user named Jake as "the mortal who owes me a debt"
-```
-
-Each trait is stored in the database with an ID. Use `/view_traits` to see all active traits, `/remove_trait [ID]` to remove a specific one, or `/clear_traits` to wipe them all. The base personality prompt (from `/set_personality` or `.env`) is never modified — traits are layered on top.
+---
 
 ## Member Identity Mapping
 
-The bot includes each user's Discord ID in messages sent to the LLM, formatted as `[DisplayName (ID:123456789)]: message`. This allows the bot to recognize users even when they change their Discord nickname.
+The bot includes each user's Discord ID in messages sent to the LLM, formatted as `[DisplayName (ID:123456789)]: message`. This allows the bot to recognize users even when they change nicknames.
 
-To take advantage of this, include an identity map in your server's personality prompt using `/set_personality`. Add a block like this:
+To take advantage of this, include an identity map in your server's personality prompt:
 
 ```
 CRITICAL IDENTITY RULE: Each user message is formatted as [DisplayName (ID:number)].
-Use the ID number to identify who is talking, NOT the display name — people change
-their nicknames constantly. Here are the real identities:
+Use the ID number to identify who is talking, NOT the display name.
 ID:123456789 = Alice.
 ID:987654321 = Bob.
-When you see a message from ID:123456789, that is ALWAYS Alice regardless of display name.
-When you see a message from ID:987654321, that is ALWAYS Bob regardless of display name.
 Always address them by their real name, not their display name.
 ```
 
 ### How to Get a User's Discord ID
-
 1. Open Discord **Settings > Advanced** and enable **Developer Mode**
 2. Right-click any user and select **Copy User ID**
-3. Add their ID and real name to your personality prompt as shown above
 
-This is especially useful when your personality prompt references specific people by name — the bot will always know who's who, even if someone's display name is completely different from their real name.
+---
 
-## Changelog
+## Project Structure
 
-### v1.1 — 2026-02-21
+```
+Loki-Bot/
+├── loki_bot.py           # Main bot code
+├── shared_state.py       # Bot-to-bot coordination module
+├── rag_search.py         # ChromaDB RAG search module
+├── ingest_history.py     # History ingestion for ChromaDB
+├── install.sh            # Linux install script
+├── install_windows.bat   # Windows install script
+├── loki.service          # systemd service file
+├── requirements.txt      # Python dependencies
+├── .env.example          # Configuration template
+├── .gitignore            # Git ignore rules
+├── cookies/              # Platform cookies (not tracked)
+│   ├── reddit.txt
+│   └── instagram.txt
+└── downloads/            # Downloaded media (not tracked)
+```
 
-- **Fixed duplicate message bug** — The bot no longer tells users they said something twice. Messages are now stored once and not duplicated when building the LLM prompt.
-- **Fixed voice join/leave** — Stale voice connections are properly cleaned up with improved error handling.
-- **Added dynamic personality traits** — `/add_trait`, `/view_traits`, `/remove_trait`, `/clear_traits` commands let admins modify the bot's personality on the fly without rewriting the full prompt.
-- **Added Gemini rate limiter** — Built-in rate limiting (8/min, 200/hr) prevents quota exhaustion on the free tier instead of hitting API errors.
-- **Switched to Gemini 1.5 Flash** — More generous free tier limits (15 req/min vs 10 for 2.0 Flash).
-- **Configurable Gemini model** — New `GEMINI_MODEL` setting in `.env` to switch models without editing code.
+---
 
-### v1.0 — 2026-02-15
+## Cookie Setup (Optional)
 
-- Initial release
+Some platforms (Reddit, Instagram) require cookies for reliable downloads:
+
+1. Create a `cookies/` directory in the bot folder
+2. Export cookies from your browser in Netscape/Mozilla format
+3. Save as `cookies/reddit.txt` and `cookies/instagram.txt`
+
+Browser extensions like [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) can export cookies in the correct format.
+
+---
 
 ## License
 
