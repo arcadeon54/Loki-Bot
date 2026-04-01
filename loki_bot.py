@@ -2538,7 +2538,7 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
         if role == "assistant":
             msgs.append({"role": "assistant", "content": content})
         else:
-            text = f"[{username} (ID:{user_id})]: {content}"
+            text = f"[{username}]: {content}"
             if image_desc:
                 text += f"\n[Image in message: {image_desc}]"
             msgs.append({"role": "user", "content": text})
