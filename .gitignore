@@ -1,16 +1,6 @@
 .env
 *.db
-*.db-shm
-*.db-wal
 venv/
 __pycache__/
 *.pyc
 *.log
-*.bak
-*.bak.*
-cookies/
-downloads/
-loki_learned.md
-quip_usage.json
-ingest_progress.json
-bot-shared-state/

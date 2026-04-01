@@ -2499,29 +2499,6 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
     # ── Current time injection ────────────────────────────────────────────
     prompt += f"\n\n[Current time]: {now_et().strftime('%I:%M %p ET, %A %B %-d %Y')}"
 
-    # ── Mood injection ────────────────────────────────────────────────────
-    if not serious:
-        mood = mood_tracker.get_mood(channel_id)
-        mood_hint = mood_tracker.get_mood_prompt(mood)
-        if mood_hint:
-            prompt += f"\n\n[Current server vibe — {mood.upper()}]: {mood_hint}"
-        vibe_detail = mood_tracker.get_vibe_detail(channel_id)
-        if vibe_detail:
-            prompt += f"\n[Room vibe detail]: {vibe_detail}"
-
-        # Tell Loki it can use @mentions
-        prompt += (
-            "\n\nYou can @mention server members in your responses using the exact "
-            "Discord mention format listed in your member directory. Use mentions "
-            "naturally — to call someone out, include them in a joke, or address "
-            "them directly. Don't force it or overdo it."
-        )
-
-        # ── Inject self-learned personality notes ────────────────────────
-        learned = load_learned_personality()
-        if learned:
-            prompt += f"\n\n[Things you've learned about this community over time — use these naturally, don't announce them]:\n{learned}"
-
     # ── Inject Miss-T cooldown behavior modifier if active ───────────────
     if shared is not None and not serious:
         on_cooldown, modifier = shared.is_loki_on_cooldown()
@@ -2538,17 +2515,6 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
                 )
 
     msgs = [{"role": "system", "content": prompt}]
-
-    # ── Member directory (for @mentions) ──────────────────────────────────
-    if not serious:
-        guild_obj = guild or (bot.get_guild(int(guild_id)) if guild_id else None)
-        if guild_obj:
-            directory = _get_member_directory(guild_obj)
-            if directory:
-                msgs.append({
-                    "role": "system",
-                    "content": f"[Member directory — use these exact strings for @mentions]:\n{directory}"
-                })
 
     # ── Relationship memory for the person Loki is responding to ──────────
     if target_user_id and guild_id and not serious:
@@ -3360,8 +3326,8 @@ async def on_ready():
 
     unprompted_interjection.start()
     log.info("Unprompted interjection task started")
-    update_self_knowledge.start()
-    log.info("Self-knowledge update task started (runs every 6 hours)")
+    # update_self_knowledge disabled — trimming token usage
+    log.info("Self-knowledge update task disabled (token savings)")
     check_reminders.start()
     log.info("Reminder check task started (runs every minute)")
     flush_db.start()
@@ -4412,34 +4378,9 @@ async def download(interaction: discord.Interaction, url: str):
     await interaction.followup.send("⏬ Download queued.", ephemeral=True)
 
 
-@bot.tree.command(
-    name="view_loki_notes",
-    description="View what Loki has learned about this community over time (Admin only)"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def view_loki_notes(interaction: discord.Interaction):
-    content = load_learned_personality()
-    if not content:
-        await interaction.response.send_message(
-            "No learned notes yet. Check back after some conversations!",
-            ephemeral=True
-        )
-        return
-
-    display = content[:3900] + "..." if len(content) > 3900 else content
-    embed = discord.Embed(
-        title="🧠 Loki's Learned Notes",
-        description=display,
-        color=discord.Color.dark_gold()
-    )
-    embed.set_footer(text=f"File: {LOKI_LEARNED_FILE} — Updated every 6 hours")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 @set_personality.error
 @view_personality.error
 @reset_personality.error
-@view_loki_notes.error
 @loki_reset.error
 async def admin_permission_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
