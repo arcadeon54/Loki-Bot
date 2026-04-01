@@ -1137,43 +1137,25 @@ class LLMHandler:
 
         return "My connection to the realms faltered. Give me a moment."
 
-    async def classify_intent(self, text: str) -> str:
-        """Classify message intent using a cheap model. Returns one of:
-        CHAT, QUESTION, EMOTIONAL, MEMORY, IMAGE, COMMAND"""
-        try:
-            prompt = (
-                "Classify this Discord message into exactly one category. "
-                "Reply with only the category word.\n\n"
-                "Categories:\n"
-                "CHAT — casual banter, jokes, reactions, short replies\n"
-                "QUESTION — asking for info, facts, opinions, how-to\n"
-                "EMOTIONAL — expressing feelings, venting, seeking support\n"
-                "MEMORY — asking about past events, history, what was said\n"
-                "COMMAND — requesting an action (download, search, remind)\n\n"
-                f'Message: "{text[:300]}"\n\nCategory:'
-            )
-            messages = [{"role": "user", "content": prompt}]
-            # Use Groq (free) for classification
-            if FALLBACK_LLM_URL and FALLBACK_LLM_API_KEY:
-                url = FALLBACK_LLM_URL.rstrip("/") + "/chat/completions"
-                result = await self._call(url, FALLBACK_LLM_API_KEY,
-                                          FALLBACK_LLM_MODEL, messages, is_openai=False)
-                if result:
-                    intent = result.strip().upper().split()[0]
-                    if intent in {"CHAT", "QUESTION", "EMOTIONAL", "MEMORY", "COMMAND"}:
-                        return intent
-        except Exception as e:
-            log.error(f"Intent classification failed: {e}")
-        return "QUESTION"  # safe default
+    async def classify_message(self, text: str) -> tuple[str, str]:
+        """Classify intent AND emotion in a single cheap LLM call.
 
-    async def detect_emotion(self, text: str) -> str:
-        """Detect emotional tone using a cheap model."""
+        Returns (intent, emotion) where:
+          intent:  CHAT | QUESTION | EMOTIONAL | MEMORY | COMMAND
+          emotion: neutral | excited | sad | frustrated | joking | curious | angry
+        """
         try:
             prompt = (
-                "Detect the emotional tone of this Discord message. "
-                "Reply with only one word.\n\n"
-                "Options: neutral, excited, sad, frustrated, joking, curious, angry\n\n"
-                f'Message: "{text[:300]}"\n\nEmotion:'
+                "Analyze this Discord message. Reply with EXACTLY two words separated by a space: "
+                "the intent category and the emotional tone.\n\n"
+                "Intent categories: CHAT, QUESTION, EMOTIONAL, MEMORY, COMMAND\n"
+                "  CHAT — casual banter, jokes, reactions, short replies\n"
+                "  QUESTION — asking for info, facts, opinions, how-to\n"
+                "  EMOTIONAL — expressing feelings, venting, seeking support\n"
+                "  MEMORY — asking about past events, history, what was said\n"
+                "  COMMAND — requesting an action (download, search, remind)\n\n"
+                "Emotion options: neutral, excited, sad, frustrated, joking, curious, angry\n\n"
+                f'Message: "{text[:300]}"\n\nReply with exactly two words (e.g. "CHAT joking"):'
             )
             messages = [{"role": "user", "content": prompt}]
             if FALLBACK_LLM_URL and FALLBACK_LLM_API_KEY:
@@ -1181,13 +1163,18 @@ class LLMHandler:
                 result = await self._call(url, FALLBACK_LLM_API_KEY,
                                           FALLBACK_LLM_MODEL, messages, is_openai=False)
                 if result:
-                    emotion = result.strip().lower().split()[0]
-                    if emotion in {"neutral", "excited", "sad", "frustrated",
-                                   "joking", "curious", "angry"}:
-                        return emotion
+                    parts = result.strip().split()
+                    intent = parts[0].upper() if parts else "QUESTION"
+                    emotion = parts[1].lower() if len(parts) > 1 else "neutral"
+                    if intent not in {"CHAT", "QUESTION", "EMOTIONAL", "MEMORY", "COMMAND"}:
+                        intent = "QUESTION"
+                    if emotion not in {"neutral", "excited", "sad", "frustrated",
+                                       "joking", "curious", "angry"}:
+                        emotion = "neutral"
+                    return intent, emotion
         except Exception as e:
-            log.error(f"Emotion detection failed: {e}")
-        return "neutral"
+            log.error(f"Message classification failed: {e}")
+        return "QUESTION", "neutral"
 
     async def chat_routed(self, messages: list[dict], intent: str, emotion: str) -> str:
         """Route to cheap or expensive model based on intent and emotion."""
@@ -2697,9 +2684,24 @@ async def update_relationship_memory(user_id: str, guild_id: str,
         log.error(f"Relationship memory update failed for {display_name}: {e}")
 
 
+_REACTION_RULES = [
+    # (pattern, emoji_choices) — first match wins
+    (re.compile(r'\b(lmao|lmfao|dead|dying|i can\'t|bruh|💀)\b', re.IGNORECASE), ["💀", "😂", "🤣"]),
+    (re.compile(r'\b(fire|heat|goes hard|banger|slaps)\b', re.IGNORECASE), ["🔥"]),
+    (re.compile(r'\b(cap|no way|you\'re lying|sus|nah)\b', re.IGNORECASE), ["🧢", "🤨"]),
+    (re.compile(r'\b(W|dub|let\'s go|goat|legend)\b'), ["🏆", "👑", "🫡"]),
+    (re.compile(r'\b(L|ratio|rip|oof|yikes)\b'), ["💀", "🫠"]),
+    (re.compile(r'\b(sad|pain|hurts|crying|miss)\b', re.IGNORECASE), ["😢", "🫂"]),
+    (re.compile(r'\b(love|heart|wholesome|cute|adorable)\b', re.IGNORECASE), ["❤️", "🥹"]),
+    (re.compile(r'[?]{2,}', re.IGNORECASE), ["🤔", "❓"]),
+    (re.compile(r'[!]{3,}', re.IGNORECASE), ["⚡", "👀"]),
+]
+
+
 async def maybe_react(message: discord.Message):
     """Silently react to a message with an emoji — sparingly and in-character.
 
+    Uses pattern matching instead of an LLM call to save API credits.
     Two-gate system: cooldown must have elapsed AND a probability roll must pass.
     Only fires on messages Loki is NOT already responding to.
     """
@@ -2711,47 +2713,23 @@ async def maybe_react(message: discord.Message):
     if random.random() > REACTION_PROB:
         return
 
-    # Build custom emoji list from all guilds the bot is in
-    custom_names = [f":{e.name}:" for e in bot.emojis]
-    emoji_hint = (
-        f"\nAvailable custom emojis: {', '.join(custom_names[:40])}"
-        if custom_names else ""
-    )
+    text = message.content
+    if not text.strip():
+        return
 
-    prompt = [
-        {"role": "system", "content": (
-            "You are Loki watching a Discord chat. Should you react to this message "
-            "with an emoji? Only react if it's genuinely funny, surprising, spicy, or "
-            "worth silently acknowledging — not for mundane messages. "
-            "Return ONLY valid JSON: {\"emoji\": \"<emoji>\"} or null.\n"
-            "Use standard unicode emojis OR a custom emoji by name (e.g. :pepehands:). "
-            f"Be selective — most messages don't warrant a reaction. NEVER use the eyes emoji (👀 or :eyes:) under any circumstances.{emoji_hint}"
-        )},
-        {"role": "user", "content": f"{message.author.display_name}: {message.content[:300]}"}
-    ]
+    emoji_to_use = None
+    for pattern, choices in _REACTION_RULES:
+        if pattern.search(text):
+            emoji_to_use = random.choice(choices)
+            break
+
+    if not emoji_to_use:
+        return
 
     try:
-        result = (await llm.chat(prompt)).strip()
-        result = re.sub(r"^```(?:json)?\s*|\s*```$", "", result, flags=re.MULTILINE).strip()
-        if result.lower() == "null" or not result:
-            return
-        data = json.loads(result)
-        emoji_str = data.get("emoji", "").strip()
-        if not emoji_str:
-            return
-
-        # Resolve custom emoji by name if :name: format
-        emoji_to_use = emoji_str
-        if emoji_str.startswith(":") and emoji_str.endswith(":"):
-            name = emoji_str.strip(":")
-            found = discord.utils.get(bot.emojis, name=name)
-            if not found:
-                return  # Custom emoji not available, skip rather than error
-            emoji_to_use = found
-
         await message.add_reaction(emoji_to_use)
         reaction_cooldowns[cid] = now
-        log.info(f"Reacted in #{message.channel.name} with {emoji_str}")
+        log.info(f"Reacted in #{message.channel.name} with {emoji_to_use}")
     except Exception as e:
         log.error(f"Reaction failed in #{message.channel.name}: {e}")
 
@@ -2788,9 +2766,34 @@ async def fetch_tenor_gif(query: str) -> str | None:
         return None
 
 
+_GIF_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "into", "about", "like",
+    "it", "its", "i", "me", "my", "you", "your", "he", "she", "they",
+    "we", "us", "this", "that", "these", "those", "and", "or", "but",
+    "not", "no", "so", "if", "just", "also", "too", "very", "really",
+    "loki", "hey", "yo", "bruh", "dude", "man", "bro", "yeah", "yep",
+    "nah", "ok", "okay", "lol", "lmao", "what", "how", "when", "where",
+    "why", "who", "don't", "didn't", "doesn't", "isn't", "aren't", "won't",
+    "im", "i'm", "it's", "that's", "there's", "here's",
+})
+
+
+def _extract_gif_query(text: str) -> str | None:
+    """Extract 2-4 keyword GIF search query from text without using LLM."""
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    keywords = [w for w in words if w not in _GIF_STOPWORDS and len(w) > 2]
+    if len(keywords) < 1:
+        return None
+    return " ".join(keywords[:3])
+
+
 async def maybe_send_gif(channel: discord.TextChannel, context: str):
     """Occasionally drop a relevant GIF after Loki responds.
 
+    Uses keyword extraction instead of an LLM call to save API credits.
     Two-gate system: cooldown + probability roll.
     """
     cid = str(channel.id)
@@ -2801,19 +2804,11 @@ async def maybe_send_gif(channel: discord.TextChannel, context: str):
     if random.random() > GIF_PROB:
         return
 
-    prompt = [
-        {"role": "system", "content": (
-            "Based on the conversation, suggest a short GIF search query (2–4 words). "
-            "Return ONLY the search query string — nothing else. "
-            "If nothing fits naturally, return: null"
-        )},
-        {"role": "user", "content": context[:300]}
-    ]
+    query = _extract_gif_query(context)
+    if not query:
+        return
 
     try:
-        query = (await llm.chat(prompt)).strip().strip('"\'')
-        if query.lower() == "null" or not query:
-            return
         gif_url = await fetch_tenor_gif(query)
         if gif_url:
             await channel.send(gif_url)
@@ -3863,11 +3858,8 @@ async def on_message(message: discord.Message):
                 )
             })
 
-        # ── Intent + emotion detection (runs in parallel, uses cheap model) ──
-        intent, emotion = await asyncio.gather(
-            llm.classify_intent(content_text),
-            llm.detect_emotion(content_text)
-        )
+        # ── Intent + emotion detection (single cheap model call) ──
+        intent, emotion = await llm.classify_message(content_text)
         log.info(f"Intent={intent} Emotion={emotion} user={message.author.display_name}")
 
         # Inject emotion context into prompt if non-neutral
