@@ -461,15 +461,6 @@ class MemoryDB:
             )
         """)
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS server_traits (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id    TEXT,
-                trait       TEXT,
-                added_by    TEXT,
-                timestamp   TEXT
-            )
-        """)
-        cursor.execute("""
             CREATE TABLE IF NOT EXISTS claude_sessions (
                 channel_id  TEXT PRIMARY KEY,
                 session_id  TEXT NOT NULL,
@@ -677,37 +668,6 @@ class MemoryDB:
         )
         self.conn.commit()
 
-    # ── Server Traits ─────────────────────────────────────────────────────
-    def add_trait(self, guild_id, trait, added_by):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "INSERT INTO server_traits (guild_id, trait, added_by, timestamp) VALUES (?, ?, ?, ?)",
-            (str(guild_id), trait, added_by, now_et().isoformat())
-        )
-        self.conn.commit()
-        return cursor.lastrowid
-
-    def get_traits(self, guild_id):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT id, trait, added_by FROM server_traits WHERE guild_id = ? ORDER BY id ASC",
-            (str(guild_id),)
-        )
-        return cursor.fetchall()
-
-    def remove_trait(self, guild_id, trait_id):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "DELETE FROM server_traits WHERE id = ? AND guild_id = ?",
-            (trait_id, str(guild_id))
-        )
-        self.conn.commit()
-        return cursor.rowcount > 0
-
-    def clear_traits(self, guild_id):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM server_traits WHERE guild_id = ?", (str(guild_id),))
-        self.conn.commit()
     # ── Claude Code Sessions ──────────────────────────────────────────────
     def get_claude_session(self, channel_id):
         cursor = self.conn.cursor()
@@ -2490,12 +2450,6 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
                 prompt = server_personality[0]
 
 
-    # ── Server traits injection ──────────────────────────────────────────
-    if not serious and guild_id:
-        traits = memory.get_traits(guild_id)
-        if traits:
-            trait_list = "\n".join(f"- {t[1]}" for t in traits)
-            prompt += f"\n\n[Personality traits set by this server's admins — embody these naturally]:\n{trait_list}"
     # ── Current time injection ────────────────────────────────────────────
     prompt += f"\n\n[Current time]: {now_et().strftime('%I:%M %p ET, %A %B %-d %Y')}"
 
