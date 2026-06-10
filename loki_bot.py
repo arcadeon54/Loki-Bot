@@ -5183,7 +5183,7 @@ async def on_message(message: discord.Message):
             named_person, rag_query = _extract_named_subject(content_text)
             hits = search_history(
                 rag_query,
-                n_results=20,
+                n_results=int(os.getenv("RAG_MAX_CHUNKS", "5")),
                 guild_name=guild_name_for_rag,
                 since_dt=since_dt,
                 until_dt=until_dt,
