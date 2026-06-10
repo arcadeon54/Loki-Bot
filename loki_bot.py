@@ -114,6 +114,12 @@ try:
 except ImportError:
     _tools_available = False
 
+try:
+    import user_memory
+    _user_memory_available = True
+except ImportError:
+    _user_memory_available = False
+
 # ─── Timezone ─────────────────────────────────────────────────────────────────
 ET = ZoneInfo("America/New_York")
 
@@ -747,6 +753,24 @@ class MemoryDB:
         """, (str(channel_id),))
         row = cursor.fetchone()
         return row if row else None
+
+    def get_channels_needing_summary(self, min_new_messages: int = 15) -> list[tuple]:
+        """Channels whose message count since their last summary exceeds the
+        threshold (Phase 3.2 rolling summaries). Returns (guild_id, channel_id)."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT m.guild_id, m.channel_id, COUNT(*) AS new_msgs
+            FROM messages m
+            LEFT JOIN (
+                SELECT channel_id, MAX(timestamp) AS last_ts
+                FROM summaries GROUP BY channel_id
+            ) s ON s.channel_id = m.channel_id
+            WHERE m.guild_id IS NOT NULL
+              AND (s.last_ts IS NULL OR m.timestamp > s.last_ts)
+            GROUP BY m.guild_id, m.channel_id
+            HAVING new_msgs >= ?
+        """, (min_new_messages,))
+        return [(g, c) for g, c, _ in cursor.fetchall()]
 
     # ── Per-Server Personality ────────────────────────────────────────────
     def set_server_personality(self, guild_id, prompt, set_by):
@@ -3392,6 +3416,22 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
                         f"({interaction_count} interactions)]: {notes}"
                     )
                 })
+            # ── Learned facts relevant to what they just said (Phase 3.1) ──
+            if _user_memory_available and extra_user_msg:
+                try:
+                    facts = user_memory.recall_facts(
+                        str(target_user_id), extra_user_msg, k=4
+                    )
+                    if facts:
+                        msgs.append({
+                            "role": "system",
+                            "content": (
+                                f"[Facts you've learned about {display_name} — "
+                                "use naturally, don't recite]: " + "; ".join(facts)
+                            )
+                        })
+                except Exception as _fact_err:
+                    log.error(f"Fact recall failed: {_fact_err}")
             # ── Emoji feedback summary ────────────────────────────────────
             pos, neg = memory.get_user_feedback_summary(target_user_id, guild_id)
             if pos + neg >= 3:
@@ -3628,6 +3668,26 @@ async def update_relationship_memory(user_id: str, guild_id: str,
         notes = await llm.chat(update_prompt)
         memory.set_user_notes(user_id, guild_id, notes)
         log.info(f"Updated relationship notes for {display_name}")
+
+        # ── Fact extraction (Phase 3.1) — cheap fallback model, stored in
+        # ChromaDB per-user so facts are individually retrievable + forgettable
+        if _user_memory_available and FALLBACK_LLM_URL and FALLBACK_LLM_API_KEY:
+            extract_msgs = [
+                {"role": "system", "content": user_memory.EXTRACTION_SYSTEM},
+                {"role": "user", "content": f"Messages from {display_name}:\n{recent_msgs}"},
+            ]
+            raw = await llm._call(
+                FALLBACK_LLM_URL.rstrip("/") + "/chat/completions",
+                FALLBACK_LLM_API_KEY, FALLBACK_LLM_MODEL,
+                extract_msgs, is_openai=False,
+            )
+            facts = user_memory.parse_facts(raw or "")
+            if facts:
+                stored = await asyncio.to_thread(
+                    user_memory.store_facts, user_id, display_name, guild_id, facts
+                )
+                if stored:
+                    log.info(f"Learned {stored} new fact(s) about {display_name}")
     except Exception as e:
         log.error(f"Relationship memory update failed for {display_name}: {e}")
 
@@ -4430,6 +4490,53 @@ async def before_detect_threads():
     await bot.wait_until_ready()
 
 
+@tasks.loop(minutes=30)
+async def rolling_channel_summaries():
+    """Keep per-channel summaries fresh in the background (Phase 3.2).
+
+    Channels with enough new messages since their last summary get re-summarized
+    on the cheap fallback model; build_llm_messages already injects the latest
+    summary as ambient context, so this turns that from manual-only (/summarize)
+    into an always-current rolling memory.
+    """
+    if not (FALLBACK_LLM_URL and FALLBACK_LLM_API_KEY):
+        return
+    try:
+        channels = memory.get_channels_needing_summary(min_new_messages=15)
+    except Exception as e:
+        log.error(f"Rolling summary scan failed: {e}")
+        return
+    for guild_id, channel_id in channels[:6]:   # cap work per cycle
+        try:
+            rows = memory.get_recent_messages(channel_id, 40)
+            if not rows:
+                continue
+            convo = "\n".join(
+                f"{username}: {content[:300]}"
+                for _uid, username, _role, content, _img, _ts in rows if content
+            )
+            prev = memory.get_latest_summary(channel_id)
+            summary_msgs = [
+                {"role": "system", "content": (
+                    "Summarize this Discord conversation in 3-5 sentences for the bot's "
+                    "own memory: main topics, who said what notable, any open questions "
+                    "or running jokes. Plain prose, no preamble."
+                    + (f"\nPrevious summary for continuity: {prev[0][:400]}" if prev else "")
+                )},
+                {"role": "user", "content": convo[-6000:]},
+            ]
+            summary = await llm._call(
+                FALLBACK_LLM_URL.rstrip("/") + "/chat/completions",
+                FALLBACK_LLM_API_KEY, FALLBACK_LLM_MODEL,
+                summary_msgs, is_openai=False,
+            )
+            if summary:
+                memory.store_summary(guild_id, channel_id, summary.strip())
+                log.info(f"Rolling summary updated for channel {channel_id}")
+        except Exception as e:
+            log.error(f"Rolling summary failed for channel {channel_id}: {e}")
+
+
 @tasks.loop(minutes=5)
 async def fire_open_thread_followups():
     """Fire follow-up messages for due open threads.
@@ -4542,6 +4649,14 @@ async def on_ready():
                  f"{', '.join(loki_tools.REGISTRY)}")
     else:
         log.warning("tools module not importable — function calling DISABLED")
+
+    if _user_memory_available and user_memory.is_available():
+        log.info(f"User memory online — {user_memory.fact_count()} facts stored")
+    else:
+        log.warning("User memory unavailable — fact learning DISABLED")
+    if not rolling_channel_summaries.is_running():
+        rolling_channel_summaries.start()
+    log.info("Rolling channel summary task started (every 30 min)")
 
     # RAG died silently for two months once (module deleted, import swallowed
     # by try/except) — always announce its real state at startup.
@@ -5335,20 +5450,36 @@ async def on_message(message: discord.Message):
                 except Exception as _tv_err:
                     log.error(f"Tavily search error: {_tv_err}")
 
-    # ── Detect direct reply context ───────────────────────────────────────
+    # ── Resolve reply chains (Phase 3.2) — to Loki OR to anyone else ──────
     reply_user_id = None
     reply_context = ""
-    if (message.reference and message.reference.resolved
-            and isinstance(message.reference.resolved, discord.Message)
-            and message.reference.resolved.author.id == bot.user.id):
-        reply_user_id = message.author.id
-        ref_content = (message.reference.resolved.content or "")[:300]
-        reply_context = (
-            f"[{message.author.display_name} is replying directly to your message: \"{ref_content}\"]\n"
-            f"[Focus your response on {message.author.display_name} only. "
-            f"Do not reference other people unless {message.author.display_name} mentions them "
-            f"or there is direct relevance between them and this conversation.]\n"
-        )
+    if message.reference and message.reference.message_id:
+        ref = message.reference.resolved
+        if not isinstance(ref, discord.Message):
+            # Discord doesn't always resolve references (old/uncached messages)
+            try:
+                ref = await message.channel.fetch_message(message.reference.message_id)
+            except Exception:
+                ref = None
+        if isinstance(ref, discord.Message):
+            ref_content = (ref.content or "")[:300]
+            if not ref_content and ref.attachments:
+                ref_content = f"(an attachment: {ref.attachments[0].filename})"
+            if ref.author.id == bot.user.id:
+                reply_user_id = message.author.id
+                reply_context = (
+                    f"[{message.author.display_name} is replying directly to your message: \"{ref_content}\"]\n"
+                    f"[Focus your response on {message.author.display_name} only. "
+                    f"Do not reference other people unless {message.author.display_name} mentions them "
+                    f"or there is direct relevance between them and this conversation.]\n"
+                )
+            else:
+                reply_context = (
+                    f"[{message.author.display_name} is replying to {ref.author.display_name}'s "
+                    f"message: \"{ref_content}\"]\n"
+                    f"[When they say \"that\"/\"this\"/\"it\", they most likely mean "
+                    f"{ref.author.display_name}'s message above.]\n"
+                )
 
     # ── Build prompt & get reply ──────────────────────────────────────────
     async with message.channel.typing():
@@ -5563,6 +5694,28 @@ async def summarize(interaction: discord.Interaction):
         color=discord.Color.green()
     )
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="forget", description="Make Loki forget everything he's learned about you")
+async def forget(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    deleted = 0
+    if _user_memory_available:
+        deleted = await asyncio.to_thread(
+            user_memory.forget_user, str(interaction.user.id)
+        )
+    # also wipe the SQLite personality notes for this user in this guild
+    if interaction.guild:
+        try:
+            memory.set_user_notes(str(interaction.user.id), str(interaction.guild.id), "")
+        except Exception as e:
+            log.error(f"/forget notes wipe failed: {e}")
+    log.info(f"/forget by {interaction.user.display_name}: {deleted} facts deleted")
+    await interaction.followup.send(
+        f"Done. {deleted} stored fact(s) about you erased, and my private notes "
+        "on you wiped. We've never met. 🐍",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="loki_join", description="Loki joins your voice channel")
