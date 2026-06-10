@@ -1,10 +1,16 @@
 """
 rag_search.py — RAG (Retrieval-Augmented Generation) module for Discord history search.
 
-v2 (Phase 1.2): searches conversation *chunks* (multi-message exchanges) instead of
-single messages. Chunks are produced by ingest_history.py and stored in ChromaDB
-with cosine distance. Each chunk carries full metadata: participants, user IDs,
-message IDs, channel/guild IDs, and a start/end timestamp range.
+v2 (Phase 1.2): two-stage retrieval.
+
+  Stage 1: search per-MESSAGE vectors (precise matching — a single message about
+           the savanna trip isn't diluted by 14 neighbours about dinner).
+  Stage 2: group matches by their parent conversation chunk and return the full
+           chunk text (the LLM gets the whole exchange, not one line).
+
+Collections (produced by ingest_history.py):
+  {RAG_COLLECTION}            chunk docs + metadata (context store)
+  {RAG_COLLECTION}_messages   per-message vectors, metadata carries chunk_id
 
 Uses ChromaDB (HTTP) for vector storage and sentence-transformers for local embeddings.
 """
@@ -18,7 +24,7 @@ CHROMADB_HOST   = os.getenv("CHROMADB_HOST", "localhost")
 CHROMADB_PORT   = int(os.getenv("CHROMADB_PORT", "8100"))
 COLLECTION_NAME = os.getenv("RAG_COLLECTION", "discord_chunks")
 
-# Embedding model. Must match what ingest_history.py used for the collection.
+# Embedding model. Must match what ingest_history.py used for the collections.
 # bge models want a query-side instruction prefix; passage side needs none.
 EMBED_MODEL  = os.getenv("RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 QUERY_PREFIX = (
@@ -26,18 +32,21 @@ QUERY_PREFIX = (
     if "bge" in EMBED_MODEL else ""
 )
 
-# Cosine distance thresholds: 0.0 = identical, 1.0 = orthogonal.
+# Cosine distance thresholds on MESSAGE-level matches: 0.0 = identical.
 # Tuned with eval_rag.py — see that script's distance report before changing.
-MAX_DISTANCE          = float(os.getenv("RAG_MAX_DISTANCE", "0.55"))
+MAX_DISTANCE          = float(os.getenv("RAG_MAX_DISTANCE", "0.50"))
 # When a time window is active the temporal filter does the heavy lifting,
-# so semantic matching can be looser (casual phrases like "pulled up" won't
-# embed close to "who came to work").
-MAX_DISTANCE_WINDOWED = float(os.getenv("RAG_MAX_DISTANCE_WINDOWED", "0.70"))
+# so semantic matching can be looser.
+MAX_DISTANCE_WINDOWED = float(os.getenv("RAG_MAX_DISTANCE_WINDOWED", "0.65"))
+
+# How many message-level candidates to pull before grouping into chunks.
+MSG_CANDIDATES = int(os.getenv("RAG_MSG_CANDIDATES", "60"))
 
 # Lazy-loaded singletons
 _model = None
 _client = None
-_collection = None
+_chunk_collection = None
+_msg_collection = None
 
 
 def _get_model():
@@ -50,19 +59,33 @@ def _get_model():
     return _model
 
 
-def _get_collection():
-    global _client, _collection
-    if _collection is None:
+def _get_client():
+    global _client
+    if _client is None:
         import chromadb
         _client = chromadb.HttpClient(host=CHROMADB_HOST, port=CHROMADB_PORT)
-        _collection = _client.get_collection(COLLECTION_NAME)
-    return _collection
+    return _client
+
+
+def _get_chunk_collection():
+    global _chunk_collection
+    if _chunk_collection is None:
+        _chunk_collection = _get_client().get_collection(COLLECTION_NAME)
+    return _chunk_collection
+
+
+def _get_msg_collection():
+    global _msg_collection
+    if _msg_collection is None:
+        _msg_collection = _get_client().get_collection(f"{COLLECTION_NAME}_messages")
+    return _msg_collection
 
 
 def is_available() -> bool:
-    """Check if ChromaDB is reachable and the collection exists."""
+    """Check if ChromaDB is reachable and both collections exist."""
     try:
-        _get_collection()
+        _get_chunk_collection()
+        _get_msg_collection()
         return True
     except Exception:
         return False
@@ -71,7 +94,7 @@ def is_available() -> bool:
 def get_chunk_count() -> int:
     """Return how many conversation chunks are indexed."""
     try:
-        return _get_collection().count()
+        return _get_chunk_collection().count()
     except Exception:
         return 0
 
@@ -90,21 +113,22 @@ def search_history(query: str, n_results: int = 20, guild_name: str = None,
         query:       The search query text.
         n_results:   Max chunks to return.
         guild_name:  Restrict to this guild only (prevents cross-server leaks).
-        since_dt:    Timezone-aware datetime — only chunks ending at/after this.
-        until_dt:    Timezone-aware datetime — only chunks starting at/before this.
+        since_dt:    Timezone-aware datetime — only messages at/after this.
+        until_dt:    Timezone-aware datetime — only messages at/before this.
 
-    Temporal filtering happens FIRST inside ChromaDB via the where clause, so
-    semantic ranking only operates over chunks overlapping the window. A chunk
-    overlaps [since, until] when ts_end_unix >= since AND ts_start_unix <= until.
+    Temporal filtering happens FIRST inside ChromaDB via the where clause on the
+    message vectors, so semantic ranking only operates over messages in the
+    window. Matching messages are grouped by parent chunk; each chunk scores as
+    its best message distance.
 
     Returns a list of hit dicts sorted oldest-first; empty list if nothing
     passes the distance threshold.
     """
     try:
         model = _get_model()
-        collection = _get_collection()
+        msg_coll = _get_msg_collection()
 
-        count = collection.count()
+        count = msg_coll.count()
         if count == 0:
             return []
 
@@ -114,9 +138,9 @@ def search_history(query: str, n_results: int = 20, guild_name: str = None,
         if guild_name:
             conditions.append({"guild": {"$eq": guild_name}})
         if since_dt:
-            conditions.append({"ts_end_unix": {"$gte": _to_unix(since_dt)}})
+            conditions.append({"ts_unix": {"$gte": _to_unix(since_dt)}})
         if until_dt:
-            conditions.append({"ts_start_unix": {"$lte": _to_unix(until_dt)}})
+            conditions.append({"ts_unix": {"$lte": _to_unix(until_dt)}})
 
         if len(conditions) == 0:
             where = None
@@ -129,26 +153,35 @@ def search_history(query: str, n_results: int = 20, guild_name: str = None,
 
         query_kwargs = dict(
             query_embeddings=[query_embedding],
-            n_results=min(n_results, count),
-            include=["documents", "metadatas", "distances"],
+            n_results=min(MSG_CANDIDATES, count),
+            include=["metadatas", "distances"],
         )
         if where:
             query_kwargs["where"] = where
 
-        results = collection.query(**query_kwargs)
+        results = msg_coll.query(**query_kwargs)
 
-        if not results["documents"] or not results["documents"][0]:
+        if not results["metadatas"] or not results["metadatas"][0]:
             return []
 
-        hits = []
-        for doc, meta, dist in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0],
-        ):
+        # Group message hits by parent chunk; chunk score = best message distance
+        best = {}   # chunk_id -> distance
+        for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
             if dist > dist_threshold:
                 continue
+            cid = meta.get("chunk_id")
+            if cid and (cid not in best or dist < best[cid]):
+                best[cid] = dist
+        if not best:
+            return []
 
+        chunk_ids = sorted(best, key=best.get)[:n_results]
+        chunks = _get_chunk_collection().get(
+            ids=chunk_ids, include=["documents", "metadatas"]
+        )
+
+        hits = []
+        for cid, doc, meta in zip(chunks["ids"], chunks["documents"], chunks["metadatas"]):
             guild_id   = meta.get("guild_id", "")
             channel_id = meta.get("channel_id", "")
             first_id   = meta.get("first_message_id", "")
@@ -167,7 +200,7 @@ def search_history(query: str, n_results: int = 20, guild_name: str = None,
                 "guild":      meta.get("guild", ""),
                 "n_messages": meta.get("n_messages", 0),
                 "jump_link":  jump_link,
-                "distance":   dist,
+                "distance":   best[cid],
             })
 
         hits.sort(key=lambda x: x["ts_start"])

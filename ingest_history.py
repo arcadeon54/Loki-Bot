@@ -102,9 +102,31 @@ class ChunkBuilder:
         authors  = list(dict.fromkeys(m.author.display_name for m in msgs))
         user_ids = list(dict.fromkeys(str(m.author.id) for m in msgs))
         first, last = msgs[0], msgs[-1]
+        chunk_id = f"chunk-{first.id}"
+
+        # Per-message records for the message-level vector collection.
+        # Retrieval matches single messages (precise), then expands to the chunk.
+        messages = [
+            {
+                "id": str(m.id),
+                "text": f"{m.author.display_name}: {m.content}",
+                "metadata": {
+                    "chunk_id":   chunk_id,
+                    "guild":      self.guild.name,
+                    "guild_id":   str(self.guild.id),
+                    "channel":    self.channel.name,
+                    "channel_id": str(self.channel.id),
+                    "author":     m.author.display_name,
+                    "user_id":    str(m.author.id),
+                    "ts_unix":    m.created_at.timestamp(),
+                },
+            }
+            for m in msgs
+        ]
 
         return {
-            "id": f"chunk-{first.id}",
+            "id": chunk_id,
+            "messages": messages,
             "text": text,
             "metadata": {
                 "guild":            self.guild.name,
@@ -135,7 +157,12 @@ async def ingest(model_name: str, collection_name: str, full: bool):
     collection = chroma.get_or_create_collection(
         collection_name, metadata={"hnsw:space": "cosine", "embed_model": model_name}
     )
-    log.info(f"Collection '{collection_name}' ready. Currently {collection.count()} chunks.")
+    msg_collection = chroma.get_or_create_collection(
+        f"{collection_name}_messages",
+        metadata={"hnsw:space": "cosine", "embed_model": model_name},
+    )
+    log.info(f"Collection '{collection_name}' ready. "
+             f"{collection.count()} chunks / {msg_collection.count()} messages indexed.")
 
     progress = {} if full else load_progress()
     coll_progress = progress.setdefault(collection_name, {})
@@ -159,6 +186,16 @@ async def ingest(model_name: str, collection_name: str, full: bool):
             documents=[c["text"] for c in batch],
             embeddings=embeddings,
             metadatas=[c["metadata"] for c in batch],
+        )
+        msgs = [m for c in batch for m in c["messages"]]
+        msg_embeddings = model.encode(
+            [m["text"] for m in msgs], normalize_embeddings=True, show_progress_bar=False
+        ).tolist()
+        msg_collection.upsert(
+            ids=[m["id"] for m in msgs],
+            documents=[m["text"] for m in msgs],
+            embeddings=msg_embeddings,
+            metadatas=[m["metadata"] for m in msgs],
         )
 
     @client.event

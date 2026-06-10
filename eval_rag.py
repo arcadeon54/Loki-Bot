@@ -1,16 +1,16 @@
 """
 eval_rag.py — retrieval quality eval for the RAG layer (Phase 1.2 acceptance).
 
+Runs the PRODUCTION search path (rag_search.search_history — message-level
+matching expanded to chunks) with the distance threshold disabled, so it
+reports true ranks and the distances needed to tune RAG_MAX_DISTANCE.
+
 Reads eval cases from eval_queries.json:
     [
       {"query": "when did we talk about the broken dishwasher",
        "expect": ["dishwasher"],            # substrings; a hit counts if ANY appears
        "channel": "general"}                # optional: hit must come from this channel
     ]
-
-For each case, runs the search and reports whether an expected chunk appears in
-the top 5 / top 20 results (ignoring the distance threshold), plus the distance
-of the first correct hit — so thresholds can be tuned from real data.
 
 Compare two models/collections:
     venv/bin/python eval_rag.py \
@@ -20,49 +20,45 @@ Compare two models/collections:
 
 import argparse
 import json
-import os
 import sys
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-CHROMADB_HOST = os.getenv("CHROMADB_HOST", "localhost")
-CHROMADB_PORT = int(os.getenv("CHROMADB_PORT", "8100"))
+import rag_search
 
 
-def query_prefix(model_name: str) -> str:
-    return ("Represent this sentence for searching relevant passages: "
-            if "bge" in model_name else "")
+def configure(model_name: str, collection_name: str):
+    """Point rag_search at a model/collection pair and reset its singletons."""
+    rag_search.EMBED_MODEL = model_name
+    rag_search.QUERY_PREFIX = (
+        "Represent this sentence for searching relevant passages: "
+        if "bge" in model_name else ""
+    )
+    rag_search.COLLECTION_NAME = collection_name
+    rag_search.MAX_DISTANCE = 9.0            # disabled: eval wants raw ranks
+    rag_search.MAX_DISTANCE_WINDOWED = 9.0
+    rag_search._model = None
+    rag_search._client = None
+    rag_search._chunk_collection = None
+    rag_search._msg_collection = None
 
 
 def run_eval(model_name: str, collection_name: str, cases: list) -> dict:
-    model = SentenceTransformer(model_name)
-    client = chromadb.HttpClient(host=CHROMADB_HOST, port=CHROMADB_PORT)
-    collection = client.get_collection(collection_name)
-    prefix = query_prefix(model_name)
-
+    configure(model_name, collection_name)
     results = []
     for case in cases:
-        emb = model.encode(prefix + case["query"], normalize_embeddings=True).tolist()
-        res = collection.query(
-            query_embeddings=[emb], n_results=20,
-            include=["documents", "metadatas", "distances"],
-        )
-        docs  = res["documents"][0]
-        metas = res["metadatas"][0]
-        dists = res["distances"][0]
+        hits = rag_search.search_history(case["query"], n_results=20)
+        hits.sort(key=lambda h: h["distance"])   # rank by relevance, not chronology
 
         rank, dist = None, None
-        for i, (doc, meta) in enumerate(zip(docs, metas)):
-            if case.get("channel") and meta.get("channel") != case["channel"]:
+        for i, h in enumerate(hits):
+            if case.get("channel") and h["channel"] != case["channel"]:
                 continue
-            text = doc.lower()
+            text = h["text"].lower()
             if any(k.lower() in text for k in case["expect"]):
-                rank, dist = i + 1, dists[i]
+                rank, dist = i + 1, h["distance"]
                 break
         results.append({
             "query": case["query"], "rank": rank, "dist": dist,
-            "top1_dist": dists[0] if dists else None,
+            "top1_dist": hits[0]["distance"] if hits else None,
         })
 
     hit5  = sum(1 for r in results if r["rank"] and r["rank"] <= 5)
