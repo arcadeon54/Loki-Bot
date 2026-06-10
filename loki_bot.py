@@ -4533,6 +4533,8 @@ async def rolling_channel_summaries():
             if summary:
                 memory.store_summary(guild_id, channel_id, summary.strip())
                 log.info(f"Rolling summary updated for channel {channel_id}")
+            # Groq free tier is 12k tokens/min — pace the calls instead of bursting
+            await asyncio.sleep(20)
         except Exception as e:
             log.error(f"Rolling summary failed for channel {channel_id}: {e}")
 
