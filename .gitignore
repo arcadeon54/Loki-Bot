@@ -14,3 +14,5 @@ quip_usage.json
 *.db-shm
 *.db-wal
 *.json.bak
+AGENTS.md
+eval_queries.json
