@@ -108,6 +108,12 @@ try:
 except ImportError:
     _tavily = None
 
+try:
+    import tools as loki_tools
+    _tools_available = True
+except ImportError:
+    _tools_available = False
+
 # ─── Timezone ─────────────────────────────────────────────────────────────────
 ET = ZoneInfo("America/New_York")
 
@@ -1257,6 +1263,76 @@ class LLMHandler:
         except Exception as e:
             log.error(f"LLM request failed ({api_url}): {e}")
             return None
+
+    async def _call_raw(self, messages: list[dict], tools: list[dict]) -> dict | None:
+        """One OpenAI chat call with tool schemas attached.
+
+        Returns the full assistant message dict (may contain tool_calls), or
+        None on failure so callers can fall back to the toolless path.
+        """
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.openai_key}"}
+        payload = {
+            "model": self.openai_model,
+            "messages": messages,
+            "tools": tools,
+            "max_completion_tokens": 1024,
+            "temperature": 0.85,
+        }
+        try:
+            session = await get_http_session()
+            async with session.post(
+                self.openai_url, headers=headers, json=payload,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    log.error(f"LLM tool call error {resp.status}: {text[:200]}")
+                    return None
+                data = await resp.json()
+                return data["choices"][0]["message"]
+        except Exception as e:
+            log.error(f"LLM tool request failed: {e}")
+            return None
+
+    async def chat_with_tools(self, messages: list[dict], tool_ctx) -> str:
+        """OpenAI chat with function calling. Tool rounds are capped; any
+        failure falls back to the plain (toolless) chat path so a tool outage
+        never silences the bot."""
+        schemas = loki_tools.schemas_for(tool_ctx.user_id)
+        if not schemas:
+            return await self.chat(messages)
+
+        convo = list(messages)
+        for _round in range(3):
+            msg = await self._call_raw(convo, schemas)
+            if msg is None:
+                return await self.chat(messages)
+
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                return (msg.get("content") or "").strip() or await self.chat(messages)
+
+            convo.append(msg)
+            for tc in tool_calls[:4]:
+                fn = tc.get("function", {})
+                result = await loki_tools.execute(
+                    fn.get("name", ""), fn.get("arguments", ""), tool_ctx
+                )
+                convo.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": result,
+                })
+
+        # Tool-call loop didn't converge — demand a final answer from what's
+        # been gathered (tool messages in history require the tools param).
+        convo.append({"role": "system",
+                      "content": "[Answer now from the tool results above — no more tool calls.]"})
+        msg = await self._call_raw(convo, schemas)
+        if msg and msg.get("content"):
+            return msg["content"].strip()
+        return await self.chat(messages)
 
     async def chat(self, messages: list[dict]) -> str:
         """Send a chat-completion request, falling back to Groq if primary fails."""
@@ -4460,6 +4536,13 @@ async def on_ready():
     except Exception as e:
         log.error(f"Slash command sync error: {e}")
 
+    if _tools_available:
+        loki_tools.bind(download=run_download, http_session=get_http_session)
+        log.info(f"Tools online — {len(loki_tools.REGISTRY)} registered: "
+                 f"{', '.join(loki_tools.REGISTRY)}")
+    else:
+        log.warning("tools module not importable — function calling DISABLED")
+
     # RAG died silently for two months once (module deleted, import swallowed
     # by try/except) — always announce its real state at startup.
     if not _rag_available:
@@ -5334,8 +5417,20 @@ async def on_message(message: discord.Message):
             })
 
         llm.record_hit(message.channel.id)
-        reply = await llm.chat_routed(messages_for_llm, intent, emotion,
-                                      channel_id=message.channel.id)
+        # Tools only on QUESTION/COMMAND (and only on the OpenAI path):
+        # banter shouldn't pay the schema-token overhead on every message.
+        if (_tools_available and LLM_PROVIDER == "openai"
+                and intent in {"QUESTION", "COMMAND"}):
+            tool_ctx = loki_tools.ToolContext(
+                user_id=str(message.author.id),
+                user_name=message.author.display_name,
+                channel_id=str(message.channel.id),
+                guild_id=str(message.guild.id) if message.guild else "",
+            )
+            reply = await llm.chat_with_tools(messages_for_llm, tool_ctx)
+        else:
+            reply = await llm.chat_routed(messages_for_llm, intent, emotion,
+                                          channel_id=message.channel.id)
 
         # ── Cognitive delay — simulate reading + typing speed ─────────────
         # ~0.02s per char of the reply, capped at 6s, with slight jitter

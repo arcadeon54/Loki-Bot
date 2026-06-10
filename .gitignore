@@ -16,3 +16,4 @@ quip_usage.json
 *.json.bak
 AGENTS.md
 eval_queries.json
+tool_calls.jsonl
