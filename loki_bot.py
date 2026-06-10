@@ -1203,6 +1203,66 @@ class VisionHandler:
 
 
 # =============================================================================
+#  MODEL ROUTING + USAGE TRACKING (Phase 4)
+# =============================================================================
+ROUTING_FILE = os.path.join(os.path.dirname(__file__), "routing.json")
+_routing_cache: dict = {}
+_routing_mtime: float = 0.0
+
+
+def get_routing_table() -> dict:
+    """routing.json, cached and hot-reloaded on mtime change — retune without
+    touching code (a restart isn't even needed)."""
+    global _routing_cache, _routing_mtime
+    try:
+        mtime = os.path.getmtime(ROUTING_FILE)
+        if mtime != _routing_mtime:
+            with open(ROUTING_FILE) as f:
+                _routing_cache = json.load(f)
+            _routing_mtime = mtime
+            log.info(f"Routing table loaded: enabled={_routing_cache.get('enabled')} "
+                     f"routes={_routing_cache.get('routes')}")
+    except Exception as e:
+        log.error(f"routing.json unreadable ({e}) — routing disabled, all primary")
+        _routing_cache = {"enabled": False}
+    return _routing_cache
+
+
+class UsageTracker:
+    """Per-backend token/call counts with a daily cost-summary log line."""
+
+    def __init__(self):
+        self.counts: dict[str, dict] = {}
+
+    def add(self, backend: str, usage: dict | None):
+        if not usage:
+            return
+        c = self.counts.setdefault(backend, {"calls": 0, "in": 0, "out": 0})
+        c["calls"] += 1
+        c["in"]  += usage.get("prompt_tokens", 0) or 0
+        c["out"] += usage.get("completion_tokens", 0) or 0
+
+    def summary(self) -> str:
+        if not self.counts:
+            return "no LLM calls recorded"
+        prices = get_routing_table().get("prices_per_million", {})
+        parts, total_cost = [], 0.0
+        for backend, c in sorted(self.counts.items()):
+            p = prices.get(backend, {})
+            cost = (c["in"] * p.get("input", 0) + c["out"] * p.get("output", 0)) / 1_000_000
+            total_cost += cost
+            parts.append(f"{backend}: {c['calls']} calls, "
+                         f"{c['in']:,} in / {c['out']:,} out tok, ~${cost:.3f}")
+        return " | ".join(parts) + f" | est total ~${total_cost:.3f}"
+
+    def reset(self):
+        self.counts = {}
+
+
+usage_tracker = UsageTracker()
+
+
+# =============================================================================
 #  LLM HANDLER — ChatGPT or Local LLM
 # =============================================================================
 class LLMHandler:
@@ -1258,6 +1318,14 @@ class LLMHandler:
         self._channel_hits[cid] = recent
         return len(recent) >= ESCALATION_THRESHOLD
 
+    @staticmethod
+    def _backend_of(api_url: str, is_openai: bool) -> str:
+        if is_openai or "openai.com" in api_url:
+            return "openai"
+        if "groq.com" in api_url:
+            return "groq"
+        return "local"
+
     async def _call(self, api_url: str, api_key: str, model: str,
                     messages: list[dict], is_openai: bool) -> str | None:
         """Make one chat completion call. Returns content string or None on failure."""
@@ -1283,6 +1351,7 @@ class LLMHandler:
                     log.error(f"LLM API error {resp.status} from {api_url}: {text[:200]}")
                     return None
                 data = await resp.json()
+                usage_tracker.add(self._backend_of(api_url, is_openai), data.get("usage"))
                 return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
             log.error(f"LLM request failed ({api_url}): {e}")
@@ -1314,6 +1383,7 @@ class LLMHandler:
                     log.error(f"LLM tool call error {resp.status}: {text[:200]}")
                     return None
                 data = await resp.json()
+                usage_tracker.add("openai", data.get("usage"))
                 return data["choices"][0]["message"]
         except Exception as e:
             log.error(f"LLM tool request failed: {e}")
@@ -1422,7 +1492,28 @@ class LLMHandler:
 
     async def chat_routed(self, messages: list[dict], intent: str, emotion: str,
                           channel_id=None) -> str:
-        """Always route to primary (OpenAI gpt-5.1). Groq is fallback-only inside chat()."""
+        """Route by intent via routing.json (Phase 4).
+
+        UNDO CLAUSE: "enabled": false in routing.json (+ restart) restores the
+        pre-Phase-4 behavior — everything on primary, Groq as failure-fallback
+        only. Decided with the user 2026-06-10.
+        """
+        table = get_routing_table()
+        backend = "primary"
+        if table.get("enabled"):
+            backend = table.get("routes", {}).get(intent, table.get("default", "primary"))
+
+        if backend == "groq" and FALLBACK_LLM_URL and FALLBACK_LLM_API_KEY:
+            model = table.get("groq_model") or FALLBACK_LLM_MODEL
+            log.info(f"Routed to groq/{model} (intent={intent}, emotion={emotion})")
+            result = await self._call(
+                FALLBACK_LLM_URL.rstrip("/") + "/chat/completions",
+                FALLBACK_LLM_API_KEY, model, messages, is_openai=False,
+            )
+            if result is not None:
+                return result
+            log.warning("Groq route failed — falling back to primary")
+
         log.info(f"Routed to primary model (intent={intent}, emotion={emotion})")
         return await self.chat(messages)
 
@@ -4490,6 +4581,14 @@ async def before_detect_threads():
     await bot.wait_until_ready()
 
 
+@tasks.loop(hours=24)
+async def daily_usage_summary():
+    """Log per-backend token usage + estimated cost once a day, then reset.
+    (Phase 4 acceptance: shows whether routing actually cuts the OpenAI bill.)"""
+    log.info(f"📊 Daily LLM usage — {usage_tracker.summary()}")
+    usage_tracker.reset()
+
+
 @tasks.loop(minutes=30)
 async def rolling_channel_summaries():
     """Keep per-channel summaries fresh in the background (Phase 3.2).
@@ -4659,6 +4758,16 @@ async def on_ready():
     if not rolling_channel_summaries.is_running():
         rolling_channel_summaries.start()
     log.info("Rolling channel summary task started (every 30 min)")
+
+    table = get_routing_table()
+    if table.get("enabled"):
+        groq_routes = [i for i, b in table.get("routes", {}).items() if b == "groq"]
+        log.info(f"Model routing ON — {', '.join(groq_routes) or 'nothing'} → Groq, "
+                 "rest → primary (undo: enabled=false in routing.json)")
+    else:
+        log.info("Model routing OFF — all intents → primary")
+    if not daily_usage_summary.is_running():
+        daily_usage_summary.start()
 
     # RAG died silently for two months once (module deleted, import swallowed
     # by try/except) — always announce its real state at startup.

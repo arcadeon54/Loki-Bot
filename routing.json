@@ -1,0 +1,21 @@
+{
+  "_what": "Per-intent model routing (Phase 4). Intents come from the classifier: CHAT, QUESTION, EMOTIONAL, MEMORY, COMMAND.",
+  "_undo": "UNDO CLAUSE: set \"enabled\": false and restart loki to return to all-gpt-5.1 (the pre-Phase-4 behavior). No code changes needed.",
+  "_note": "QUESTION/COMMAND always use the primary (OpenAI) path when tools are available — function calling requires it; their entries here only apply when tools are unavailable.",
+  "enabled": true,
+  "routes": {
+    "CHAT": "groq",
+    "EMOTIONAL": "primary",
+    "MEMORY": "primary",
+    "QUESTION": "primary",
+    "COMMAND": "primary"
+  },
+  "default": "primary",
+  "groq_model": "",
+  "_groq_model": "Optional override for routed-to-groq calls, e.g. meta-llama/llama-4-scout-17b-16e-instruct. Empty = FALLBACK_LLM_MODEL from .env (llama-3.3-70b-versatile).",
+  "prices_per_million": {
+    "openai":  {"input": 1.25, "output": 10.0},
+    "groq":    {"input": 0.0,  "output": 0.0},
+    "_note": "Used only for the daily cost-summary log line. Groq free tier = 0."
+  }
+}
