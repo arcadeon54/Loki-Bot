@@ -4,3 +4,13 @@ venv/
 __pycache__/
 *.pyc
 *.log
+cookies/
+*.bak*
+loki_learned.md
+ingest_progress.json
+jobsite_pending.json
+relay_aliases.json
+quip_usage.json
+*.db-shm
+*.db-wal
+*.json.bak

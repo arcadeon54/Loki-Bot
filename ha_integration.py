@@ -1,0 +1,207 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+import json
+import asyncio
+import logging
+import re
+
+import aiohttp
+from aiohttp import web
+
+log = logging.getLogger(__name__)
+
+HA_URL              = os.getenv("HA_URL", "http://192.168.1.247:8123")
+HA_TOKEN            = os.getenv("HA_TOKEN", "")
+HA_NOTIFY_CHANNEL_ID = int(os.getenv("HA_NOTIFY_CHANNEL_ID", "0"))
+HA_WEBHOOK_PORT     = int(os.getenv("HA_WEBHOOK_PORT", "9100"))
+
+_CONTROL_DOMAINS = {"light", "switch", "sensor", "binary_sensor",
+                    "climate", "fan", "media_player", "camera", "person", "device_tracker"}
+
+def _headers():
+    return {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+
+
+async def get_state(entity_id: str) -> dict | None:
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.get(f"{HA_URL}/api/states/{entity_id}",
+                             headers=_headers(),
+                             timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status == 200:
+                    return await r.json()
+        except Exception as e:
+            log.error(f"HA get_state error: {e}")
+    return None
+
+
+async def get_all_states() -> list:
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.get(f"{HA_URL}/api/states",
+                             headers=_headers(),
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return await r.json()
+        except Exception as e:
+            log.error(f"HA get_all_states error: {e}")
+    return []
+
+
+async def call_service(domain: str, service: str, entity_id: str = None, extra: dict = None) -> bool:
+    payload = {}
+    if entity_id:
+        payload["entity_id"] = entity_id
+    if extra:
+        payload.update(extra)
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.post(f"{HA_URL}/api/services/{domain}/{service}",
+                              headers=_headers(), json=payload,
+                              timeout=aiohttp.ClientTimeout(total=30)) as r:
+                return r.status in (200, 201)
+        except Exception as e:
+            log.error(f"HA call_service error: {e}")
+    return False
+
+
+async def ha_control(query: str, llm) -> str:
+    if not HA_TOKEN:
+        return "Home Assistant isn't configured yet — token missing."
+
+    states = await get_all_states()
+    if not states:
+        return "Couldn't reach Home Assistant right now."
+
+    entities = [s for s in states if s["entity_id"].split(".")[0] in _CONTROL_DOMAINS]
+
+    lines = []
+    for e in entities[:100]:
+        name = e.get("attributes", {}).get("friendly_name", "")
+        suffix = f" ({name})" if name and name != e["entity_id"] else ""
+        lines.append(f"{e['entity_id']} = {e['state']}{suffix}")
+
+    system = (
+        "You are a smart home controller with access to Home Assistant. "
+        "Given a user request and the entity list, respond with ONLY a JSON object — no markdown, no prose.\n\n"
+        "For control actions:\n"
+        '{"action":"service","domain":"light","service":"turn_on","entity_id":"light.bathroom_lamp","reply":"Turning on the bathroom lamp."}\n\n'
+        "For state/sensor queries:\n"
+        '{"action":"state","entity_id":"sensor.govee_thermometer_temperature","reply":"Temperature is {state}°F."}\n\n'
+        "For multi-entity (e.g. all lights off):\n"
+        '{"action":"service","domain":"light","service":"turn_off","entity_id":["light.bathroom_lamp","light.bedroom_lamp"],"reply":"Lights off."}\n\n'
+        "For unknown/unsupported:\n"
+        '{"action":"none","reply":"I can\'t do that through Home Assistant."}\n\n'
+        "Entity list:\n" + "\n".join(lines)
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": query},
+    ]
+
+    raw = await llm.chat(messages)
+
+    try:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return raw.strip()
+        parsed = json.loads(m.group())
+
+        action = parsed.get("action")
+        reply_tmpl = parsed.get("reply", "Done.")
+
+        if action == "service":
+            entity_id = parsed.get("entity_id")
+            success = await call_service(parsed["domain"], parsed["service"], entity_id, parsed.get("extra"))
+            return reply_tmpl if success else "Couldn't reach Home Assistant."
+
+        elif action == "state":
+            state_data = await get_state(parsed["entity_id"])
+            if state_data:
+                return reply_tmpl.replace("{state}", state_data["state"])
+            return "Couldn't get that state from Home Assistant."
+
+        else:
+            return reply_tmpl
+
+    except Exception as e:
+        log.error(f"HA control parse error: {e} | raw: {raw[:300]}")
+        return "Ran into an issue parsing that request."
+
+
+def _make_webhook_app(bot):
+    async def handle_notify(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400, text="bad json")
+
+        msg   = data.get("message", "").strip()
+        title = data.get("title", "").strip()
+        if not msg:
+            return web.Response(status=400, text="no message")
+
+        channel = bot.get_channel(HA_NOTIFY_CHANNEL_ID)
+        if channel:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-I:%M %p, %b %-d %Y")
+            text = f"**{title}**\n{msg}" if title else msg
+            asyncio.create_task(channel.send(f"{text} ({ts})"))
+
+        return web.Response(status=200, text="ok")
+
+    app = web.Application()
+    app.router.add_post("/ha-notify", handle_notify)
+    return app
+
+
+async def start_webhook_server(bot):
+    if not HA_NOTIFY_CHANNEL_ID:
+        log.info("HA webhook disabled — HA_NOTIFY_CHANNEL_ID not set")
+        return
+    app = _make_webhook_app(bot)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HA_WEBHOOK_PORT)
+    await site.start()
+    log.info(f"HA webhook server listening on :{HA_WEBHOOK_PORT}")
+
+
+async def set_alarm(target_dt) -> bool:
+    """Set input_datetime.alarm_time to trigger the morning alarm script."""
+    payload = {
+        "entity_id": "input_datetime.alarm_time",
+        "datetime": target_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.post(
+                f"{HA_URL}/api/services/input_datetime/set_datetime",
+                headers=_headers(), json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                return r.status in (200, 201)
+        except Exception as e:
+            log.error(f"HA set_alarm error: {e}")
+    return False
+
+
+async def cancel_alarm() -> bool:
+    """Clear the alarm by pushing it 365 days out."""
+    import datetime as _dt
+    far_future = (_dt.datetime.now() + _dt.timedelta(days=365)).strftime("%Y-%m-%d 00:00:00")
+    payload = {"entity_id": "input_datetime.alarm_time", "datetime": far_future}
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.post(
+                f"{HA_URL}/api/services/input_datetime/set_datetime",
+                headers=_headers(), json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                return r.status in (200, 201)
+        except Exception as e:
+            log.error(f"HA cancel_alarm error: {e}")
+    return False

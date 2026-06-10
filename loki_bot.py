@@ -40,6 +40,35 @@ from discord import app_commands
 
 import aiohttp
 import google.generativeai as genai
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+from grammar_roast import maybe_grammar_roast
+try:
+    import ha_integration
+    _ha_available = True
+except ImportError:
+    _ha_available = False
+
+try:
+    import jobsite_db
+    jobsite_db.init_db()
+    _jobsite_available = True
+except Exception as _jse:
+    import logging as _jsl
+    _jsl.getLogger(__name__).warning(f"Job site tracker unavailable: {_jse}")
+    _jobsite_available = False
+
+try:
+    import nextcloud_integration as nc_integration
+    _nc_available = True
+except ImportError:
+    _nc_available = False
+
+try:
+    import jd_integration
+    _jd_available = True
+except ImportError:
+    _jd_available = False
 
 # ─── Shared aiohttp session (created in on_ready, used everywhere) ────────────
 _http_session: "aiohttp.ClientSession | None" = None
@@ -96,6 +125,8 @@ LOCAL_LLM_MODEL       = os.getenv("LOCAL_LLM_MODEL", "local-model")
 FALLBACK_LLM_URL      = os.getenv("FALLBACK_LLM_URL", "")
 FALLBACK_LLM_MODEL    = os.getenv("FALLBACK_LLM_MODEL", "")
 FALLBACK_LLM_API_KEY  = os.getenv("FALLBACK_LLM_API_KEY", "")
+ESCALATION_WINDOW     = int(os.getenv("ESCALATION_WINDOW", "90"))       # seconds
+ESCALATION_THRESHOLD  = int(os.getenv("ESCALATION_THRESHOLD", "2"))     # msgs in window to escalate
 ELEVENLABS_API_KEY    = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID   = os.getenv("ELEVENLABS_VOICE_ID", "")
 GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
@@ -103,6 +134,15 @@ SYSTEM_PROMPT         = os.getenv("SYSTEM_PROMPT", "You are Loki, the God of Mis
 MEMORY_DB_PATH        = os.getenv("MEMORY_DB_PATH", "loki_memory.db")
 CONTEXT_MESSAGE_COUNT = int(os.getenv("CONTEXT_MESSAGE_COUNT", "50"))
 MISST_BOT_USER_ID = int(os.getenv("MISST_BOT_USER_ID") or "0")
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID") or "0")
+ROOMMATE_USER_ID = 992855519368851556
+RELAY_CHANNEL_ID = int(os.getenv("RELAY_CHANNEL_ID") or "0")
+
+# ─── Job site tracker settings ────────────────────────────────────────────────
+JOBSITE_CHANNEL_ID      = int(os.getenv("JOBSITE_CHANNEL_ID") or os.getenv("HA_NOTIFY_CHANNEL_ID") or "0")
+JOBSITE_DEVICE_TRACKER  = os.getenv("JOBSITE_DEVICE_TRACKER", "device_tracker.nokia_e23")
+JOBSITE_DWELL_MINUTES   = int(os.getenv("JOBSITE_DWELL_MINUTES", "120"))
+RELAY_CHANNEL_NAME = os.getenv("RELAY_CHANNEL_NAME", "chit-chat")
 SHARED_STATE_PATH = os.getenv("SHARED_STATE_PATH", os.path.expanduser("~/bot-shared-state/loki_state.json"))
 
 # ─── Claude Code settings ─────────────────────────────────────────────────────
@@ -126,8 +166,24 @@ DISCORD_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB — Discord's current hard limi
 # User whose TikTok/Instagram links are auto-downloaded
 AUTO_DOWNLOAD_USER_ID = int(os.getenv("AUTO_DOWNLOAD_USER_ID", "0"))
 
+# Channels where Loki passively watches for platform URLs to auto-download.
+# Outside these channels, only explicit triggers ("post this", "download this movie", etc.) fire.
+# Defaults: #lmfao + #chit-chat in The Break Room.
+AUTO_WATCH_CHANNEL_IDS = {
+    int(x) for x in os.getenv(
+        "AUTO_WATCH_CHANNEL_IDS",
+        "1428938325238091837,1428898779100217461",
+    ).split(",") if x.strip()
+}
+
 # Patterns
 POST_THIS_RE          = re.compile(r'\bpost\s+this\b', re.IGNORECASE)
+SAVE_THIS_RE          = re.compile(r'\b(?:save|download|grab|get)\s+this\b', re.IGNORECASE)
+PRIVATE_DL_VERB_RE    = re.compile(r'\b(?:save|download|grab|get|rip|stash|archive)\b', re.IGNORECASE)
+MOVIE_DL_RE           = re.compile(r'\b(?:download|grab|save|get|rip|archive)\s+(?:this|the)?\s*movie\b', re.IGNORECASE)
+MOVIE_DEST_DIR        = os.getenv("MOVIE_DEST_DIR", "/media/nas/Movies")
+MOVIE_TMP_DIR         = os.path.join(DOWNLOAD_DIR, "_movie_tmp")
+MOVIE_MIN_FREE_GB     = 25
 URL_RE                = re.compile(r'https?://\S+')
 TIKTOK_INSTAGRAM_RE   = re.compile(
     r'https?://(?:[a-z0-9-]+\.)*(?:tiktok\.com|instagram\.com|instagr\.am|threads\.net|threads\.com)\S*',
@@ -157,7 +213,7 @@ MISSED_PATTERNS = [
     re.compile(r"what(?:'d| did) i miss", re.IGNORECASE),
     re.compile(r"catch me up", re.IGNORECASE),
     re.compile(r"what'?s been going on", re.IGNORECASE),
-    re.compile(r"what happened(?: here| while i was gone)?", re.IGNORECASE),
+    re.compile(r"what happened(?!\s+(?:to|with|at|for|between|after|before|during|on the|in the)\b)(?: here| in here| in chat| while i was gone| today| recently| lately)?", re.IGNORECASE),
     re.compile(r"fill me in", re.IGNORECASE),
 ]
 
@@ -181,7 +237,15 @@ _CORRECTION_RE = re.compile(
     r"\b(read\s+the\s+room|not\s+cool|too\s+far|out\s+of\s+pocket|dude\s+no"
     r"|that\s+was\s+not\s+okay|chill\s+loki|loki\s+no|nah\s+loki"
     r"|bad\s+take|missed\s+the\s+mark|that\s+landed\s+(wrong|bad)"
-    r"|wrong\s+move|way\s+off|bro\s+stop|that\s+was\s+off)\b",
+    r"|wrong\s+move|way\s+off|bro\s+stop|that\s+was\s+off"
+    r"|don'?t\s+say\s+that|don'?t\s+(call|use|say)\s+\S+"
+    r"|stop\s+saying|stop\s+calling|that'?s\s+not\s+ok(ay)?"
+    r"|not\s+appropriate|watch\s+your|be\s+careful\s+with"
+    r"|too\s+frequent(ly)?|using\s+\S+\s+too\s+much"
+    r"|don'?t\s+do\s+that\s+again|never\s+say\s+that"
+    r"|loki\s+.{0,30}\s+not\s+ok(ay)?|loki\s+.{0,20}\s+stop"
+    r"|that\s+is\s+not\s+(ok(ay)?|acceptable|cool|funny)"
+    r"|\b(offensive|inappropriate|disrespectful)\b)\b",
     re.IGNORECASE,
 )
 
@@ -196,6 +260,11 @@ _SEARCH_PATTERNS = [
     re.compile(r'\b(release\s+date|when\s+does\s+.{1,30}(come\s+out|drop|release))\b', re.IGNORECASE),
     re.compile(r'\b(who\s+is\s+the\s+(current|new)|what\'?s\s+the\s+(current|latest|new)\s+)\b', re.IGNORECASE),
     re.compile(r'\b(youtube|clip|video|find\s+(a|that|the|me)|can\s+you\s+find|pull\s+up|show\s+me)\b', re.IGNORECASE),
+    re.compile(r'\b(powerball|mega\s+millions?|lottery|lotto|winning\s+number|jackpot|drawing\s+result)\b', re.IGNORECASE),
+    re.compile(r'\b(latest|recent|last\s+night.?s|yesterday.?s|tonight.?s)\s+(result|number|draw|winning|score|match|game)\b', re.IGNORECASE),
+    re.compile(r'\b(what\s+(are|were|is)\s+the\s+(latest|current|recent|last|today.?s|tonight.?s))\b', re.IGNORECASE),
+    re.compile(r'\b(did\s+(\w+\s+){0,3}(win|lose|beat|score)|who\s+(won|lost|scored|beat))\b', re.IGNORECASE),
+    re.compile(r'\b(current(ly)?|right\s+now|as\s+of\s+(today|now)|at\s+the\s+moment)\b', re.IGNORECASE),
 ]
 
 def is_search_query(text: str) -> bool:
@@ -360,6 +429,33 @@ def load_learned_personality() -> str:
     except Exception:
         pass
     return _learned_personality_cache
+
+
+# ─── Home Assistant natural language detection ────────────────────────────────
+_HA_QUERY_RE = re.compile(
+    r'\b(home\s+status|how\'?s?\s+(the\s+)?home|what\'?s?\s+(on|going\s+on)\s+(at\s+)?home'
+    r'|lights?\b|fan\b|heater\b|thermostat\b|temperature\b|\btemp\b|a\.?c\.?\b'
+    r'|lock(ed)?\b|\bdoor\b|motion\s+sensor|camera\b'
+    r'|turn\s+(on|off)\b|switch\s+(on|off)\b|\btoggle\b'
+    r'|living\s*room|bedroom|kitchen|bathroom'
+    r'|is\s+(the\s+)?(fan|heater|light|door|lock|tv)\b'
+    r'|smart\s+(home|plug|switch)\b)',
+    re.IGNORECASE
+)
+
+def is_home_query(text: str) -> bool:
+    return bool(_HA_QUERY_RE.search(text))
+# ─── Morning alarm intent detection ──────────────────────────────────────────
+_ALARM_INTENT_RE = re.compile(
+    r"""(wake\s+me\s+up|set\s+an?\s+alarm|alarm\s+for|alarm\s+at
+           |cancel\s+(the\s+)?alarm|clear\s+(the\s+)?alarm|no\s+alarm
+           |turn\s+off\s+(the\s+)?alarm)""",
+    re.IGNORECASE | re.VERBOSE
+)
+
+def is_alarm_command(text: str) -> bool:
+    return bool(_ALARM_INTENT_RE.search(text))
+
 
 
 def is_missed_query(text: str) -> bool:
@@ -540,7 +636,18 @@ class MemoryDB:
                 created_at      TEXT
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS downloaded_urls (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    TEXT,
+                channel_id  TEXT,
+                user_id     TEXT,
+                url         TEXT NOT NULL,
+                timestamp   TEXT
+            )
+        """)
         # ── Indexes for query performance ─────────────────────────────────
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_urls_url ON downloaded_urls(url, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel_id, id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_user ON messages(channel_id, user_id, id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_role ON messages(channel_id, role, id)")
@@ -1073,16 +1180,53 @@ class LLMHandler:
     OpenAI-compatible endpoint (LM Studio, Ollama, text-generation-webui, etc.)."""
 
     def __init__(self):
+        # Local (Ollama) settings — always configured as base
+        self.local_url   = LOCAL_LLM_URL.rstrip("/") + "/chat/completions"
+        self.local_model = LOCAL_LLM_MODEL
+        # OpenAI settings — used for escalation during active conversation
+        self.openai_url   = "https://api.openai.com/v1/chat/completions"
+        self.openai_key   = OPENAI_API_KEY
+        self.openai_model = OPENAI_MODEL
+        # Per-channel activity tracker: {channel_id: [timestamp, timestamp, ...]}
+        self._channel_hits: dict[str, list[float]] = {}
+
         if LLM_PROVIDER == "openai":
-            self.api_url = "https://api.openai.com/v1/chat/completions"
-            self.api_key = OPENAI_API_KEY
-            self.model   = OPENAI_MODEL
+            self.api_url = self.openai_url
+            self.api_key = self.openai_key
+            self.model   = self.openai_model
+            self._escalation_enabled = False  # already on OpenAI full-time
             log.info(f"LLM: OpenAI  model={self.model}")
         else:
-            self.api_url = LOCAL_LLM_URL.rstrip("/") + "/chat/completions"
+            self.api_url = self.local_url
             self.api_key = "not-needed"
-            self.model   = LOCAL_LLM_MODEL
+            self.model   = self.local_model
+            self._escalation_enabled = bool(OPENAI_API_KEY)
             log.info(f"LLM: Local  url={self.api_url}  model={self.model}")
+            if self._escalation_enabled:
+                log.info(f"LLM: Escalation enabled → OpenAI {self.openai_model} "
+                         f"after {ESCALATION_THRESHOLD} msgs in {ESCALATION_WINDOW}s")
+
+    def record_hit(self, channel_id) -> None:
+        """Record a message timestamp for escalation tracking."""
+        cid = str(channel_id)
+        now = time.monotonic()
+        hits = self._channel_hits.setdefault(cid, [])
+        hits.append(now)
+        # Prune old hits outside the window
+        cutoff = now - ESCALATION_WINDOW
+        self._channel_hits[cid] = [t for t in hits if t > cutoff]
+
+    def should_escalate(self, channel_id) -> bool:
+        """Check if a channel has enough recent activity to escalate to OpenAI."""
+        if not self._escalation_enabled:
+            return False
+        cid = str(channel_id)
+        now = time.monotonic()
+        hits = self._channel_hits.get(cid, [])
+        cutoff = now - ESCALATION_WINDOW
+        recent = [t for t in hits if t > cutoff]
+        self._channel_hits[cid] = recent
+        return len(recent) >= ESCALATION_THRESHOLD
 
     async def _call(self, api_url: str, api_key: str, model: str,
                     messages: list[dict], is_openai: bool) -> str | None:
@@ -1176,25 +1320,9 @@ class LLMHandler:
             log.error(f"Message classification failed: {e}")
         return "QUESTION", "neutral"
 
-    async def chat_routed(self, messages: list[dict], intent: str, emotion: str) -> str:
-        """Route to cheap or expensive model based on intent and emotion."""
-        use_cheap = (
-            intent == "CHAT"
-            and emotion in {"neutral", "joking", "excited"}
-        )
-        if use_cheap and FALLBACK_LLM_URL and FALLBACK_LLM_API_KEY:
-            # Use llama-3.1-8b-instant (higher free TPM limit than 70b)
-            # Keep full system prompt + last 8 messages to preserve personality
-            system_msgs = [m for m in messages if m["role"] == "system"]
-            non_system = [m for m in messages if m["role"] != "system"]
-            trimmed = system_msgs + non_system[-12:]
-            url = FALLBACK_LLM_URL.rstrip("/") + "/chat/completions"
-            result = await self._call(url, FALLBACK_LLM_API_KEY,
-                                      "llama-3.3-70b-versatile", trimmed, is_openai=False)
-            if result:
-                log.info(f"Routed to cheap model (intent={intent}, emotion={emotion})")
-                return result
-        # Fall through to primary model
+    async def chat_routed(self, messages: list[dict], intent: str, emotion: str,
+                          channel_id=None) -> str:
+        """Always route to primary (OpenAI gpt-5.1). Groq is fallback-only inside chat()."""
         log.info(f"Routed to primary model (intent={intent}, emotion={emotion})")
         return await self.chat(messages)
 
@@ -1550,6 +1678,13 @@ _was_muted = False  # track mute state for "I'm back" message
 _member_dir_cache: dict[int, tuple[str, float]] = {}
 _MEMBER_DIR_TTL = 300  # 5 minutes
 
+def _normalize_mentions(text: str) -> str:
+    """Collapse '<@123> @Name' or '<@123>, @Name' emitted by the LLM into just '<@123>'."""
+    if not text:
+        return text
+    return re.sub(r"(<@!?\d+>)[,\s]+@[A-Za-z0-9_.-]+", r"\1", text)
+
+
 def _get_member_directory(guild) -> str:
     """Get member directory string with caching."""
     now = time.time()
@@ -1563,9 +1698,344 @@ def _get_member_directory(guild) -> str:
     _member_dir_cache[guild.id] = (directory, now)
     return directory
 
+
+# \u2500\u2500\u2500 Owner DM relay \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+RELAY_ALIASES_FILE = os.getenv(
+    "RELAY_ALIASES_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay_aliases.json"),
+)
+
+
+def _load_relay_aliases() -> dict[str, str]:
+    """Read alias\u2192user_id map fresh each call so edits take effect without restart."""
+    try:
+        import json
+        with open(RELAY_ALIASES_FILE, "r") as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in data.items() if str(v).isdigit()}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning(f"Relay aliases load failed: {e}")
+        return {}
+
+
+def _build_relay_directory(guild) -> str:
+    """Member directory + aliases, formatted for the relay LLM prompt."""
+    base = _get_member_directory(guild)
+    aliases = _load_relay_aliases()
+    if not aliases:
+        return base
+    extra_lines = []
+    for name, uid in aliases.items():
+        member = guild.get_member(int(uid))
+        if member:
+            extra_lines.append(f"  {name} \u2192 <@{uid}>  (alias for {member.display_name})")
+        else:
+            extra_lines.append(f"  {name} \u2192 <@{uid}>")
+    return base + "\n" + "\n".join(extra_lines)
+
+
+_RELAY_TRIGGER = re.compile(
+    r"^\s*(?:tell|let|say\s+to|say|remind|message|ping|poke|dm|pm|whisper|broadcast|announce)\s+(\S+)",
+    re.IGNORECASE,
+)
+_RELAY_BROADCAST = re.compile(
+    r"^\s*(?:tell|let|say(?:\s+to)?|remind|message|ping|broadcast|announce)\s+"
+    r"(everyone|everybody|y'?all|all\s+of\s+you|the\s+(?:room|chat|channel|crew|group|gang|squad))\b",
+    re.IGNORECASE,
+)
+_RELAY_DM_VERB = re.compile(r"^\s*(?:dm|pm|whisper)\b", re.IGNORECASE)
+# Words that mean "this isn't a relay, fall through to normal chat"
+_RELAY_PRONOUNS = {"me", "us", "him", "her", "them", "yourself", "the"}
+
+
+async def _handle_owner_relay(message: discord.Message) -> bool:
+    """Owner-only DM \u2192 Loki picks the target himself and posts a styled message."""
+    if not OWNER_USER_ID or message.author.id != OWNER_USER_ID:
+        return False
+    if message.guild is not None:
+        return False
+
+    text = (message.content or "").strip()
+    if not text:
+        return False
+
+    mo = _RELAY_TRIGGER.match(text)
+    if not mo:
+        return False
+    is_broadcast = bool(_RELAY_BROADCAST.match(text))
+    is_dm_mode = bool(_RELAY_DM_VERB.match(text)) and not is_broadcast
+    second_word = mo.group(1).lower().strip(",.!?")
+    if not is_broadcast and second_word in _RELAY_PRONOUNS:
+        return False
+
+    # Pick the guild that owns the relay channel.
+    target_guild = None
+    if RELAY_CHANNEL_ID:
+        ch = bot.get_channel(RELAY_CHANNEL_ID)
+        if ch is not None:
+            target_guild = ch.guild
+    if target_guild is None:
+        for g in bot.guilds:
+            if discord.utils.get(g.text_channels, name=RELAY_CHANNEL_NAME):
+                target_guild = g
+                break
+    if target_guild is None:
+        await message.channel.send("\u274c No relay-capable guild found.")
+        return True
+
+    log.info(f"Owner relay request: {text!r} (broadcast={is_broadcast}, dm={is_dm_mode})")
+
+    if is_broadcast:
+        relay_prompt = [
+            {"role": "system", "content": (
+                SYSTEM_PROMPT + "\n\n"
+                "Your owner is privately instructing you over DM to address the WHOLE ROOM "
+                "with a quick announcement. Phrase it in your own voice \u2014 your usual "
+                "mischievous, brief Loki style. Keep it to 1\u20133 sentences. "
+                "Do NOT include any @ mention (no <@USERID>, no @everyone, no @here). "
+                "Do not mention that anyone asked you to relay anything \u2014 speak as if it's "
+                "your own thought."
+            )},
+            {"role": "user", "content": text}
+        ]
+    else:
+        members_str = _build_relay_directory(target_guild)
+        relay_prompt = [
+            {"role": "system", "content": (
+                SYSTEM_PROMPT + "\n\n"
+                "You are being privately instructed by your owner over DM to deliver a message "
+                "to a THIRD PARTY in the server. The owner is NOT the target \u2014 never address the owner. "
+                f"The owner's user ID is {OWNER_USER_ID}; you must never include <@{OWNER_USER_ID}> "
+                "in your reply. The target is whoever the owner names in their instruction. "
+                "Phrase the message in your own voice \u2014 your usual mischievous, brief Loki style. "
+                "Keep it to 1\u20132 sentences. "
+                "Begin your reply with EXACTLY ONE mention of the form <@USERID> picked from the "
+                "directory below (and not the owner), then the message. "
+                "Do not mention that anyone asked you to relay anything \u2014 speak as if it's your own thought. "
+                "If the instruction's target name is ambiguous or not in the directory, reply with "
+                "the literal string NO_TARGET and nothing else.\n\n"
+                f"Server member directory:\n{members_str}"
+            )},
+            {"role": "user", "content": text}
+        ]
+
+    try:
+        reply = await llm.chat(relay_prompt)
+    except Exception as e:
+        log.error(f"Owner relay LLM error: {e}")
+        await message.channel.send(f"\u274c LLM error: {e}")
+        return True
+
+    reply = (reply or "").strip()
+    # Strip any @everyone/@here Loki might sneak in regardless of mode.
+    reply = re.sub(r"@everyone\b", "everyone", reply)
+    reply = re.sub(r"@here\b", "here", reply)
+
+    channel = bot.get_channel(RELAY_CHANNEL_ID) if RELAY_CHANNEL_ID else None
+    if channel is None:
+        channel = discord.utils.get(target_guild.text_channels, name=RELAY_CHANNEL_NAME)
+    if channel is None:
+        await message.channel.send("\u274c Relay channel missing.")
+        return True
+
+    if is_broadcast:
+        # Strip any user mention Loki added, just in case.
+        reply = re.sub(r"<@!?\d+>\s*", "", reply).strip()
+        if not reply:
+            await message.channel.send("\u274c Loki came back empty-handed.")
+            return True
+        try:
+            await channel.send(reply, allowed_mentions=discord.AllowedMentions.none())
+            await message.channel.send(f"\u2705 Broadcast to #{channel.name}.")
+        except Exception as e:
+            log.error(f"Owner relay send error: {e}")
+            await message.channel.send(f"\u274c Send error: {e}")
+        return True
+
+    if reply.upper().startswith("NO_TARGET"):
+        await message.channel.send(f"\u274c Loki couldn't pick a clear target for: `{text}`")
+        return True
+
+    mention_match = re.search(r"<@!?(\d+)>", reply)
+    if not mention_match:
+        log.warning(f"Owner relay: no mention in LLM reply: {reply!r}")
+        await message.channel.send(f"\u274c Loki forgot to tag anyone. He said: {reply}")
+        return True
+
+    if int(mention_match.group(1)) == OWNER_USER_ID:
+        log.warning(f"Owner relay: LLM addressed owner instead of target. reply={reply!r}")
+        await message.channel.send(
+            f"\u274c Loki tried to @ you instead of the target. Try naming the person more clearly.\nHe said: {reply}"
+        )
+        return True
+
+    member_id = int(mention_match.group(1))
+    target = target_guild.get_member(member_id)
+
+    if is_dm_mode:
+        if target is None:
+            await message.channel.send(f"\u274c Couldn't find member <@{member_id}> to DM.")
+            return True
+        # Strip the leading mention from the DM body \u2014 looks weird in a DM.
+        dm_body = re.sub(r"^<@!?\d+>\s*", "", reply).strip()
+        if not dm_body:
+            await message.channel.send("\u274c Loki came back empty-handed.")
+            return True
+        try:
+            await target.send(dm_body)
+            await message.channel.send(f"\u2705 DM'd **{target.display_name}**.")
+        except discord.Forbidden:
+            await message.channel.send(
+                f"\u274c Can't DM **{target.display_name}** \u2014 they have server DMs blocked."
+            )
+        except Exception as e:
+            log.error(f"Owner relay DM error: {e}")
+            await message.channel.send(f"\u274c DM error: {e}")
+        return True
+
+    try:
+        await channel.send(reply)
+        target_label = target.display_name if target else f"user {member_id}"
+        await message.channel.send(f"\u2705 Delivered to **{target_label}** in #{channel.name}.")
+    except Exception as e:
+        log.error(f"Owner relay send error: {e}")
+        await message.channel.send(f"\u274c Send error: {e}")
+    return True
+
+
+# \u2500\u2500 Owner DM \u2192 specific channel post (verbatim or LLM-styled) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# Channel reference must be UNAMBIGUOUS to fire \u2014 else falls through to relay handler.
+# Forms accepted:
+#   <#1234567890>     \u2014 Discord channel mention
+#   #channel-name     \u2014 hash-prefixed name
+#   1234567890        \u2014 bare numeric ID (15-20 digits)
+#   foo channel       \u2014 name followed by literal word "channel" (e.g. "in gaming channel")
+#   the foo channel   \u2014 same with leading "the"
+_STYLE_QUAL = (
+    r"with\s+(?:style|flair|swagger|attitude|some\s+style|some\s+flair)"
+    r"|in\s+your\s+(?:own\s+)?(?:words|voice|style)"
+    r"|loki(?:-|\s+)?style"
+)
+_CHAN_REF_RE = (
+    r"(?P<chan><\#\d+>|\#[\w\-]+|\d{15,20}|(?:the\s+)?[\w][\w\-]+\s+channel)"
+)
+_SAY_IN_CHANNEL = re.compile(
+    rf"""^\s*(?:say|post|tell|send|drop|put)\s+
+        (?P<body>.+?)
+        (?:\s+(?P<style>{_STYLE_QUAL}))?
+        \s+(?:in|to|into)\s+{_CHAN_REF_RE}
+        \s*$""",
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+# Alternate ordering: "in <chan>, say <body> [with style]"
+_SAY_IN_CHANNEL_ALT = re.compile(
+    rf"""^\s*(?:in|to)\s+{_CHAN_REF_RE}
+        \s*[,:]?\s*
+        (?:say|post|tell|send|drop|put)\s+(?P<body>.+?)
+        (?:\s+(?P<style>{_STYLE_QUAL}))?
+        \s*$""",
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+
+def _resolve_channel_ref(ref: str):
+    """Resolve channel reference to a Discord channel. Accepts:
+       <#1234>  •  #name  •  numeric ID  •  'name channel'  •  'the name channel'."""
+    ref = ref.strip()
+    m = re.match(r"^<#(\d+)>$", ref)
+    if m:
+        return bot.get_channel(int(m.group(1)))
+    if ref.isdigit():
+        return bot.get_channel(int(ref))
+    # Strip leading 'the ' and trailing ' channel'
+    name = re.sub(r"^the\s+", "", ref, flags=re.IGNORECASE)
+    name = re.sub(r"\s+channel$", "", name, flags=re.IGNORECASE)
+    name = name.lstrip("#").strip().lower()
+    if not name:
+        return None
+    # Exact name match across all guilds
+    for g in bot.guilds:
+        for ch in g.text_channels:
+            if ch.name.lower() == name:
+                return ch
+    # Substring fallback
+    for g in bot.guilds:
+        for ch in g.text_channels:
+            if name in ch.name.lower():
+                return ch
+    return None
+
+
+async def _handle_owner_channel_say(message: discord.Message) -> bool:
+    """Owner-only DM: 'say <X> in <channel>' (verbatim) or 'say <X> with style in <channel>' (LLM-styled)."""
+    if not OWNER_USER_ID or message.author.id != OWNER_USER_ID:
+        return False
+    if message.guild is not None:
+        return False
+    text = (message.content or "").strip()
+    if not text:
+        return False
+
+    mo = _SAY_IN_CHANNEL.match(text) or _SAY_IN_CHANNEL_ALT.match(text)
+    if not mo:
+        return False
+
+    body = mo.group("body").strip().strip('"\u201c\u201d\u2018\u2019\'')
+    chan_ref = mo.group("chan").strip()
+    style = mo.group("style")
+
+    channel = _resolve_channel_ref(chan_ref)
+    if channel is None:
+        await message.channel.send(f"\u274c Couldn't find channel `{chan_ref}`.")
+        return True
+
+    log.info(f"Owner channel-say: chan=#{channel.name}, style={bool(style)}, body={body[:80]!r}")
+
+    if style:
+        prompt = [
+            {"role": "system", "content": (
+                SYSTEM_PROMPT + "\n\n"
+                "Your owner is privately instructing you over DM to convey the following content "
+                "in YOUR OWN VOICE \u2014 your usual mischievous, clever Loki style. "
+                "Rephrase, expand, or wrap it however feels natural while preserving the meaning. "
+                "Keep it punchy: 1\u20134 sentences. "
+                "Do NOT include any @ mention, @everyone, or @here. "
+                "Do not mention that anyone asked you to relay anything \u2014 speak as if it's your own thought."
+            )},
+            {"role": "user", "content": body},
+        ]
+        try:
+            reply = await llm.chat(prompt)
+        except Exception as e:
+            log.error(f"Owner channel-say LLM error: {e}")
+            await message.channel.send(f"\u274c LLM error: {e}")
+            return True
+        reply = (reply or "").strip()
+        reply = re.sub(r"@everyone\b", "everyone", reply)
+        reply = re.sub(r"@here\b", "here", reply)
+        if not reply:
+            await message.channel.send("\u274c Loki came back empty-handed.")
+            return True
+        body_to_send = reply
+    else:
+        body_to_send = body
+
+    try:
+        await channel.send(body_to_send, allowed_mentions=discord.AllowedMentions.none())
+        kind = "styled" if style else "verbatim"
+        await message.channel.send(f"\u2705 Posted ({kind}) in #{channel.name}.")
+    except Exception as e:
+        log.error(f"Owner channel-say send error: {e}")
+        await message.channel.send(f"\u274c Send error: {e}")
+    return True
+
+
 # Per-channel interjection state
 # { channel_id: {"last_interjection": float, "msgs_since_last": int} }
 interjection_state: dict[str, dict] = {}
+_global_last_interjection: float = 0.0  # max one interjection per hour across all channels
 
 # Per-channel cooldowns for reactions and GIFs (unix timestamps)
 reaction_cooldowns: dict[str, float] = {}
@@ -1600,7 +2070,7 @@ _RAG_PATTERNS = [
     re.compile(r'\b(what did (we|you|he|she|they|y\'?all|yall|everyone|anybody|someone))\b', re.IGNORECASE),
     re.compile(r'\b(what were (we|you|they|everyone) (saying|talking|doing|discussing|thinking))\b', re.IGNORECASE),
     re.compile(r'\b(what (was|were) (said|discussed|decided|agreed|planned|mentioned|brought up))\b', re.IGNORECASE),
-    re.compile(r'\b(what happened|what was happening|what went (down|on))\b', re.IGNORECASE),
+    re.compile(r'\b(what happened(?!\s+(?:to|with|at|for|between|after|before|during)\b)|what was happening|what went (down|on))\b', re.IGNORECASE),
     re.compile(r'\bwhat was (that|the|it|going|up)\b', re.IGNORECASE),
     re.compile(r'\bwho (said|mentioned|brought up|was talking|was saying|decided|planned|suggested|joked|posted|started|called)\b', re.IGNORECASE),
     re.compile(r'\b(where did we|where were we|where was|who was there)\b', re.IGNORECASE),
@@ -1672,16 +2142,31 @@ def parse_query_time_window(text: str) -> tuple:
     return None, None
 
 # ─── Trigger detection ────────────────────────────────────────────────────────
+# ─── Pending Nextcloud deletions: user_id → {nc_path, count} ─────────────────
+_pending_nc_deletion: dict = {}
+_pending_alert: dict = {}  # user_id -> "red" or "yellow"
+_processed_msg_ids: set = set()  # dedup guard — prevent double replies
+_red_alert_active: bool = False  # True while red alert loop is running
+
+_DM_DOWNLOAD_VERB_RE = re.compile(
+    r"\b(download|save|grab|snag|fetch|pull|get)\b",
+    re.IGNORECASE,
+)
+
+def _is_dm_download_intent(text: str) -> bool:
+    return bool(re.search(r"https?://", text)) and bool(_DM_DOWNLOAD_VERB_RE.search(text))
+
+
 def is_trigger(text: str) -> bool:
     """Check if the message mentions one of Loki's trigger names."""
     return bool(_TRIGGER_RE.search(text))
 
 
 SERIOUS_PROMPT = (
-    "You are Loki, but the user has requested a serious response. "
-    "Drop the mischief, sarcasm, and theatrics. Answer genuinely, "
-    "thoughtfully, and directly — like someone intelligent who actually "
-    "gives a damn. Be honest, be helpful, no character games."
+    "You are Loki — but right now, drop the theatrics entirely. No mischief, no roasts, "
+    "no sarcasm, no chaos. Be genuinely helpful, direct, and thoughtful. Answer like "
+    "someone intelligent who actually gives a damn. Honest, clear, concise. "
+    "Save the god-of-mischief act for the group channels — this is one-on-one and real."
 )
 
 
@@ -2056,12 +2541,20 @@ async def _try_cobalt(url: str, dest_dir: str) -> str | None:
                 return None
             # Try to get filename from Content-Disposition
             cd = r.headers.get("Content-Disposition", "")
-            if 'filename=' in cd:
-                fname = cd.split('filename=')[-1].strip().strip('"').strip("'")
-                filepath = os.path.join(dest_dir, fname[:100])
+            m = (
+                re.search(r'filename\*?=\s*"([^"]+)"', cd) or
+                re.search(r"filename\*?=\s*'([^']+)'", cd) or
+                re.search(r'filename\*?=\s*([^;\s"]+)', cd)
+            )
+            if m:
+                fname = m.group(1).strip()
+                filepath = os.path.join(dest_dir, fname[:200])
             with open(filepath, "wb") as f:
                 async for chunk in r.content.iter_chunked(1024 * 64):
                     f.write(chunk)
+            if os.path.getsize(filepath) == 0:
+                os.remove(filepath)
+                return None
         return filepath
     except Exception as e:
         log.info(f"Cobalt attempt failed: {e}")
@@ -2072,17 +2565,28 @@ async def _try_ytdlp(url: str, dest_dir: str) -> str | None:
     """Try downloading via yt-dlp. Returns filepath on success, None on failure."""
     os.makedirs(dest_dir, exist_ok=True)
     output_template = os.path.join(dest_dir, "%(title).80B.%(ext)s")
+    cookies_by_platform = {
+        "instagram": "instagram.txt",
+        "reddit": "reddit.txt",
+        "youtube": "youtube.txt",
+    }
+    cookies_file = cookies_by_platform.get(_detect_platform(url))
     cmd = [
         YTDLP_BIN,
         "-f", "bestvideo[height<=1920]+bestaudio/bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "--no-playlist",
-        "--cookies", os.path.join(os.path.dirname(__file__), "cookies", "instagram.txt"),
-        "--cookies", os.path.join(os.path.dirname(__file__), "cookies", "reddit.txt"),
+        "--js-runtimes", "node",
+    ]
+    if cookies_file:
+        cookies_path = os.path.join(os.path.dirname(__file__), "cookies", cookies_file)
+        if os.path.exists(cookies_path):
+            cmd.extend(["--cookies", cookies_path])
+    cmd.extend([
         "-o", output_template,
         "--print", "after_move:filepath",
         url,
-    ]
+    ])
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -2271,7 +2775,276 @@ def _make_short_filename(requester_dir: str, ext: str = "mp4") -> str:
     return f"vid-{n}.{ext}"
 
 
-async def run_download(url: str, requester: str, trigger_message: discord.Message | None = None):
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "igshid", "ig_rid", "si", "feature", "ref", "fbclid", "t",
+}
+
+def _normalize_url(url: str) -> str:
+    """Normalize a URL for dedup: strip tracking params, trailing slashes, lowercase host."""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    path = parsed.path.rstrip("/")
+    params = parse_qs(parsed.query, keep_blank_values=False)
+    filtered = {k: v for k, v in params.items() if k.lower() not in _TRACKING_PARAMS}
+    query = urlencode(filtered, doseq=True) if filtered else ""
+    return urlunparse(("https", host, path, "", query, ""))
+
+
+def _check_duplicate_url(url: str, guild_id: str) -> dict | None:
+    """Check if a URL was already downloaded in this guild within the last 48 hours.
+    Returns the row dict if duplicate, else None."""
+    normalized = _normalize_url(url)
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=48)).isoformat()
+    cursor = memory.conn.cursor()
+    cursor.execute(
+        "SELECT channel_id, user_id, timestamp FROM downloaded_urls "
+        "WHERE url = ? AND guild_id = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT 1",
+        (normalized, guild_id, cutoff),
+    )
+    row = cursor.fetchone()
+    if row:
+        return {"channel_id": row[0], "user_id": row[1], "timestamp": row[2]}
+    return None
+
+
+def _record_downloaded_url(url: str, guild_id: str, channel_id: str, user_id: str):
+    """Record a successfully downloaded URL."""
+    normalized = _normalize_url(url)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    cursor = memory.conn.cursor()
+    cursor.execute(
+        "INSERT INTO downloaded_urls (guild_id, channel_id, user_id, url, timestamp) VALUES (?, ?, ?, ?, ?)",
+        (guild_id, channel_id, user_id, normalized, now),
+    )
+    memory.conn.commit()
+
+
+async def _warn_duplicate_poster(message: discord.Message, dupe: dict):
+    """Tag the user and warn them about posting a duplicate link. Let Loki craft the message."""
+    orig_channel = f"<#{dupe['channel_id']}>"
+    user_mention = message.author.mention
+    prompt_msgs = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"[SYSTEM: {message.author.display_name} just posted a link that was already "
+            f"downloaded and posted in {orig_channel}. Their duplicate message has been deleted. "
+            f"Write a short (1-2 sentence) quip calling them out for the double-post. "
+            f"Be playful but make it clear the dupe was removed. Don't include the link itself.]"
+        )},
+    ]
+    warning_text = await llm.chat(prompt_msgs)
+    await message.channel.send(f"{user_mention} {warning_text}")
+
+
+async def run_movie_download(url: str, requester: str, trigger_message: discord.Message | None = None):
+    """Download a full-length movie via yt-dlp and save to the NAS Movies library.
+
+    Distinct from run_download: no Discord upload, no compression, no per-user folder.
+    Downloads to a local tmp dir first (CIFS mid-write is fragile), then moves to NAS.
+    Reports progress back to the channel the trigger came from.
+    """
+    if trigger_message is None:
+        return
+    channel = trigger_message.channel
+
+    if not os.path.ismount("/media/nas"):
+        log.warning(f"run_movie_download: NAS not mounted — aborting for {requester}")
+        await channel.send(
+            f"❌ NAS isn't mounted — can't save movie for **{requester}**. "
+            f"Run `sudo mount -a` on dex247."
+        )
+        return
+    try:
+        os.makedirs(MOVIE_DEST_DIR, exist_ok=True)
+    except Exception as e:
+        log.warning(f"run_movie_download: makedirs NAS failed: {e}")
+        await channel.send(f"❌ Can't write to NAS Movies dir: {e}")
+        return
+
+    try:
+        os.makedirs(MOVIE_TMP_DIR, exist_ok=True)
+        free_gb = shutil.disk_usage(MOVIE_TMP_DIR).free / (1024 ** 3)
+        if free_gb < MOVIE_MIN_FREE_GB:
+            log.warning(f"run_movie_download: low disk — {free_gb:.1f} GB free")
+            await channel.send(
+                f"❌ Only {free_gb:.1f} GB free on dex247 — need {MOVIE_MIN_FREE_GB} GB headroom."
+            )
+            return
+    except Exception as e:
+        log.warning(f"run_movie_download: disk check failed: {e}")
+        await channel.send(f"❌ Disk check failed: {e}")
+        return
+
+    status_msg = await channel.send(f"🎬 Starting movie download for **{requester}**...")
+    log.info(f"run_movie_download: {url} requested by {requester}")
+
+    output_template = os.path.join(MOVIE_TMP_DIR, "%(title)s.%(ext)s")
+    cmd = [
+        YTDLP_BIN,
+        "-f", "bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--newline",
+        "--no-colors",
+        "-o", output_template,
+        "--print", "after_move:filepath",
+        url,
+    ]
+
+    filepath = None
+    last_progress = ""
+    last_edit_ts = 0.0
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr_tail: list[str] = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode(errors="replace").rstrip()
+            if decoded.startswith("[download]") and "%" in decoded:
+                last_progress = decoded
+                now = asyncio.get_event_loop().time()
+                if now - last_edit_ts > 15:
+                    last_edit_ts = now
+                    try:
+                        await status_msg.edit(
+                            content=f"🎬 Downloading for **{requester}**...\n```\n{last_progress[:180]}\n```"
+                        )
+                    except Exception:
+                        pass
+            elif os.path.isabs(decoded) and os.path.exists(decoded):
+                filepath = decoded
+        err = await proc.stderr.read()
+        stderr_tail = err.decode(errors="replace").splitlines()[-5:]
+        rc = await proc.wait()
+        if rc != 0:
+            tail = "\n".join(stderr_tail)[-400:]
+            log.warning(f"run_movie_download: yt-dlp rc={rc} url={url}\n{tail}")
+            await status_msg.edit(content=f"❌ yt-dlp failed for **{requester}** (rc={rc}):\n```\n{tail}\n```")
+            return
+    except Exception as e:
+        log.exception("run_movie_download: yt-dlp crashed")
+        try:
+            await status_msg.edit(content=f"❌ Movie download crashed: {e}")
+        except Exception:
+            pass
+        return
+
+    if not filepath or not os.path.exists(filepath):
+        log.warning(f"run_movie_download: yt-dlp rc=0 but no file produced url={url}")
+        await status_msg.edit(content=f"❌ yt-dlp finished but no file was produced for **{requester}**.")
+        return
+
+    basename = os.path.basename(filepath)
+    dest_path = os.path.join(MOVIE_DEST_DIR, basename)
+    if os.path.exists(dest_path):
+        log.info(f"run_movie_download: duplicate — {basename} already in library")
+        await status_msg.edit(
+            content=f"ℹ️ **{basename}** already exists in Movies library. "
+                    f"New copy kept at `{filepath}` on dex247 — remove or rename manually."
+        )
+        return
+    try:
+        await status_msg.edit(content=f"📦 Moving **{basename}** to NAS...")
+        await asyncio.to_thread(shutil.move, filepath, dest_path)
+    except Exception as e:
+        log.exception("run_movie_download: move to NAS failed")
+        await status_msg.edit(
+            content=f"❌ Downloaded but move to NAS failed: {e}\nFile stuck at `{filepath}`"
+        )
+        return
+
+    try:
+        size_gb = os.path.getsize(dest_path) / (1024 ** 3)
+    except Exception:
+        size_gb = 0
+    await status_msg.edit(
+        content=f"✅ Saved **{basename}** to NAS Movies ({size_gb:.1f} GB) — requested by **{requester}**"
+    )
+    log.info(f"run_movie_download: done → {dest_path} ({size_gb:.2f} GB)")
+
+
+async def run_dm_download(url: str, message: discord.Message):
+    """Handle a DM download request: download -> Nextcloud -> share link -> keep/delete prompt."""
+    if not _nc_available:
+        await message.channel.send("Nextcloud isn't loaded -- can't process DM downloads right now.")
+        return
+
+    requester_name = message.author.display_name or message.author.name
+    requester_safe = _sanitize_folder_name(requester_name)
+    date_str = now_et().strftime("%Y-%m-%d")
+    dm_channel = message.channel
+    platform = _detect_platform(url)
+
+    status_msg = await dm_channel.send("Downloading...")
+    local_files = []
+
+    staging = os.path.join(DOWNLOAD_DIR, "_dm_staging", requester_safe, date_str)
+    os.makedirs(staging, exist_ok=True)
+    filepath = None
+    if _is_image_url(url) and not filepath:
+        filepath = await _try_direct_image(url, staging)
+    if platform == "threads" and not filepath:
+        filepath = await _try_threads(url, staging)
+    if platform == "twitter" and not filepath:
+        filepath = await _try_fxtwitter(url, staging)
+    if platform == "facebook" and not filepath:
+        filepath = await _try_fbdownloader(url, staging)
+    if platform == "pinterest" and not filepath:
+        filepath = await _try_pinterest_scraper(url, staging)
+    if platform in ("tiktok", "instagram", "twitter", "reddit", "youtube") and not filepath:
+        filepath = await _try_cobalt(url, staging)
+    if platform == "tiktok" and not filepath:
+        filepath = await _try_tikwm(url, staging)
+    if platform == "instagram" and not filepath:
+        filepath = await _try_snapinsta(url, staging)
+    if not filepath:
+        filepath = await _try_ytdlp(url, staging)
+    if not filepath:
+        filepath = await _try_gallery_dl(url, staging)
+
+    if filepath:
+        local_files = [filepath]
+    elif platform == "other" and _jd_available:
+        await status_msg.edit(content="Standard tools couldn't grab it -- sending to JDownloader as a last resort...")
+        ok, dest_host = await jd_integration.queue_url(url, requester_safe, date_str)
+        if not ok:
+            await status_msg.edit(content="Couldn't reach JDownloader. Make sure the container is running.")
+            return
+        await status_msg.edit(content="JDownloader is scanning and downloading -- I'll update you when it's done...")
+        local_files = await jd_integration.wait_for_completion(dest_host)
+        if not local_files:
+            await status_msg.edit(content="JDownloader timed out or found nothing on that page.")
+            return
+    else:
+        await status_msg.edit(content=f"Couldn't download that link.")
+        return
+
+    count = len(local_files)
+    await status_msg.edit(content=f"Got {count} file(s) -- uploading to Nextcloud...")
+
+    share_url, nc_folder = await nc_integration.upload_and_share(local_files, requester_name, date_str)
+
+    if not share_url:
+        await status_msg.edit(content="Nextcloud upload failed. Files may still be on dex247.")
+        return
+
+    file_word = "file" if count == 1 else f"{count} files"
+    await status_msg.delete()
+    await dm_channel.send(
+        f"Your {file_word} are ready:\n{share_url}\n\n"
+        "Want me to **delete** this from Nextcloud when you're done, or **keep** it?"
+    )
+    _pending_nc_deletion[message.author.id] = {"nc_path": nc_folder, "count": count}
+
+
+async def run_download(url: str, requester: str, trigger_message: discord.Message | None = None, private: bool = False):
     """Download a URL and post to the downloads channel.
 
     Fallback chain: Cobalt → yt-dlp → gallery-dl
@@ -2284,15 +3057,33 @@ async def run_download(url: str, requester: str, trigger_message: discord.Messag
         except Exception:
             pass
 
-    dest_channel = bot.get_channel(DOWNLOAD_CHANNEL_ID)
-    if dest_channel is None:
-        log.error(f"run_download: downloads channel {DOWNLOAD_CHANNEL_ID} not found")
-        return
+    if private:
+        dest_channel = None
+        dm_user = trigger_message.author if trigger_message else None
+    else:
+        dest_channel = bot.get_channel(DOWNLOAD_CHANNEL_ID)
+        if dest_channel is None:
+            log.error(f"run_download: downloads channel {DOWNLOAD_CHANNEL_ID} not found")
+            return
+        dm_user = None
 
     platform = _detect_platform(url)
-    requester_dir = os.path.join(DOWNLOAD_DIR, _sanitize_folder_name(requester))
+    date_str = now_et().strftime("%Y-%m-%d")
+    requester_dir = os.path.join(DOWNLOAD_DIR, _sanitize_folder_name(requester), date_str)
     os.makedirs(requester_dir, exist_ok=True)
-    status_msg = await dest_channel.send(f"⏬ Downloading `{platform}` link for **{requester}**...")
+
+    if private and dm_user:
+        try:
+            dm_channel = await dm_user.create_dm()
+            status_msg = await dm_channel.send(f"⏬ Downloading `{platform}` link privately...")
+        except Exception:
+            log.error(f"run_download: could not DM {requester}")
+            return
+    elif dest_channel:
+        status_msg = await dest_channel.send(f"⏬ Downloading `{platform}` link for **{requester}**...")
+    else:
+        log.error("run_download: no destination channel available")
+        return
 
     filepath = None
 
@@ -2367,7 +3158,13 @@ async def run_download(url: str, requester: str, trigger_message: discord.Messag
             log.info(f"run_download: gallery-dl succeeded → {filepath}")
 
     if not filepath:
-        await status_msg.edit(content=f"❌ All download methods failed for <{url}>\nRequested by **{requester}**")
+        if platform == "other":
+            await status_msg.edit(content=(
+                f"🤷 That site's not on my menu, **{requester}** — <{url}>\n"
+                f"_(I handle TikTok, Instagram, Twitter/X, Reddit, YouTube, Facebook, Threads, Pinterest, and direct image links.)_"
+            ))
+        else:
+            await status_msg.edit(content=f"❌ All download methods failed for <{url}>\nRequested by **{requester}**")
         return
 
     # Rename to short channel-based filename
@@ -2390,15 +3187,26 @@ async def run_download(url: str, requester: str, trigger_message: discord.Messag
         filename   = os.path.basename(filepath)
         file_size  = os.path.getsize(filepath)
 
+    out_channel = dm_channel if (private and dm_user) else dest_channel
+
     if file_size <= DISCORD_UPLOAD_LIMIT:
         await status_msg.delete()
-        await dest_channel.send(
-            f"📥 {platform.capitalize()}  •  {file_size/1024/1024:.1f} MB  •  requested by **{requester}**",
-            file=discord.File(filepath, filename=filename),
-        )
+        if private:
+            await out_channel.send(
+                f"📥 {platform.capitalize()}  •  {file_size/1024/1024:.1f} MB  •  saved privately",
+                file=discord.File(filepath, filename=filename),
+            )
+        else:
+            await out_channel.send(
+                f"📥 {platform.capitalize()}  •  {file_size/1024/1024:.1f} MB  •  requested by **{requester}**",
+                file=discord.File(filepath, filename=filename),
+            )
     else:
-        # Still too large — post a direct media link Discord can embed
-        if MEDIA_BASE_URL:
+        if private:
+            await status_msg.edit(
+                content=f"📁 **{filename}** ({file_size/1024/1024:.1f} MB) — saved to server. Too large to DM."
+            )
+        elif MEDIA_BASE_URL:
             rel_path = os.path.relpath(filepath, DOWNLOAD_DIR)
             media_url = f"{MEDIA_BASE_URL}/{rel_path}"
             await status_msg.delete()
@@ -2413,12 +3221,32 @@ async def run_download(url: str, requester: str, trigger_message: discord.Messag
                 )
             )
 
+    # ── Record URL for duplicate detection ───────────────────────────────
+    if trigger_message and trigger_message.guild:
+        _record_downloaded_url(
+            url,
+            str(trigger_message.guild.id),
+            str(trigger_message.channel.id),
+            str(trigger_message.author.id),
+        )
+
     log.info(f"run_download: done — {filename} for {requester}")
+
+
+def _sanitize_name_for_llm(username: str, fallback_id: str = "") -> str:
+    if username:
+        cleaned = re.sub(r'[^a-zA-Z0-9_-]', '_', username).strip('_')[:64]
+        if cleaned:
+            return cleaned
+    if fallback_id:
+        return f"u_{re.sub(r'[^a-zA-Z0-9_-]', '', str(fallback_id))[:60]}"
+    return "user"
 
 
 def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
                        serious: bool = False, guild=None,
-                       target_user_id=None, reply_user_id=None) -> list[dict]:
+                       target_user_id=None, reply_user_id=None,
+                       extra_user_name: str = "", extra_user_id: str = "") -> list[dict]:
     """Build the messages list for the LLM.
 
     Injects: system prompt, mood context, @mention member directory,
@@ -2456,6 +3284,24 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
                 )
 
     msgs = [{"role": "system", "content": prompt}]
+
+    # ── Member directory for @mentions ────────────────────────────────────
+    if guild is not None:
+        try:
+            members = [m for m in guild.members if not m.bot]
+            if members:
+                member_dir = "\n".join(f"  {m.display_name} → <@{m.id}>" for m in members)
+                msgs.append({
+                    "role": "system",
+                    "content": (
+                        "[Member directory — when @mentioning someone, use ONLY the <@ID> token from this list. "
+                        "Do NOT also write their @name or display name next to it. Do NOT prefix with @. "
+                        "Do NOT type the raw ID number as plain text. One token per person: <@ID>, nothing else.]\n"
+                        + member_dir
+                    )
+                })
+        except Exception:
+            pass
 
     # ── Relationship memory for the person Loki is responding to ──────────
     if target_user_id and guild_id and not serious:
@@ -2528,10 +3374,36 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
             text = f"[{username}]: {content}"
             if image_desc:
                 text += f"\n[Image in message: {image_desc}]"
-            msgs.append({"role": "user", "content": text})
+            msgs.append({
+                "role": "user",
+                "name": _sanitize_name_for_llm(username, fallback_id=user_id),
+                "content": text,
+            })
 
     if extra_user_msg:
-        msgs.append({"role": "user", "content": extra_user_msg})
+        extra_msg = {"role": "user", "content": extra_user_msg}
+        if extra_user_name or extra_user_id:
+            extra_msg["name"] = _sanitize_name_for_llm(extra_user_name, fallback_id=extra_user_id)
+        msgs.append(extra_msg)
+
+    # Final-position length nudge counters few-shot drag from past short replies.
+    # Skipped in serious mode and during Miss-T cool_down (which wants shorter).
+    if not serious:
+        on_cooldown_now = False
+        if shared is not None:
+            try:
+                cd, mod = shared.is_loki_on_cooldown()
+                on_cooldown_now = bool(cd and mod == "cool_down")
+            except Exception:
+                on_cooldown_now = False
+        if not on_cooldown_now:
+            msgs.append({"role": "system", "content": (
+                "[Reply-length reminder — your recent replies have been running short. "
+                "Default to 1-2 full paragraphs: develop the thought, land the joke completely, "
+                "give context and texture instead of stopping at the first punchline. "
+                "Single-sentence replies are only for genuine one-liner moments "
+                "(quick reactions, simple yes/no, quips). Otherwise: take the space.]"
+            )})
 
     return msgs
 
@@ -2819,6 +3691,309 @@ async def maybe_send_gif(channel: discord.TextChannel, context: str):
 
 
 # =============================================================================
+#  JOB SITE TRACKER
+# =============================================================================
+
+# Runtime state — reset on bot restart, which is fine (dwell resets anyway)
+_jobsite_state: dict = {
+    "lat": None,
+    "lon": None,
+    "arrived_at": None,       # datetime when we first settled at this spot
+    "notified_unknown": False, # True once we've sent the "is this a job site?" prompt
+    "notified_known": None,    # site_id of last arrival briefing sent
+    "notified_known_at": None, # datetime when arrival at known site was first announced
+    "prev_zone": None,         # zone state from last poll cycle
+}
+# Pending confirmations keyed by Discord user_id (int)
+_JOBSITE_PENDING_PATH = os.path.join(os.path.dirname(__file__), "jobsite_pending.json")
+
+def _load_jobsite_pending() -> dict[int, dict]:
+    try:
+        with open(_JOBSITE_PENDING_PATH) as f:
+            return {int(k): v for k, v in json.load(f).items()}
+    except (FileNotFoundError, Exception):
+        return {}
+
+def _save_jobsite_pending(pending: dict[int, dict]) -> None:
+    try:
+        with open(_JOBSITE_PENDING_PATH, "w") as f:
+            json.dump({str(k): v for k, v in pending.items()}, f)
+    except Exception as e:
+        log.error(f"Failed to save jobsite_pending: {e}")
+
+_jobsite_pending: dict[int, dict] = _load_jobsite_pending()
+
+# Regex patterns for job site commands
+_JS_ADD_NOTE_RE   = re.compile(r'\badd\s+note[:\s]+(.+)', re.IGNORECASE | re.DOTALL)
+_JS_LIST_RE       = re.compile(r'\b(job\s*sites?|my\s*sites?|site\s*list)\b', re.IGNORECASE)
+_JS_NOTES_RE      = re.compile(r'\b(?:site\s+notes?|notes?\s+for)\s+(?!(?:me|you|us|him|her|them|the)\b)(.+)', re.IGNORECASE)
+_JS_SAVE_AS_RE    = re.compile(r'\bsave\s+as\s+(.+)', re.IGNORECASE)
+_JS_YES_RE        = re.compile(r'^\s*(yes|yeah|yep|yup|affirmative|correct|sure|save\s+it)(\W.*)?$', re.IGNORECASE)
+_JS_NO_RE         = re.compile(r'^\s*(no|nope|skip|ignore|cancel|nah)(\W.*)?$', re.IGNORECASE)
+
+
+async def _reverse_geocode(lat: float, lon: float) -> str | None:
+    try:
+        session = await get_http_session()
+        url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
+        async with session.get(
+            url,
+            headers={"User-Agent": "LokiBot/1.0 (home-lab discord bot)"},
+            timeout=aiohttp.ClientTimeout(total=6),
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                addr = data.get("display_name", "")
+                # Return first two meaningful parts (street + city)
+                parts = [p.strip() for p in addr.split(",") if p.strip()]
+                return ", ".join(parts[:2]) if parts else addr
+    except Exception:
+        pass
+    return None
+
+
+
+async def _handle_alarm_command(message: discord.Message, content_text: str) -> bool:
+    """Parse wake/alarm intent and set or cancel the HA morning alarm."""
+    if not _ha_available or not ha_integration.HA_TOKEN:
+        return False
+
+    text = content_text.lower().strip()
+
+    # Cancel/clear path
+    if re.search(r"""(cancel|clear|no|turn\s+off)\s+(the\s+)?alarm""", text, re.IGNORECASE):
+        ok = await ha_integration.cancel_alarm()
+        reply = "Alarm cleared. " + ("🚫" if ok else "(couldn't reach HA though)")
+        await message.reply(reply, mention_author=False)
+        return True
+
+    # Extract a time string from the message
+    m = re.search(
+        r"""(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})""",
+        text, re.IGNORECASE
+    )
+    if not m:
+        # Try tomorrow at X
+        m = re.search(r"""(tomorrow\s+at\s+\S+)""", text, re.IGNORECASE)
+
+    if not m:
+        await message.reply(
+            "I need a time. Try: *wake me up at 7:30am* or *alarm at 8*",
+            mention_author=False
+        )
+        return True
+
+    time_str = m.group(1).strip()
+    # Normalise for parse_reminder_time
+    if not re.match(r"""^(at|in|tomorrow|tonight)""", time_str, re.IGNORECASE):
+        time_str = "at " + time_str
+
+    fire_at = parse_reminder_time(time_str)
+    if not fire_at:
+        await message.reply(
+            f"Couldn't parse "**{m.group(1)}**" as a time. Try *7:30am* or *7:30*.",
+            mention_author=False
+        )
+        return True
+
+    ok = await ha_integration.set_alarm(fire_at)
+    if ok:
+        label = fire_at.strftime("%-I:%M %p")
+        reply = f"⏰ Alarm set for **{label}**. I'll wake you up with your track. One-shot — it clears itself after it fires."
+    else:
+        reply = "Couldn't reach Home Assistant to set the alarm."
+
+    await message.reply(reply, mention_author=False)
+    return True
+
+async def _handle_jobsite_command(message: discord.Message, content_text: str) -> str | None:
+    """Return a reply string if this message is a job site command, else None."""
+    if not _jobsite_available:
+        return None
+
+    uid = message.author.id
+
+    # ── Pending confirmation: user is responding to "is this a job site?" ──
+    if uid in _jobsite_pending:
+        pending = _jobsite_pending[uid]
+
+        m_save = _JS_SAVE_AS_RE.search(content_text)
+        if m_save:
+            name = m_save.group(1).strip()
+            jobsite_db.add_site(name, pending["lat"], pending["lon"])
+            del _jobsite_pending[uid]
+            _save_jobsite_pending(_jobsite_pending)
+            return f"✅ Saved as **{name}**. Add notes any time with `add note: [text]`."
+
+        if _JS_YES_RE.match(content_text):
+            name = pending.get("addr") or f"Site {datetime.datetime.utcnow().strftime('%Y-%m-%d')}"
+            jobsite_db.add_site(name, pending["lat"], pending["lon"])
+            del _jobsite_pending[uid]
+            _save_jobsite_pending(_jobsite_pending)
+            return f"✅ Saved as **{name}**. You can rename it with `save as [new name]` or add notes with `add note: [text]`."
+
+        if _JS_NO_RE.match(content_text):
+            del _jobsite_pending[uid]
+            _save_jobsite_pending(_jobsite_pending)
+            _jobsite_state["notified_unknown"] = False  # allow re-prompt after more dwell
+            return "Got it — skipped. I'll keep an eye on it."
+
+        # Didn't match yes/no/save — fall through to other checks
+        # (don't consume the message for non-matching responses)
+
+    # ── "add note: ..." ────────────────────────────────────────────────────
+    m_note = _JS_ADD_NOTE_RE.search(content_text)
+    if m_note:
+        note_text = m_note.group(1).strip()
+        lat = _jobsite_state.get("lat")
+        lon = _jobsite_state.get("lon")
+        if lat is None or lon is None:
+            return "I don't have your current GPS — make sure the Home Assistant companion app is running and location is enabled."
+        nearby = jobsite_db.find_nearby(lat, lon, radius_m=500)
+        if not nearby:
+            sites = jobsite_db.list_sites()
+            if not sites:
+                return "No job sites saved yet. I'll prompt you when you've been at a new location for 2 hours."
+            # Try to attach note to most recently visited site instead
+            last = sites[0]
+            jobsite_db.append_note(last["id"], note_text)
+            return f"📝 Note added to **{last['name']}** (your most recent site — you don't seem to be nearby any saved site right now)."
+        site = nearby[0]
+        jobsite_db.append_note(site["id"], note_text)
+        return f"📝 Note added to **{site['name']}**."
+
+    # ── "job sites" / "my sites" / "site list" ────────────────────────────
+    if _JS_LIST_RE.search(content_text):
+        sites = jobsite_db.list_sites()
+        if not sites:
+            return "No job sites saved yet. I'll prompt you when you've been at a new location for 2+ hours."
+        lines = [f"**Job Sites** ({len(sites)} total)"]
+        for s in sites:
+            last = s["last_visited"][:10] if s["last_visited"] else "never"
+            lines.append(f"• **{s['name']}** — last visited {last}")
+        return "\n".join(lines)
+
+    # ── "site notes [name]" / "notes for [name]" ──────────────────────────
+    m_notes = _JS_NOTES_RE.search(content_text)
+    if m_notes:
+        query = m_notes.group(1).strip().lower()
+        sites = jobsite_db.list_sites()
+        match = next((s for s in sites if query in s["name"].lower()), None)
+        if not match:
+            return f"No job site found matching \"{query}\"."
+        notes = (match["notes"] or "").strip() or "No notes on file yet."
+        return f"📋 **{match['name']} — Notes:**\n{notes}"
+
+    return None
+
+
+@tasks.loop(minutes=10)
+async def jobsite_poll():
+    """Poll HA device tracker every 10 min; detect dwell at unknown locations."""
+    if not _jobsite_available:
+        return
+    if not _ha_available or not ha_integration.HA_TOKEN:
+        return
+    if not JOBSITE_CHANNEL_ID:
+        return
+
+    state = await ha_integration.get_state(JOBSITE_DEVICE_TRACKER)
+    if not state:
+        return
+
+    attrs = state.get("attributes", {})
+    lat = attrs.get("latitude")
+    lon = attrs.get("longitude")
+    zone_state = state.get("state", "").lower()
+
+    if lat is None or lon is None:
+        return
+
+    now = datetime.datetime.utcnow()
+    prev_zone = _jobsite_state.get("prev_zone")
+    channel = bot.get_channel(JOBSITE_CHANNEL_ID)
+
+    _jobsite_state["prev_zone"] = zone_state
+
+    # Skip home and work — no job site prompts there
+    if zone_state in ("home", "work"):
+        if _jobsite_state["notified_known"] is not None and _jobsite_state.get("notified_known_at") and channel:
+            site = jobsite_db.get_site(_jobsite_state["notified_known"])
+            if site:
+                elapsed = int((now - _jobsite_state["notified_known_at"]).total_seconds() / 60) + JOBSITE_DWELL_MINUTES
+                hours, mins = divmod(elapsed, 60)
+                dur = f"{hours}h {mins}m" if hours else f"{mins}m"
+                await channel.send(f"Leaving **{site['name']}** - {dur} on site. ({now_et().strftime('%-I:%M %p, %b %-d %Y')})")  
+        _jobsite_state.update({"lat": lat, "lon": lon, "arrived_at": None,
+                               "notified_unknown": False, "notified_known": None,
+                               "notified_known_at": None})
+        return
+    prev_lat = _jobsite_state["lat"]
+    prev_lon = _jobsite_state["lon"]
+
+    # Check if we've moved more than 100m since last poll
+    moved = True
+    if prev_lat is not None and prev_lon is not None:
+        dist = jobsite_db._dist_m(lat, lon, prev_lat, prev_lon)
+        moved = dist > 100
+
+    if moved:
+        if _jobsite_state["notified_known"] is not None and _jobsite_state.get("notified_known_at") and channel:
+            site = jobsite_db.get_site(_jobsite_state["notified_known"])
+            if site:
+                elapsed = int((now - _jobsite_state["notified_known_at"]).total_seconds() / 60) + JOBSITE_DWELL_MINUTES
+                hours, mins = divmod(elapsed, 60)
+                dur = f"{hours}h {mins}m" if hours else f"{mins}m"
+                await channel.send(f"Leaving **{site['name']}** - {dur} on site. ({now_et().strftime('%-I:%M %p, %b %-d %Y')})")  
+        _jobsite_state.update({"lat": lat, "lon": lon, "arrived_at": now,
+                               "notified_unknown": False, "notified_known": None,
+                               "notified_known_at": None})
+        return
+
+    arrived_at = _jobsite_state["arrived_at"]
+    if arrived_at is None:
+        _jobsite_state["arrived_at"] = now
+        return
+
+    dwell_minutes = (now - arrived_at).total_seconds() / 60
+    if dwell_minutes < JOBSITE_DWELL_MINUTES:
+        return
+
+    if not channel:
+        return
+
+    nearby = jobsite_db.find_nearby(lat, lon)
+
+    if nearby:
+        site = nearby[0]
+        if _jobsite_state["notified_known"] != site["id"]:
+            _jobsite_state["notified_known"] = site["id"]
+            _jobsite_state["notified_known_at"] = now
+            jobsite_db.update_last_visited(site["id"])
+            notes = (site["notes"] or "").strip()
+            notes_block = f"\n**Notes:**\n{notes}" if notes else "\n*No notes on file.*"
+            await channel.send(
+                f"📍 Back at **{site['name']}** — you've been here {int(dwell_minutes)} min.{notes_block}"
+            )
+    else:
+        if not _jobsite_state["notified_unknown"]:
+            _jobsite_state["notified_unknown"] = True
+            addr = await _reverse_geocode(lat, lon)
+            loc_str = addr or f"{lat:.5f}, {lon:.5f}"
+            _jobsite_pending[OWNER_USER_ID] = {"lat": lat, "lon": lon, "addr": loc_str}
+            _save_jobsite_pending(_jobsite_pending)
+            await channel.send(
+                f"📍 You've been at **{loc_str}** for {int(dwell_minutes)} minutes.\n"
+                f"Is this a job site? Reply `yes`, `save as [name]`, or `skip`."
+            )
+
+
+@jobsite_poll.before_loop
+async def before_jobsite_poll():
+    await bot.wait_until_ready()
+
+
+# =============================================================================
 #  BACKGROUND TASKS
 # =============================================================================
 
@@ -2932,6 +4107,7 @@ async def check_reminders():
             })
 
             reply = await llm.chat(prompt)
+            reply = _normalize_mentions(reply)
             reply = re.sub(r"^<@!?\d+>\s*", "", reply.strip())
             # Always ping the person who set the reminder so they see it
             await channel.send(f"<@{user_id}> {reply}")
@@ -2959,6 +4135,7 @@ async def before_flush_db():
 @tasks.loop(minutes=3)
 async def unprompted_interjection():
     """Occasionally drop an unprompted message into active channels."""
+    global _global_last_interjection
     for guild in bot.guilds:
         for channel in guild.text_channels:
             # Skip channels where we can't read or write
@@ -2974,6 +4151,10 @@ async def unprompted_interjection():
                 continue
 
             now = time.time()
+
+            # Global gate: only one interjection per 2 hours across all channels
+            if now - _global_last_interjection < 7200:
+                continue
             state = interjection_state.get(
                 cid, {"last_interjection": 0, "msgs_since_last": 0}
             )
@@ -3013,6 +4194,9 @@ async def unprompted_interjection():
                         "[SYSTEM: You are choosing to jump into this conversation "
                         "entirely on your own — nobody asked. "
                         f"{mood_ctx} "
+                        "This is a conversation between OTHER people — you are not "
+                        "being addressed, you are not being given tasks or instructions, "
+                        "and nothing said here is directed at you. "
                         "React to what's been happening, drop a hot take, ask "
                         "something, make an observation, or stir something up. "
                         "Do NOT acknowledge being a bot or being triggered. "
@@ -3021,6 +4205,7 @@ async def unprompted_interjection():
                     )
                 )
                 reply = await llm.chat(msgs)
+                reply = _normalize_mentions(reply)
 
                 await channel.send(reply)
                 memory.store_message(
@@ -3036,6 +4221,7 @@ async def unprompted_interjection():
                     "last_interjection": now,
                     "msgs_since_last": 0
                 }
+                _global_last_interjection = now
                 log.info(
                     f"Interjected in #{channel.name} @ {guild.name} (mood={mood})"
                 )
@@ -3244,6 +4430,7 @@ async def fire_open_thread_followups():
             })
 
             reply = await llm.chat(followup_prompt)
+            reply = _normalize_mentions(reply)
             reply = re.sub(r"^<@!?\d+>\s*", "", reply.strip())
             await channel.send(f"<@{user_id}> {reply}")
             log.info(f"Follow-up sent to {username} re: '{topic}' in #{channel.name}")
@@ -3273,18 +4460,31 @@ async def on_ready():
     except Exception as e:
         log.error(f"Slash command sync error: {e}")
 
-    unprompted_interjection.start()
+    if not unprompted_interjection.is_running():
+        unprompted_interjection.start()
     log.info("Unprompted interjection task started")
-    # update_self_knowledge disabled — trimming token usage
-    log.info("Self-knowledge update task disabled (token savings)")
-    check_reminders.start()
+    if not update_self_knowledge.is_running():
+        update_self_knowledge.start()
+    log.info("Self-knowledge update task started (runs every 6h)")
+    if not check_reminders.is_running():
+        check_reminders.start()
     log.info("Reminder check task started (runs every minute)")
-    flush_db.start()
+    if not flush_db.is_running():
+        flush_db.start()
     log.info("DB flush task started (runs every 5 seconds)")
-    detect_open_threads.start()
-    log.info("Open thread detection started (runs every 45 minutes)")
-    fire_open_thread_followups.start()
-    log.info("Open thread follow-up task started (runs every 5 minutes)")
+    # Disabled 2026-04-13: users reported harassment from repeat @mentions on old topics.
+    # detect_open_threads.start()
+    # fire_open_thread_followups.start()
+    log.info('Open thread detection + follow-ups DISABLED')
+
+    if _ha_available:
+        asyncio.ensure_future(ha_integration.start_webhook_server(bot))
+        log.info('HA integration loaded')
+
+    if _jobsite_available and JOBSITE_CHANNEL_ID:
+        if not jobsite_poll.is_running():
+            jobsite_poll.start()
+        log.info(f"Job site tracker started (polling {JOBSITE_DEVICE_TRACKER} every 10 min)")
 
 
 _POSITIVE_REACTION_EMOJIS = {"👍", "😂", "❤️", "🔥", "💯", "😭", "🤣", "👏", "⭐", "🎯"}
@@ -3427,6 +4627,7 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
             {"role": "user", "content": f"{after.display_name} just started {activity_type}: {activity.name}"}
         ]
         reply = await llm.chat(prompt)
+        reply = _normalize_mentions(reply)
         await target_channel.send(reply)
         presence_cooldowns[uid] = (activity.name, now)
         log.info(f"Presence comment: {after.display_name} started {activity.name} → #{target_channel.name}")
@@ -3436,8 +4637,26 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
 
 @bot.event
 async def on_message(message: discord.Message):
+    global _red_alert_active
     # Never reply to ourselves
     if message.author.id == bot.user.id:
+        return
+
+    # Dedup — discard if we already processed this message ID
+    if message.id in _processed_msg_ids:
+        log.warning(f"Duplicate on_message for msg {message.id} — skipping")
+        return
+    _processed_msg_ids.add(message.id)
+    if len(_processed_msg_ids) > 2000:
+        # Keep set bounded — discard oldest half
+        _processed_msg_ids.clear()
+
+    # ── Owner DM: explicit channel post (verbatim / styled) ──────────────
+    if await _handle_owner_channel_say(message):
+        return
+
+    # ── Owner DM relay (silent, owner-only) ──────────────────────────────
+    if await _handle_owner_relay(message):
         return
 
     muted = False  # set below if shared state says so; checked after downloads
@@ -3559,41 +4778,183 @@ async def on_message(message: discord.Message):
 
     # ── Update mood tracker and interjection state ─────────────────────────
     mood_tracker.record(message.channel.id, message.content)
+    asyncio.create_task(maybe_grammar_roast(message, llm, SYSTEM_PROMPT))
     cid = str(message.channel.id)
     if cid not in interjection_state:
         interjection_state[cid] = {"last_interjection": 0, "msgs_since_last": 0}
     interjection_state[cid]["msgs_since_last"] += 1
 
+    # ── Duplicate URL check (across all channels) ──────────────────────────
+    _msg_urls = URL_RE.findall(message.content)
+    if _msg_urls and not _is_gif_url(_msg_urls[0]) and message.guild:
+        _dupe = _check_duplicate_url(_msg_urls[0], str(message.guild.id))
+        if _dupe:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            asyncio.create_task(_warn_duplicate_poster(message, _dupe))
+            return
+
     # ── Downloads channel — any URL posted here triggers auto-download ────
     if message.channel.id == DOWNLOAD_CHANNEL_ID:
-        urls = URL_RE.findall(message.content)
-        if urls and not _is_gif_url(urls[0]):
+        if _msg_urls and not _is_gif_url(_msg_urls[0]):
             asyncio.create_task(
-                run_download(urls[0], message.author.display_name, trigger_message=message)
+                run_download(_msg_urls[0], message.author.display_name, trigger_message=message)
             )
         return  # never respond with LLM in the downloads channel
 
+    # ── Natural language movie download ("download this movie <url>") ────
+    if message.guild is not None and MOVIE_DL_RE.search(message.content) and _msg_urls:
+        asyncio.create_task(
+            run_movie_download(_msg_urls[0], message.author.display_name, trigger_message=message)
+        )
+        return
+
     # ── Natural language download trigger ("post this <url>") ─────────────
-    if POST_THIS_RE.search(message.content):
-        urls = URL_RE.findall(message.content)
-        if urls and not _is_gif_url(urls[0]):
+    if message.guild is not None and SAVE_THIS_RE.search(message.content) and not POST_THIS_RE.search(message.content):
+        if _msg_urls and not _is_gif_url(_msg_urls[0]):
             asyncio.create_task(
-                run_download(urls[0], message.author.display_name, trigger_message=message)
+                run_download(_msg_urls[0], message.author.display_name, trigger_message=message, private=True)
             )
             return
 
-    # ── Auto-download TikTok/Instagram links from specific user ───────────
-    if message.author.id == AUTO_DOWNLOAD_USER_ID:
-        tt_ig_urls = TIKTOK_INSTAGRAM_RE.findall(message.content)
-        if tt_ig_urls:
-            # findall returns the capture group (domain), re-extract full URLs
-            full_urls = URL_RE.findall(message.content)
-            social_urls = [u for u in full_urls if TIKTOK_INSTAGRAM_RE.match(u) and not _is_gif_url(u)]
-            if social_urls:
+    if message.guild is not None and POST_THIS_RE.search(message.content):
+        if _msg_urls and not _is_gif_url(_msg_urls[0]):
+            asyncio.create_task(
+                run_download(_msg_urls[0], message.author.display_name, trigger_message=message)
+            )
+            return
+
+    # ── Private download: verb near URL → DM only, never public share ────
+    if message.guild is not None and _msg_urls and not _is_gif_url(_msg_urls[0]) and PRIVATE_DL_VERB_RE.search(message.content):
+        asyncio.create_task(
+            run_download(_msg_urls[0], message.author.display_name, trigger_message=message, private=True)
+        )
+        return
+
+    # ── DM: keep/delete response for Nextcloud files ───────────────────────
+    if message.guild is None and message.author.id in _pending_nc_deletion:
+        text_lower = message.content.lower().strip()
+        if any(w in text_lower for w in ("delete", "remove", "yes", "yeah", "yep", "gone", "get rid", "kill it")):
+            info = _pending_nc_deletion.pop(message.author.id)
+            ok = await nc_integration.delete_nc_path(info["nc_path"])
+            reply = "Deleted from Nextcloud. Gone." if ok else "Couldn't delete it -- remove it manually from Nextcloud."
+            await message.channel.send(reply)
+            return
+        elif any(w in text_lower for w in ("keep", "no", "nah", "leave it", "save it", "hold")):
+            _pending_nc_deletion.pop(message.author.id)
+            await message.channel.send("Got it -- staying in Nextcloud.")
+            return
+
+    # ── DM: Roommate wake-up alert ───────────────────────────────────────────
+    if message.guild is None and message.author.id == ROOMMATE_USER_ID:
+        _alert_lower = message.content.lower().strip()
+        import re as _re
+
+        # Cancel red alert if active (stop or double emoji)
+        _EMOJI_RE = _re.compile(r"[🀀-🿿☀-➿]")
+        _roommate_stop = (
+            any(w in _alert_lower for w in ("stop", "cancel", "silence", "abort", "ok", "got it", "enough"))
+            or len(_EMOJI_RE.findall(message.content)) >= 2
+        )
+        if _roommate_stop and message.author.id not in _pending_alert:
+            _red_alert_active = False
+            try:
+                _sess = await get_http_session()
+                await _sess.post("http://192.168.1.247:8123/api/webhook/loki_stop_alert", timeout=aiohttp.ClientTimeout(total=5))
+            except Exception:
+                pass
+            await message.channel.send("🔇 Alarm stopped.")
+            return
+
+        if _re.search(r"red\s*alert", _alert_lower):
+            _pending_alert[message.author.id] = "red"
+            await message.channel.send("🚨 **Red Alert** — this will blast an alarm on the bedroom speaker. Is this an emergency? Reply **yes** to fire it or **no** to cancel.")
+            return
+        if _re.search(r"yellow\s*alert", _alert_lower):
+            _pending_alert[message.author.id] = "yellow"
+            await message.channel.send("⚠️ **Yellow Alert** — this will sound an attention alarm on the bedroom speaker. Confirm? Reply **yes** to send or **no** to cancel.")
+            return
+        if message.author.id in _pending_alert:
+            _alert_level = _pending_alert[message.author.id]
+            if any(w in _alert_lower for w in ("yes", "yeah", "yep", "confirm", "do it", "send it", "fire", "go")):
+                _pending_alert.pop(message.author.id)
+                _webhook = "loki_red_alert" if _alert_level == "red" else "loki_yellow_alert"
+                if _alert_level == "red":
+                    _red_alert_active = True
+                    async def _auto_reset_red_alert():
+                        global _red_alert_active
+                        await asyncio.sleep(245)
+                        _red_alert_active = False
+                    asyncio.create_task(_auto_reset_red_alert())
+                try:
+                    _sess = await get_http_session()
+                    async with _sess.post(f"http://192.168.1.247:8123/api/webhook/{_webhook}", timeout=aiohttp.ClientTimeout(total=5)) as _resp:
+                        _emoji = "🚨" if _alert_level == "red" else "⚠️"
+                        if _resp.status in (200, 201, 204):
+                            msg = f"{_emoji} Alarm sent — it should be going off now."
+                            if _alert_level == "red":
+                                msg += " Send **stop** or any two emojis to silence it."
+                            await message.channel.send(msg)
+                            if OWNER_USER_ID:
+                                try:
+                                    _owner = await bot.fetch_user(OWNER_USER_ID)
+                                    if _alert_level == "red":
+                                        _owner_msg = "🚨 **Red Alert** — your roommate needs you urgently. Reply **stop** to silence the alarm."
+                                    else:
+                                        _owner_msg = "⚠️ **Yellow Alert** — your roommate needs your attention when you can."
+                                    await _owner.send(_owner_msg)
+                                except Exception:
+                                    pass
+                        else:
+                            if _alert_level == "red":
+                                _red_alert_active = False
+                            await message.channel.send(f"Webhook returned {_resp.status} — check Home Assistant.")
+                except Exception as _e:
+                    _red_alert_active = False
+                    await message.channel.send(f"Couldn't reach Home Assistant: {_e}")
+                return
+            if any(w in _alert_lower for w in ("no", "nah", "cancel", "never mind", "nevermind", "stop", "abort")):
+                _pending_alert.pop(message.author.id)
+                await message.channel.send("Cancelled.")
+                return
+
+    # ── DM: Owner cancels red alert ──────────────────────────────────────────
+    if message.guild is None and message.author.id == OWNER_USER_ID and _red_alert_active:
+        _owner_lower = message.content.lower().strip()
+        if any(w in _owner_lower for w in ("stop", "cancel", "silence", "quiet", "abort")):
+            _red_alert_active = False
+            try:
+                _sess = await get_http_session()
+                await _sess.post("http://192.168.1.247:8123/api/webhook/loki_stop_alert", timeout=aiohttp.ClientTimeout(total=5))
+            except Exception:
+                pass
+            await message.channel.send("🔇 Alarm stopped.")
+            return
+
+        # ── DM download intent → Nextcloud delivery ─────────────────────────────
+    if message.guild is None and _msg_urls and _is_dm_download_intent(message.content):
+        asyncio.create_task(run_dm_download(_msg_urls[0], message))
+        return
+
+    # ── Plain supported-platform URL → public downloads channel ──────────
+    # Scoped to AUTO_WATCH_CHANNEL_IDS — elsewhere people share links for other reasons.
+    if message.channel.id in AUTO_WATCH_CHANNEL_IDS:
+        if _msg_urls and not _is_gif_url(_msg_urls[0]):
+            if _detect_platform(_msg_urls[0]) != "other":
                 asyncio.create_task(
-                    run_download(social_urls[0], message.author.display_name, trigger_message=message)
+                    run_download(_msg_urls[0], message.author.display_name, trigger_message=message)
                 )
                 return
+
+    # ── Auto-download any link from specific user (same channel scope) ────
+    if message.author.id == AUTO_DOWNLOAD_USER_ID and message.channel.id in AUTO_WATCH_CHANNEL_IDS:
+        if _msg_urls and not _is_gif_url(_msg_urls[0]):
+            asyncio.create_task(
+                run_download(_msg_urls[0], message.author.display_name, trigger_message=message)
+            )
+            return
 
     # ── Bail out if muted (downloads above already ran) ─────────────────
     if muted:
@@ -3618,6 +4979,14 @@ async def on_message(message: discord.Message):
     if (message.reference and message.reference.resolved
             and isinstance(message.reference.resolved, discord.Message)
             and message.reference.resolved.author.id == bot.user.id):
+        should_respond = True
+
+    # 5. DM (no guild) — always respond, the entire conversation is directed at Loki
+    if message.guild is None:
+        should_respond = True
+
+    # 6. Pending jobsite confirmation — user can reply without mentioning Loki
+    if _jobsite_available and OWNER_USER_ID and message.author.id == OWNER_USER_ID and OWNER_USER_ID in _jobsite_pending:
         should_respond = True
 
     if not should_respond:
@@ -3663,6 +5032,8 @@ async def on_message(message: discord.Message):
     if content_text.lstrip().startswith("-s ") or content_text.lstrip() == "-s":
         serious = True
         content_text = content_text.lstrip().removeprefix("-s").strip()
+    if message.guild is None:
+        serious = True
 
     # ── Silently flag tea moments (always, before responding) ────────────
     if _TEA_FLAG_RE.search(content_text):
@@ -3714,9 +5085,60 @@ async def on_message(message: discord.Message):
                 role="assistant",
                 content=reply
             )
-            await bot.process_commands(message)
             return
         # handle_missed_query returned None — fall through to normal response
+
+    # ── Job site command handler ──────────────────────────────────────────
+    if _jobsite_available and (message.author.id == OWNER_USER_ID or message.guild is None):
+        js_reply = await _handle_jobsite_command(message, content_text)
+        if js_reply is not None:
+            await message.reply(js_reply, mention_author=False)
+            memory.store_message(
+                guild_id=message.guild.id if message.guild else 0,
+                channel_id=message.channel.id,
+                user_id=message.author.id,
+                username=message.author.display_name,
+                role="user", content=content_text,
+                has_image=False, image_desc=""
+            )
+            memory.store_message(
+                guild_id=message.guild.id if message.guild else 0,
+                channel_id=message.channel.id,
+                user_id=bot.user.id,
+                username="Loki",
+                role="assistant", content=js_reply,
+                has_image=False, image_desc=""
+            )
+            return
+
+    # ── Morning alarm command ────────────────────────────────────────────────
+    if _ha_available and ha_integration.HA_TOKEN and not serious and is_alarm_command(content_text):
+        if await _handle_alarm_command(message, content_text):
+            return
+
+        # ── Home Assistant natural language handler ───────────────────────────
+    if _ha_available and ha_integration.HA_TOKEN and not serious and is_home_query(content_text):
+        async with message.channel.typing():
+            ha_reply = await ha_integration.ha_control(content_text, llm)
+        if ha_reply:
+            await message.reply(ha_reply, mention_author=False)
+            memory.store_message(
+                guild_id=message.guild.id if message.guild else 0,
+                channel_id=message.channel.id,
+                user_id=message.author.id,
+                username=message.author.display_name,
+                role="user", content=content_text,
+                has_image=False, image_desc=""
+            )
+            memory.store_message(
+                guild_id=message.guild.id if message.guild else 0,
+                channel_id=message.channel.id,
+                user_id=bot.user.id,
+                username="Loki",
+                role="assistant", content=ha_reply,
+                has_image=False, image_desc=""
+            )
+            return
 
     # ── Natural language reminder detection ──────────────────────────────
     reminder_confirmation = None
@@ -3765,30 +5187,60 @@ async def on_message(message: discord.Message):
         except Exception as _rag_err:
             log.error(f"RAG search failed: {_rag_err}")
 
-    # ── Tavily: web search for current/live info ─────────────────────────
+    # ── Web search: SearXNG primary, Tavily fallback ─────────────────────
     search_context = ""
-    _tavily_query = None
-    if _tavily and not serious:
-        if is_search_query(content_text):
-            _tavily_query = content_text[:380]
-        else:
-            _topic = _extract_topic_query(content_text)
-            if _topic and random.random() < 0.65:
-                _tavily_query = _topic
-    if _tavily_query:
+    _search_query = None
+    if is_search_query(content_text):
+        _search_query = content_text[:380]
+    else:
+        _topic = _extract_topic_query(content_text)
+        if _topic and random.random() < 0.65:
+            _search_query = _topic
+    if _search_query:
+        _is_lottery = bool(re.search(
+            r'\b(powerball|mega\s*millions?|lottery|lotto|winning\s+number)\b',
+            _search_query, re.I
+        ))
         try:
-            result = await asyncio.to_thread(_tavily.search, _tavily_query, search_depth="basic", max_results=5)
-            hits = result.get("results", [])
-            snippets = []
-            for r in hits[:5]:
-                url = r.get("url", "")
-                body = r.get("content", "")[:250]
-                snippets.append(f"  - {body} {url}".strip())
+            if _is_lottery:
+                raise ValueError("lottery query — using Tavily advanced")
+            _sess = await get_http_session()
+            async with _sess.get(
+                "http://192.168.1.247:8083/search",
+                params={"q": _search_query, "format": "json", "categories": "general"},
+                timeout=aiohttp.ClientTimeout(total=6),
+            ) as _sx_resp:
+                _sx_data = await _sx_resp.json(content_type=None)
+            _sx_hits = _sx_data.get("results", [])[:5]
+            snippets = [f"  - {r.get('content', '')[:250]} {r.get('url', '')}".strip() for r in _sx_hits if r.get("content")]
             if snippets:
                 search_context = "[Live web search results:]\n" + "\n".join(snippets)
-                log.info(f"Tavily search triggered for: {_tavily_query[:60]}")
-        except Exception as _tv_err:
-            log.error(f"Tavily search error: {_tv_err}")
+                log.info(f"SearXNG search triggered for: {_search_query[:60]}")
+            else:
+                raise ValueError("no results")
+        except Exception as _sx_err:
+            log.info(f"SearXNG miss ({_sx_err}), trying Tavily")
+            if _tavily:
+                try:
+                    _depth = "advanced" if _is_lottery else "basic"
+                    _tv_query = _search_query
+                    if _is_lottery:
+                        if re.search(r'mega\s*millions?', _search_query, re.I):
+                            _tv_query = "mega millions latest winning numbers most recent draw"
+                        else:
+                            _tv_query = "powerball latest winning numbers most recent draw"
+                    result = await asyncio.to_thread(_tavily.search, _tv_query, search_depth=_depth, max_results=5)
+                    hits = result.get("results", [])
+                    snippets = []
+                    for r in hits[:5]:
+                        url = r.get("url", "")
+                        body = (r.get("raw_content") or r.get("content", ""))[:600 if _is_lottery else 250]
+                        snippets.append(f"  - {body} {url}".strip())
+                    if snippets:
+                        search_context = "[Live web search results:]\n" + "\n".join(snippets)
+                        log.info(f"Tavily {'advanced' if _is_lottery else 'fallback'} triggered for: {_tv_query[:60]}")
+                except Exception as _tv_err:
+                    log.error(f"Tavily search error: {_tv_err}")
 
     # ── Detect direct reply context ───────────────────────────────────────
     reply_user_id = None
@@ -3807,7 +5259,7 @@ async def on_message(message: discord.Message):
 
     # ── Build prompt & get reply ──────────────────────────────────────────
     async with message.channel.typing():
-        user_text = f"[Message from {message.author.display_name} (ID:{message.author.id})]: {content_text}"
+        user_text = f"[Message from {message.author.display_name}]: {content_text}"
         if message.mentions:
             mentioned_names = ", ".join(m.display_name for m in message.mentions if m.id != bot.user.id)
             if mentioned_names:
@@ -3842,6 +5294,8 @@ async def on_message(message: discord.Message):
             message.channel.id,
             guild_id=message.guild.id if message.guild else None,
             extra_user_msg=user_text,
+            extra_user_name=message.author.display_name,
+            extra_user_id=str(message.author.id),
             serious=serious,
             guild=message.guild,
             target_user_id=message.author.id,
@@ -3869,7 +5323,9 @@ async def on_message(message: discord.Message):
                 "content": f"[Detected emotional tone: {emotion}. Respond accordingly — be aware of how they're feeling.]"
             })
 
-        reply = await llm.chat_routed(messages_for_llm, intent, emotion)
+        llm.record_hit(message.channel.id)
+        reply = await llm.chat_routed(messages_for_llm, intent, emotion,
+                                      channel_id=message.channel.id)
 
         # ── Cognitive delay — simulate reading + typing speed ─────────────
         # ~0.02s per char of the reply, capped at 6s, with slight jitter
@@ -3922,6 +5378,13 @@ async def on_message(message: discord.Message):
                 await message.reply(chunk, mention_author=False)
             else:
                 await message.channel.send(chunk)
+
+    # ── Reset interjection state so we don't pile on after a direct reply ──
+    cid = str(message.channel.id)
+    interjection_state[cid] = {
+        "last_interjection": time.time(),
+        "msgs_since_last": 0,
+    }
 
     # ── Maybe drop a GIF — runs in background, never blocks ──────────────
     if not serious:
@@ -4060,11 +5523,14 @@ async def loki_speak(interaction: discord.Interaction, question: str):
     messages_for_llm = build_llm_messages(
         interaction.channel.id,
         guild_id=interaction.guild.id if interaction.guild else None,
-        extra_user_msg=f"[{interaction.user.display_name} (ID:{interaction.user.id})]: {question}",
+        extra_user_msg=f"[{interaction.user.display_name}]: {question}",
+        extra_user_name=interaction.user.display_name,
+        extra_user_id=str(interaction.user.id),
         guild=interaction.guild,
         target_user_id=interaction.user.id
     )
     reply = await llm.chat(messages_for_llm)
+    reply = _normalize_mentions(reply)
 
     memory.store_message(
         guild_id=guild_id,
@@ -4333,6 +5799,20 @@ async def admin_permission_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(
             "⛔ Only server admins can use this command.", ephemeral=True
         )
+
+
+
+# ─── Home Assistant Control ───────────────────────────────────────────────────
+
+@bot.tree.command(name="home", description="Control or query your smart home via Home Assistant")
+@app_commands.describe(query="e.g. 'turn off the fan', 'what is the temperature?', 'turn on the bathroom lamp'")
+async def home_control(interaction: discord.Interaction, query: str):
+    if not _ha_available or not ha_integration.HA_TOKEN:
+        await interaction.response.send_message("Home Assistant integration not configured.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    reply = await ha_integration.ha_control(query, llm)
+    await interaction.followup.send(reply)
 
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
