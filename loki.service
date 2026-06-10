@@ -1,7 +1,8 @@
 [Unit]
 Description=Loki Discord Bot
-# Wait for network to be available before starting
-After=network.target
+# Wait for the network to actually be online before starting
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 # Run as your user (replace YOUR_USERNAME with your actual Linux username)
