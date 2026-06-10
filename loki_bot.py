@@ -4460,6 +4460,16 @@ async def on_ready():
     except Exception as e:
         log.error(f"Slash command sync error: {e}")
 
+    # RAG died silently for two months once (module deleted, import swallowed
+    # by try/except) — always announce its real state at startup.
+    if not _rag_available:
+        log.warning("RAG module not importable — history search DISABLED")
+    elif rag_available():
+        from rag_search import get_chunk_count
+        log.info(f"RAG online — {get_chunk_count()} conversation chunks indexed")
+    else:
+        log.warning("RAG module loaded but ChromaDB unreachable — history search DISABLED")
+
     if not unprompted_interjection.is_running():
         unprompted_interjection.start()
     log.info("Unprompted interjection task started")
@@ -5173,7 +5183,7 @@ async def on_message(message: discord.Message):
             named_person, rag_query = _extract_named_subject(content_text)
             hits = search_history(
                 rag_query,
-                n_results=20,
+                n_results=int(os.getenv("RAG_MAX_CHUNKS", "5")),
                 guild_name=guild_name_for_rag,
                 since_dt=since_dt,
                 until_dt=until_dt,

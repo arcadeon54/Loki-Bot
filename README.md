@@ -6,6 +6,7 @@ A conversational AI Discord bot with persistent memory, image recognition, voice
 
 - **Conversational AI** — Responds to mentions, name triggers, and replies with context-aware conversation
 - **Persistent Memory** — SQLite-backed conversation history that survives restarts
+- **History Search (RAG)** — "remember when…" questions search the full server history via ChromaDB. Messages are embedded individually (local sentence-transformers, no API cost) and grouped into conversation chunks; matches return the whole exchange with a jump link. Run `ingest_history.py` to index history (incremental — cron it), `eval_rag.py` to measure retrieval quality. Config: `CHROMADB_HOST`/`CHROMADB_PORT` (default localhost:8100), `RAG_EMBED_MODEL` (default `BAAI/bge-small-en-v1.5`), `RAG_MAX_DISTANCE` relevance cutoff, `RAG_MAX_CHUNKS` context cap (default 5)
 - **Image/GIF Recognition** — Analyzes images and GIFs using Google Gemini (free tier)
 - **Voice Chat** — Joins voice channels and speaks with TTS (edge-tts)
 - **Per-Server Personalities** — Each server admin can set a custom personality prompt
