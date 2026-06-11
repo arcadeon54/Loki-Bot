@@ -1,0 +1,4 @@
+{
+  "_format": "MM-DD keys, list of names or <@discord_user_id> mentions. Example: \"07-04\": [\"<@708060206961131530>\"]. Loki posts wishes at 10:00 AM ET.",
+  "_example": {"01-15": ["Eric"]}
+}
