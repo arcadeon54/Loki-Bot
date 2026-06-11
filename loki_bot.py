@@ -120,6 +120,12 @@ try:
 except ImportError:
     _user_memory_available = False
 
+try:
+    import voice_listen
+    _voice_listen_available = voice_listen.is_available()
+except ImportError:
+    _voice_listen_available = False
+
 # ─── Timezone ─────────────────────────────────────────────────────────────────
 ET = ZoneInfo("America/New_York")
 
@@ -1800,13 +1806,27 @@ class VoiceHandler:
     def __init__(self):
         self.voice_clients: dict[int, discord.VoiceClient] = {}
 
-    async def join(self, voice_channel: discord.VoiceChannel) -> discord.VoiceClient:
+    async def join(self, voice_channel: discord.VoiceChannel,
+                   receive: bool = False) -> discord.VoiceClient:
         guild_id = voice_channel.guild.id
         guild = voice_channel.guild
 
+        # Listening (Phase 6) needs a VoiceRecvClient; a plain connection
+        # can't receive audio, so reconnect if the type doesn't match.
+        recv_cls = None
+        if receive:
+            from discord.ext import voice_recv
+            recv_cls = voice_recv.VoiceRecvClient
+
         if guild_id in self.voice_clients:
             existing = self.voice_clients[guild_id]
-            if existing.is_connected():
+            if existing.is_connected() and recv_cls and not isinstance(existing, recv_cls):
+                try:
+                    await existing.disconnect(force=True)
+                except Exception:
+                    pass
+                del self.voice_clients[guild_id]
+            elif existing.is_connected():
                 await existing.move_to(voice_channel)
                 return existing
             else:
@@ -1824,7 +1844,10 @@ class VoiceHandler:
             except Exception:
                 pass
 
-        vc = await voice_channel.connect()
+        if recv_cls:
+            vc = await voice_channel.connect(cls=recv_cls)
+        else:
+            vc = await voice_channel.connect()
         self.voice_clients[guild_id] = vc
         return vc
 
@@ -5026,6 +5049,11 @@ async def on_ready():
             task.start()
     log.info(f"Proactive behavior started — {proactive.status()}")
 
+    if _voice_listen_available:
+        log.info(f"Voice ears available — /loki_ears (model={voice_listen.STT_MODEL})")
+    else:
+        log.info("Voice ears unavailable (faster-whisper or voice-recv missing)")
+
     # RAG died silently for two months once (module deleted, import swallowed
     # by try/except) — always announce its real state at startup.
     if not _rag_available:
@@ -6127,6 +6155,89 @@ async def forget(interaction: discord.Interaction):
     )
 
 
+_speech_collectors: dict[int, "voice_listen.SpeechCollector"] = {}
+
+
+async def _handle_voice_wake(member: discord.Member, transcript: str):
+    """A wake-word utterance was heard in voice chat — answer out loud."""
+    guild = member.guild
+    vc = voice_h.voice_clients.get(guild.id)
+    if vc is None or not vc.is_connected() or vc.is_playing():
+        return
+    try:
+        msgs = build_llm_messages(
+            vc.channel.id, guild_id=guild.id,
+            extra_user_msg=(
+                f"[VOICE — {member.display_name} just said to you in voice chat: "
+                f"\"{transcript}\"]\n[Reply SPOKEN-style: short and punchy, 1-3 "
+                "sentences, no emoji, no markdown, no lists.]"
+            ),
+            extra_user_name=member.display_name,
+            extra_user_id=str(member.id),
+            guild=guild, target_user_id=member.id,
+        )
+        reply = await llm.chat(msgs)
+        if not reply:
+            return
+        spoken = re.sub(r"[*_`#>|]|:\w+:", "", reply).strip()[:400]
+        memory.store_message(
+            guild_id=guild.id, channel_id=vc.channel.id, user_id=member.id,
+            username=member.display_name, role="user",
+            content=f"[voice] {transcript}",
+        )
+        memory.store_message(
+            guild_id=guild.id, channel_id=vc.channel.id, user_id=bot.user.id,
+            username="Loki", role="assistant", content=f"[voice] {spoken}",
+        )
+        await voice_h.speak(vc, spoken)
+    except Exception as e:
+        log.error(f"Voice wake response failed: {e}")
+
+
+@bot.tree.command(name="loki_ears", description="Toggle Loki listening for his name in your voice channel")
+@discord.app_commands.describe(action="on or off")
+async def loki_ears(interaction: discord.Interaction, action: str = "on"):
+    if not _voice_listen_available:
+        await interaction.response.send_message(
+            "My ears aren't installed on this build (faster-whisper/voice-recv missing).",
+            ephemeral=True)
+        return
+    guild = interaction.guild
+    action = action.strip().lower()
+
+    if action == "off":
+        collector = _speech_collectors.pop(guild.id, None)
+        if collector:
+            collector.stop()
+        await interaction.response.send_message("🙉 Ears off. I heard nothing.")
+        return
+
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message(
+            "Get in a voice channel first, then ask for my ears.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        old = _speech_collectors.pop(guild.id, None)
+        if old:
+            old.stop()
+        vc = await voice_h.join(interaction.user.voice.channel, receive=True)
+        collector = voice_listen.SpeechCollector(
+            vc, _handle_voice_wake, asyncio.get_running_loop())
+        collector.start()
+        _speech_collectors[guild.id] = collector
+        await interaction.followup.send(
+            f"👂 Ears ON in **{interaction.user.voice.channel.name}**. "
+            "Say my name and speak — everything else I ignore and discard. "
+            "`/loki_ears off` when you're done."
+        )
+    except Exception as e:
+        log.error(f"loki_ears failed: {e}")
+        await interaction.followup.send("Couldn't switch my ears on — check my log.",
+                                        ephemeral=True)
+
+
 @bot.tree.command(name="loki_join", description="Loki joins your voice channel")
 async def loki_join(interaction: discord.Interaction):
     if not interaction.user.voice or not interaction.user.voice.channel:
@@ -6152,6 +6263,9 @@ async def loki_join(interaction: discord.Interaction):
 @bot.tree.command(name="loki_leave", description="Loki leaves the voice channel")
 async def loki_leave(interaction: discord.Interaction):
     guild_id = interaction.guild.id
+    collector = _speech_collectors.pop(guild_id, None)
+    if collector:
+        collector.stop()
     if guild_id in voice_h.voice_clients or interaction.guild.voice_client:
         await voice_h.leave(guild_id, guild=interaction.guild)
         await interaction.response.send_message("Fine. I'll leave. For now. 🐍")
