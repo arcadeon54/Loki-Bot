@@ -29,6 +29,7 @@ import uuid
 import sqlite3
 import asyncio
 import logging
+import logging.handlers
 import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -86,14 +87,8 @@ async def get_http_session() -> "aiohttp.ClientSession":
 # ─── Load environment variables ───────────────────────────────────────────────
 load_dotenv()
 
-# ─── Shared state (bot-to-bot coordination) ───────────────────────────────────
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(__file__))
-try:
-    from shared_state import SharedState as _SharedState
-    _shared_state_available = True
-except ImportError:
-    _shared_state_available = False
 
 try:
     from rag_search import search_history, format_for_context, is_available as rag_available
@@ -143,15 +138,12 @@ LOCAL_LLM_MODEL       = os.getenv("LOCAL_LLM_MODEL", "local-model")
 FALLBACK_LLM_URL      = os.getenv("FALLBACK_LLM_URL", "")
 FALLBACK_LLM_MODEL    = os.getenv("FALLBACK_LLM_MODEL", "")
 FALLBACK_LLM_API_KEY  = os.getenv("FALLBACK_LLM_API_KEY", "")
-ESCALATION_WINDOW     = int(os.getenv("ESCALATION_WINDOW", "90"))       # seconds
-ESCALATION_THRESHOLD  = int(os.getenv("ESCALATION_THRESHOLD", "2"))     # msgs in window to escalate
 ELEVENLABS_API_KEY    = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID   = os.getenv("ELEVENLABS_VOICE_ID", "")
 GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
 SYSTEM_PROMPT         = os.getenv("SYSTEM_PROMPT", "You are Loki, the God of Mischief.")
 MEMORY_DB_PATH        = os.getenv("MEMORY_DB_PATH", "loki_memory.db")
 CONTEXT_MESSAGE_COUNT = int(os.getenv("CONTEXT_MESSAGE_COUNT", "50"))
-MISST_BOT_USER_ID = int(os.getenv("MISST_BOT_USER_ID") or "0")
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID") or "0")
 ROOMMATE_USER_ID = 992855519368851556
 RELAY_CHANNEL_ID = int(os.getenv("RELAY_CHANNEL_ID") or "0")
@@ -161,7 +153,6 @@ JOBSITE_CHANNEL_ID      = int(os.getenv("JOBSITE_CHANNEL_ID") or os.getenv("HA_N
 JOBSITE_DEVICE_TRACKER  = os.getenv("JOBSITE_DEVICE_TRACKER", "device_tracker.nokia_e23")
 JOBSITE_DWELL_MINUTES   = int(os.getenv("JOBSITE_DWELL_MINUTES", "120"))
 RELAY_CHANNEL_NAME = os.getenv("RELAY_CHANNEL_NAME", "chit-chat")
-SHARED_STATE_PATH = os.getenv("SHARED_STATE_PATH", os.path.expanduser("~/bot-shared-state/loki_state.json"))
 
 # ─── Claude Code settings ─────────────────────────────────────────────────────
 _claude_bin_default = shutil.which("claude") or "claude"
@@ -213,7 +204,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("loki_bot.log"),
+        # journald (via systemd) keeps the rotated authoritative log; the local
+        # file is a convenience copy capped so it can't grow forever
+        logging.handlers.RotatingFileHandler(
+            "loki_bot.log", maxBytes=2_000_000, backupCount=2),
         logging.StreamHandler()
     ]
 )
@@ -674,6 +668,7 @@ class MemoryDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user_guild ON feedback_log(user_id, guild_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_correction_channel ON correction_log(channel_id, id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tea_guild_channel ON tea_log(guild_id, channel_id, id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_guild_role_ts ON messages(guild_id, role, timestamp)")
         self.conn.commit()
 
     # ── Reminders ─────────────────────────────────────────────────────────
@@ -1392,50 +1387,21 @@ class LLMHandler:
         # Local (Ollama) settings — always configured as base
         self.local_url   = LOCAL_LLM_URL.rstrip("/") + "/chat/completions"
         self.local_model = LOCAL_LLM_MODEL
-        # OpenAI settings — used for escalation during active conversation
+        # OpenAI settings
         self.openai_url   = "https://api.openai.com/v1/chat/completions"
         self.openai_key   = OPENAI_API_KEY
         self.openai_model = OPENAI_MODEL
-        # Per-channel activity tracker: {channel_id: [timestamp, timestamp, ...]}
-        self._channel_hits: dict[str, list[float]] = {}
 
         if LLM_PROVIDER == "openai":
             self.api_url = self.openai_url
             self.api_key = self.openai_key
             self.model   = self.openai_model
-            self._escalation_enabled = False  # already on OpenAI full-time
             log.info(f"LLM: OpenAI  model={self.model}")
         else:
             self.api_url = self.local_url
             self.api_key = "not-needed"
             self.model   = self.local_model
-            self._escalation_enabled = bool(OPENAI_API_KEY)
             log.info(f"LLM: Local  url={self.api_url}  model={self.model}")
-            if self._escalation_enabled:
-                log.info(f"LLM: Escalation enabled → OpenAI {self.openai_model} "
-                         f"after {ESCALATION_THRESHOLD} msgs in {ESCALATION_WINDOW}s")
-
-    def record_hit(self, channel_id) -> None:
-        """Record a message timestamp for escalation tracking."""
-        cid = str(channel_id)
-        now = time.monotonic()
-        hits = self._channel_hits.setdefault(cid, [])
-        hits.append(now)
-        # Prune old hits outside the window
-        cutoff = now - ESCALATION_WINDOW
-        self._channel_hits[cid] = [t for t in hits if t > cutoff]
-
-    def should_escalate(self, channel_id) -> bool:
-        """Check if a channel has enough recent activity to escalate to OpenAI."""
-        if not self._escalation_enabled:
-            return False
-        cid = str(channel_id)
-        now = time.monotonic()
-        hits = self._channel_hits.get(cid, [])
-        cutoff = now - ESCALATION_WINDOW
-        recent = [t for t in hits if t > cutoff]
-        self._channel_hits[cid] = recent
-        return len(recent) >= ESCALATION_THRESHOLD
 
     @staticmethod
     def _backend_of(api_url: str, is_openai: bool) -> str:
@@ -1673,15 +1639,12 @@ async def transcribe_voice_message(audio_bytes: bytes, filename: str = "voice.og
 
 
 
-async def send_voice_message(channel, text: str, reference=None):
-    """Generate TTS audio and send it as a Discord voice message in a text channel."""
-    import struct, base64, subprocess
-    tmp_mp3 = f"/tmp/loki_voice_msg_{channel.id}.mp3"
-    tmp_ogg = f"/tmp/loki_voice_msg_{channel.id}.ogg"
-
-    try:
-        # ── Generate TTS audio via ElevenLabs ──
-        if ELEVENLABS_API_KEY:
+async def synthesize_tts_mp3(text: str, out_path: str):
+    """Shared TTS synthesis: ElevenLabs (Callum, max style) with edge-tts
+    fallback. The ElevenLabs generator does blocking HTTP, so it runs in a
+    worker thread."""
+    if ELEVENLABS_API_KEY:
+        def _generate():
             from elevenlabs.client import ElevenLabs as ELClient
             from elevenlabs import VoiceSettings
             el = ELClient(api_key=ELEVENLABS_API_KEY)
@@ -1696,13 +1659,25 @@ async def send_voice_message(channel, text: str, reference=None):
                     use_speaker_boost=True,
                 ),
             )
-            with open(tmp_mp3, "wb") as f:
+            with open(out_path, "wb") as f:
                 for chunk in audio_gen:
                     f.write(chunk)
-        else:
-            import edge_tts
-            comm = edge_tts.Communicate(text, "en-US-GuyNeural")
-            await comm.save(tmp_mp3)
+        await asyncio.to_thread(_generate)
+        log.info("TTS generated via ElevenLabs (Callum max-style)")
+    else:
+        import edge_tts
+        await edge_tts.Communicate(text, "en-US-GuyNeural").save(out_path)
+        log.info("TTS generated via edge-tts (fallback)")
+
+
+async def send_voice_message(channel, text: str, reference=None):
+    """Generate TTS audio and send it as a Discord voice message in a text channel."""
+    import struct, base64, subprocess
+    tmp_mp3 = f"/tmp/loki_voice_msg_{channel.id}.mp3"
+    tmp_ogg = f"/tmp/loki_voice_msg_{channel.id}.ogg"
+
+    try:
+        await synthesize_tts_mp3(text, tmp_mp3)
 
         # ── Convert to OGG Opus (required for Discord voice messages) ──
         proc = await asyncio.to_thread(
@@ -1869,33 +1844,7 @@ class VoiceHandler:
         """Generate TTS audio and play it. Uses ElevenLabs if available, edge-tts as fallback."""
         audio_path = "/tmp/loki_tts.mp3"
         try:
-            if ELEVENLABS_API_KEY:
-                # ── ElevenLabs TTS (Callum - Husky Trickster, max style) ──
-                from elevenlabs.client import ElevenLabs
-                from elevenlabs import VoiceSettings
-                el_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-                audio_gen = el_client.text_to_speech.convert(
-                    voice_id=ELEVENLABS_VOICE_ID,
-                    text=text,
-                    model_id="eleven_multilingual_v2",
-                    voice_settings=VoiceSettings(
-                        stability=0.5,
-                        similarity_boost=0.75,
-                        style=1.0,
-                        use_speaker_boost=True,
-                    ),
-                )
-                with open(audio_path, "wb") as f:
-                    for chunk in audio_gen:
-                        f.write(chunk)
-                log.info("TTS generated via ElevenLabs (Callum max-style)")
-            else:
-                # ── Fallback: edge-tts ──
-                import edge_tts
-                voice = "en-US-GuyNeural"
-                communicate = edge_tts.Communicate(text, voice)
-                await communicate.save(audio_path)
-                log.info("TTS generated via edge-tts (fallback)")
+            await synthesize_tts_mp3(text, audio_path)
 
             if vc.is_playing():
                 vc.stop()
@@ -1998,8 +1947,6 @@ llm       = LLMHandler()
 voice_h   = VoiceHandler()
 claude_cc = ClaudeCodeHandler(CLAUDE_BIN, CLAUDE_WORKSPACE, CLAUDE_TIMEOUT)
 mood_tracker = MoodTracker()
-shared = _SharedState(SHARED_STATE_PATH) if _shared_state_available else None
-_was_muted = False  # track mute state for "I'm back" message
 
 # Member directory cache: { guild_id: (directory_string, timestamp) }
 _member_dir_cache: dict[int, tuple[str, float]] = {}
@@ -3595,21 +3542,6 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
     # ── Current time injection ────────────────────────────────────────────
     prompt += f"\n\n[Current time]: {now_et().strftime('%I:%M %p ET, %A %B %-d %Y')}"
 
-    # ── Inject Miss-T cooldown behavior modifier if active ───────────────
-    if shared is not None and not serious:
-        on_cooldown, modifier = shared.is_loki_on_cooldown()
-        if on_cooldown and modifier:
-            if modifier == "cool_down":
-                prompt += (
-                    "\n\n[Miss-T told you to cool it. You are currently being watched. "
-                    "Be less chaotic, keep responses shorter and more measured.]"
-                )
-            elif modifier == "be_nice":
-                prompt += (
-                    "\n\n[Miss-T told you to be nice. You're being extra polite and "
-                    "well-behaved right now, though it pains you deeply.]"
-                )
-
     msgs = [{"role": "system", "content": prompt}]
 
     # ── Member directory for @mentions ────────────────────────────────────
@@ -3730,23 +3662,14 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
         msgs.append(extra_msg)
 
     # Final-position length nudge counters few-shot drag from past short replies.
-    # Skipped in serious mode and during Miss-T cool_down (which wants shorter).
     if not serious:
-        on_cooldown_now = False
-        if shared is not None:
-            try:
-                cd, mod = shared.is_loki_on_cooldown()
-                on_cooldown_now = bool(cd and mod == "cool_down")
-            except Exception:
-                on_cooldown_now = False
-        if not on_cooldown_now:
-            msgs.append({"role": "system", "content": (
-                "[Reply-length reminder — your recent replies have been running short. "
-                "Default to 1-2 full paragraphs: develop the thought, land the joke completely, "
-                "give context and texture instead of stopping at the first punchline. "
-                "Single-sentence replies are only for genuine one-liner moments "
-                "(quick reactions, simple yes/no, quips). Otherwise: take the space.]"
-            )})
+        msgs.append({"role": "system", "content": (
+            "[Reply-length reminder — your recent replies have been running short. "
+            "Default to 1-2 full paragraphs: develop the thought, land the joke completely, "
+            "give context and texture instead of stopping at the first punchline. "
+            "Single-sentence replies are only for genuine one-liner moments "
+            "(quick reactions, simple yes/no, quips). Otherwise: take the space.]"
+        )})
 
     return msgs
 
@@ -4381,7 +4304,11 @@ async def update_self_knowledge():
             for username, content, ts in reversed(rows)
         )
 
-        existing = load_learned_personality()
+        # Only the most recent slice of the notes file goes in the prompt.
+        # The full file is 400KB+ — sending it all was ~110k tokens per run,
+        # 4x/day, on the primary model. Recent entries are enough to avoid
+        # duplicate learnings.
+        existing = load_learned_personality()[-4000:]
 
         update_prompt = [
             {"role": "system", "content": (
@@ -5061,6 +4988,15 @@ async def on_ready():
     elif rag_available():
         from rag_search import get_chunk_count
         log.info(f"RAG online — {get_chunk_count()} conversation chunks indexed")
+        # Preload the embedding model in a worker thread now: lazily loading
+        # it on the first RAG/fact query blocks the event loop for several
+        # seconds and freezes the whole bot.
+        import rag_search as _rs
+
+        async def _warm_embedder():
+            await asyncio.to_thread(_rs._get_model)
+            log.info("Embedding model preloaded")
+        asyncio.create_task(_warm_embedder())
     else:
         log.warning("RAG module loaded but ChromaDB unreachable — history search DISABLED")
 
@@ -5262,73 +5198,6 @@ async def on_message(message: discord.Message):
     # ── Owner DM relay (silent, owner-only) ──────────────────────────────
     if await _handle_owner_relay(message):
         return
-
-    muted = False  # set below if shared state says so; checked after downloads
-
-    # ── Check shared state (Miss-T authority) ─────────────────────────────
-    if shared is not None:
-        global _was_muted
-
-        # Miss-T detection: only fire compliance when she is actually scolding Loki
-        if MISST_BOT_USER_ID and message.author.id == MISST_BOT_USER_ID:
-            msg_lower = message.content.lower()
-            loki_named = bot.user.mentioned_in(message) or "loki" in msg_lower
-            _SCOLD_WORDS = (
-                "stop", "enough", "chill", "cool it", "calm down", "be quiet",
-                "shut up", "back off", "knock it off", "cut it out", "behave",
-                "watch it", "i'm warning", "last warning", "no more",
-                "that's enough", "sit down", "stand down",
-            )
-            is_scold = loki_named and any(w in msg_lower for w in _SCOLD_WORDS)
-            if is_scold and not shared.is_loki_muted():
-                scold_prompt = [
-                    {"role": "system", "content": (
-                        SYSTEM_PROMPT + "\n\n"
-                        "Miss-T just called you out directly. Respond in your full Loki character — "
-                        "acknowledge the scolding with your signature mix of wounded pride, "
-                        "dramatic flair, and reluctant compliance. Never use the same phrasing twice. "
-                        "Keep it under 2 sentences. No canned lines."
-                    )},
-                    {"role": "user", "content": f"[Miss-T just said]: {message.content}"}
-                ]
-                try:
-                    scold_reply = await llm.chat(scold_prompt)
-                    await message.channel.send(scold_reply)
-                except Exception as _se:
-                    log.error(f"Scold LLM error: {_se}")
-                return
-            # Miss-T not scolding Loki — stay quiet if she didn't address him
-            if not loki_named:
-                return
-            # She mentioned Loki without scolding — fall through to normal LLM response
-
-        # Check mute status
-        muted = shared.is_loki_muted()
-        if muted:
-            _was_muted = True
-            if message.guild:
-                memory.store_message(
-                    guild_id=message.guild.id,
-                    channel_id=message.channel.id,
-                    user_id=message.author.id,
-                    username=message.author.display_name,
-                    role="user",
-                    content=message.content,
-                    has_image=False,
-                    image_desc=""
-                )
-            # Don't return yet — still allow downloads to run below
-        elif _was_muted:
-            _was_muted = False
-            return_lines = [
-                "...I'm back. Did you miss me? Don't answer that.",
-                "Mute expired. I have returned. You're welcome.",
-                "*stretches* Back. As if I was ever really gone.",
-            ]
-            await message.channel.send(random.choice(return_lines))
-
-        # Check cooldown modifier — will be injected in build_llm_messages
-        on_cooldown, modifier = shared.is_loki_on_cooldown()
 
     # ── Process images / GIFs attached to ANY message for context ──────────
     image_desc = ""
@@ -5560,10 +5429,6 @@ async def on_message(message: discord.Message):
             )
             return
 
-    # ── Bail out if muted (downloads above already ran) ─────────────────
-    if muted:
-        return
-
     # ── Check if bot should respond ───────────────────────────────────────
     should_respond = False
 
@@ -5775,7 +5640,9 @@ async def on_message(message: discord.Message):
             guild_name_for_rag = message.guild.name if message.guild else None
             since_dt, until_dt = parse_query_time_window(content_text)
             named_person, rag_query = _extract_named_subject(content_text)
-            hits = search_history(
+            # off the event loop: embeds the query + hits ChromaDB
+            hits = await asyncio.to_thread(
+                search_history,
                 rag_query,
                 n_results=int(os.getenv("RAG_MAX_CHUNKS", "5")),
                 guild_name=guild_name_for_rag,
@@ -5943,7 +5810,6 @@ async def on_message(message: discord.Message):
                 "content": f"[Detected emotional tone: {emotion}. Respond accordingly — be aware of how they're feeling.]"
             })
 
-        llm.record_hit(message.channel.id)
         # Tools only on QUESTION/COMMAND (and only on the OpenAI path):
         # banter shouldn't pay the schema-token overhead on every message.
         if (_tools_available and LLM_PROVIDER == "openai"
