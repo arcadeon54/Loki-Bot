@@ -29,6 +29,9 @@ RECALL_DISTANCE = float(os.getenv("USER_FACTS_RECALL_DISTANCE", "0.60"))
 
 _client = None
 _collection = None
+# Cached so recall_facts can skip the embedding entirely while no facts exist
+# (it runs on every reply from a profiled user — that's the hot path).
+_count_cache: int | None = None
 
 
 def _get_model():
@@ -96,6 +99,9 @@ def store_facts(user_id: str, user_name: str, guild_id: str, facts: list[str]) -
                 }],
             )
             stored += 1
+        if stored:
+            global _count_cache
+            _count_cache = (_count_cache or 0) + stored
         return stored
     except Exception as e:
         log.error(f"store_facts failed: {e}")
@@ -104,9 +110,12 @@ def store_facts(user_id: str, user_name: str, guild_id: str, facts: list[str]) -
 
 def recall_facts(user_id: str, query: str, k: int = 4) -> list[str]:
     """Facts about this user semantically relevant to the current message."""
+    global _count_cache
     try:
         coll = _get_collection()
-        if coll.count() == 0:
+        if _count_cache is None:
+            _count_cache = coll.count()
+        if _count_cache == 0:
             return []
         model = _get_model()
         emb = model.encode(query[:400], normalize_embeddings=True).tolist()
@@ -131,6 +140,9 @@ def forget_user(user_id: str) -> int:
         ids = existing.get("ids", [])
         if ids:
             coll.delete(ids=ids)
+            global _count_cache
+            if _count_cache is not None:
+                _count_cache = max(0, _count_cache - len(ids))
         return len(ids)
     except Exception as e:
         log.error(f"forget_user failed: {e}")
