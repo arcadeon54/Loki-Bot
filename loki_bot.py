@@ -144,7 +144,6 @@ GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
 SYSTEM_PROMPT         = os.getenv("SYSTEM_PROMPT", "You are Loki, the God of Mischief.")
 MEMORY_DB_PATH        = os.getenv("MEMORY_DB_PATH", "loki_memory.db")
 CONTEXT_MESSAGE_COUNT = int(os.getenv("CONTEXT_MESSAGE_COUNT", "50"))
-MISST_BOT_USER_ID = int(os.getenv("MISST_BOT_USER_ID") or "0")
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID") or "0")
 ROOMMATE_USER_ID = 992855519368851556
 RELAY_CHANNEL_ID = int(os.getenv("RELAY_CHANNEL_ID") or "0")
@@ -154,7 +153,6 @@ JOBSITE_CHANNEL_ID      = int(os.getenv("JOBSITE_CHANNEL_ID") or os.getenv("HA_N
 JOBSITE_DEVICE_TRACKER  = os.getenv("JOBSITE_DEVICE_TRACKER", "device_tracker.nokia_e23")
 JOBSITE_DWELL_MINUTES   = int(os.getenv("JOBSITE_DWELL_MINUTES", "120"))
 RELAY_CHANNEL_NAME = os.getenv("RELAY_CHANNEL_NAME", "chit-chat")
-SHARED_STATE_PATH = os.getenv("SHARED_STATE_PATH", os.path.expanduser("~/bot-shared-state/loki_state.json"))
 
 # ─── Claude Code settings ─────────────────────────────────────────────────────
 _claude_bin_default = shutil.which("claude") or "claude"
@@ -1949,8 +1947,6 @@ llm       = LLMHandler()
 voice_h   = VoiceHandler()
 claude_cc = ClaudeCodeHandler(CLAUDE_BIN, CLAUDE_WORKSPACE, CLAUDE_TIMEOUT)
 mood_tracker = MoodTracker()
-shared = _SharedState(SHARED_STATE_PATH) if _shared_state_available else None
-_was_muted = False  # track mute state for "I'm back" message
 
 # Member directory cache: { guild_id: (directory_string, timestamp) }
 _member_dir_cache: dict[int, tuple[str, float]] = {}
@@ -3546,21 +3542,6 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
     # ── Current time injection ────────────────────────────────────────────
     prompt += f"\n\n[Current time]: {now_et().strftime('%I:%M %p ET, %A %B %-d %Y')}"
 
-    # ── Inject Miss-T cooldown behavior modifier if active ───────────────
-    if shared is not None and not serious:
-        on_cooldown, modifier = shared.is_loki_on_cooldown()
-        if on_cooldown and modifier:
-            if modifier == "cool_down":
-                prompt += (
-                    "\n\n[Miss-T told you to cool it. You are currently being watched. "
-                    "Be less chaotic, keep responses shorter and more measured.]"
-                )
-            elif modifier == "be_nice":
-                prompt += (
-                    "\n\n[Miss-T told you to be nice. You're being extra polite and "
-                    "well-behaved right now, though it pains you deeply.]"
-                )
-
     msgs = [{"role": "system", "content": prompt}]
 
     # ── Member directory for @mentions ────────────────────────────────────
@@ -3681,23 +3662,14 @@ def build_llm_messages(channel_id, guild_id=None, extra_user_msg: str = "",
         msgs.append(extra_msg)
 
     # Final-position length nudge counters few-shot drag from past short replies.
-    # Skipped in serious mode and during Miss-T cool_down (which wants shorter).
     if not serious:
-        on_cooldown_now = False
-        if shared is not None:
-            try:
-                cd, mod = shared.is_loki_on_cooldown()
-                on_cooldown_now = bool(cd and mod == "cool_down")
-            except Exception:
-                on_cooldown_now = False
-        if not on_cooldown_now:
-            msgs.append({"role": "system", "content": (
-                "[Reply-length reminder — your recent replies have been running short. "
-                "Default to 1-2 full paragraphs: develop the thought, land the joke completely, "
-                "give context and texture instead of stopping at the first punchline. "
-                "Single-sentence replies are only for genuine one-liner moments "
-                "(quick reactions, simple yes/no, quips). Otherwise: take the space.]"
-            )})
+        msgs.append({"role": "system", "content": (
+            "[Reply-length reminder — your recent replies have been running short. "
+            "Default to 1-2 full paragraphs: develop the thought, land the joke completely, "
+            "give context and texture instead of stopping at the first punchline. "
+            "Single-sentence replies are only for genuine one-liner moments "
+            "(quick reactions, simple yes/no, quips). Otherwise: take the space.]"
+        )})
 
     return msgs
 
@@ -5227,73 +5199,6 @@ async def on_message(message: discord.Message):
     if await _handle_owner_relay(message):
         return
 
-    muted = False  # set below if shared state says so; checked after downloads
-
-    # ── Check shared state (Miss-T authority) ─────────────────────────────
-    if shared is not None:
-        global _was_muted
-
-        # Miss-T detection: only fire compliance when she is actually scolding Loki
-        if MISST_BOT_USER_ID and message.author.id == MISST_BOT_USER_ID:
-            msg_lower = message.content.lower()
-            loki_named = bot.user.mentioned_in(message) or "loki" in msg_lower
-            _SCOLD_WORDS = (
-                "stop", "enough", "chill", "cool it", "calm down", "be quiet",
-                "shut up", "back off", "knock it off", "cut it out", "behave",
-                "watch it", "i'm warning", "last warning", "no more",
-                "that's enough", "sit down", "stand down",
-            )
-            is_scold = loki_named and any(w in msg_lower for w in _SCOLD_WORDS)
-            if is_scold and not shared.is_loki_muted():
-                scold_prompt = [
-                    {"role": "system", "content": (
-                        SYSTEM_PROMPT + "\n\n"
-                        "Miss-T just called you out directly. Respond in your full Loki character — "
-                        "acknowledge the scolding with your signature mix of wounded pride, "
-                        "dramatic flair, and reluctant compliance. Never use the same phrasing twice. "
-                        "Keep it under 2 sentences. No canned lines."
-                    )},
-                    {"role": "user", "content": f"[Miss-T just said]: {message.content}"}
-                ]
-                try:
-                    scold_reply = await llm.chat(scold_prompt)
-                    await message.channel.send(scold_reply)
-                except Exception as _se:
-                    log.error(f"Scold LLM error: {_se}")
-                return
-            # Miss-T not scolding Loki — stay quiet if she didn't address him
-            if not loki_named:
-                return
-            # She mentioned Loki without scolding — fall through to normal LLM response
-
-        # Check mute status
-        muted = shared.is_loki_muted()
-        if muted:
-            _was_muted = True
-            if message.guild:
-                memory.store_message(
-                    guild_id=message.guild.id,
-                    channel_id=message.channel.id,
-                    user_id=message.author.id,
-                    username=message.author.display_name,
-                    role="user",
-                    content=message.content,
-                    has_image=False,
-                    image_desc=""
-                )
-            # Don't return yet — still allow downloads to run below
-        elif _was_muted:
-            _was_muted = False
-            return_lines = [
-                "...I'm back. Did you miss me? Don't answer that.",
-                "Mute expired. I have returned. You're welcome.",
-                "*stretches* Back. As if I was ever really gone.",
-            ]
-            await message.channel.send(random.choice(return_lines))
-
-        # Check cooldown modifier — will be injected in build_llm_messages
-        on_cooldown, modifier = shared.is_loki_on_cooldown()
-
     # ── Process images / GIFs attached to ANY message for context ──────────
     image_desc = ""
     if message.attachments:
@@ -5523,10 +5428,6 @@ async def on_message(message: discord.Message):
                 run_download(_msg_urls[0], message.author.display_name, trigger_message=message)
             )
             return
-
-    # ── Bail out if muted (downloads above already ran) ─────────────────
-    if muted:
-        return
 
     # ── Check if bot should respond ───────────────────────────────────────
     should_respond = False
