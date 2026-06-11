@@ -17,3 +17,4 @@ quip_usage.json
 AGENTS.md
 eval_queries.json
 tool_calls.jsonl
+proactive_state.json

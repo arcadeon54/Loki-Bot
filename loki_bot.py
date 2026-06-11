@@ -772,6 +772,39 @@ class MemoryDB:
         """, (min_new_messages,))
         return [(g, c) for g, c, _ in cursor.fetchall()]
 
+    def get_guild_messages_between(self, guild_id, start_iso, end_iso, limit=400):
+        """User messages in a guild between two ISO timestamps (for recaps)."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT channel_id, username, content FROM messages
+            WHERE guild_id = ? AND role = 'user'
+              AND timestamp >= ? AND timestamp < ?
+            ORDER BY id LIMIT ?
+        """, (str(guild_id), start_iso, end_iso, limit))
+        return cursor.fetchall()
+
+    def get_last_user_message_time(self, guild_id):
+        """ISO timestamp of the most recent human message in a guild."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT timestamp FROM messages
+            WHERE guild_id = ? AND role = 'user'
+            ORDER BY id DESC LIMIT 1
+        """, (str(guild_id),))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def get_most_active_channel(self, guild_id, since_iso):
+        """channel_id with the most human messages since the given time."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT channel_id, COUNT(*) AS n FROM messages
+            WHERE guild_id = ? AND role = 'user' AND timestamp >= ?
+            GROUP BY channel_id ORDER BY n DESC LIMIT 1
+        """, (str(guild_id), since_iso))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
     # ── Per-Server Personality ────────────────────────────────────────────
     def set_server_personality(self, guild_id, prompt, set_by):
         cursor = self.conn.cursor()
@@ -1200,6 +1233,86 @@ class VisionHandler:
         except Exception as e:
             log.error(f"Vision error: {e}")
             return f"[Could not analyze image: {e}]"
+
+
+# =============================================================================
+#  PROACTIVE GOVERNOR (Phase 5)
+# =============================================================================
+PROACTIVE_CHANNEL_ID  = os.getenv("PROACTIVE_CHANNEL_ID", "")
+PROACTIVE_MAX_PER_DAY = int(os.getenv("PROACTIVE_MAX_PER_DAY", "5"))
+PROACTIVE_QUIET_HOURS = os.getenv("PROACTIVE_QUIET_HOURS", "23-9")   # ET, start-end
+QUIET_CALLOUT_HOURS   = float(os.getenv("QUIET_CALLOUT_HOURS", "36"))
+
+
+class ProactiveGovernor:
+    """Hard limits over everything Loki says unprompted: a persisted on/off
+    switch (/proactive), quiet hours, and a daily message budget. Every
+    proactive feature must pass allowed() before posting and call record()
+    after — no exceptions, that's the whole point."""
+
+    STATE_FILE = os.path.join(os.path.dirname(__file__), "proactive_state.json")
+
+    def __init__(self):
+        self.state = {"enabled": True, "date": "", "count": 0, "last_quiet_callout": 0.0}
+        try:
+            with open(self.STATE_FILE) as f:
+                self.state.update(json.load(f))
+        except Exception:
+            pass
+        q = PROACTIVE_QUIET_HOURS.split("-")
+        self.quiet_start, self.quiet_end = int(q[0]), int(q[1])
+
+    def _save(self):
+        try:
+            with open(self.STATE_FILE, "w") as f:
+                json.dump(self.state, f)
+        except Exception as e:
+            log.error(f"proactive state save failed: {e}")
+
+    def _roll_day(self):
+        today = now_et().strftime("%Y-%m-%d")
+        if self.state["date"] != today:
+            self.state["date"] = today
+            self.state["count"] = 0
+
+    def in_quiet_hours(self) -> bool:
+        h = now_et().hour
+        if self.quiet_start <= self.quiet_end:
+            return self.quiet_start <= h < self.quiet_end
+        return h >= self.quiet_start or h < self.quiet_end
+
+    def allowed(self, kind: str) -> bool:
+        self._roll_day()
+        if not self.state.get("enabled", True):
+            return False
+        if self.in_quiet_hours():
+            return False
+        if self.state["count"] >= PROACTIVE_MAX_PER_DAY:
+            log.info(f"Proactive '{kind}' suppressed — daily budget "
+                     f"({PROACTIVE_MAX_PER_DAY}) spent")
+            return False
+        return True
+
+    def record(self, kind: str):
+        self._roll_day()
+        self.state["count"] += 1
+        self._save()
+        log.info(f"Proactive message sent ({kind}) — "
+                 f"{self.state['count']}/{PROACTIVE_MAX_PER_DAY} today")
+
+    def set_enabled(self, value: bool):
+        self.state["enabled"] = value
+        self._save()
+
+    def status(self) -> str:
+        self._roll_day()
+        return (f"{'ON' if self.state.get('enabled', True) else 'OFF (kill switch)'} — "
+                f"{self.state['count']}/{PROACTIVE_MAX_PER_DAY} used today, "
+                f"quiet hours {self.quiet_start}:00–{self.quiet_end}:00 ET"
+                + (" (in quiet hours now)" if self.in_quiet_hours() else ""))
+
+
+proactive = ProactiveGovernor()
 
 
 # =============================================================================
@@ -4363,6 +4476,9 @@ async def before_flush_db():
 async def unprompted_interjection():
     """Occasionally drop an unprompted message into active channels."""
     global _global_last_interjection
+    # Phase 5: interjections count against the proactive budget too
+    if not proactive.allowed("interjection"):
+        return
     for guild in bot.guilds:
         for channel in guild.text_channels:
             # Skip channels where we can't read or write
@@ -4449,6 +4565,7 @@ async def unprompted_interjection():
                     "msgs_since_last": 0
                 }
                 _global_last_interjection = now
+                proactive.record("interjection")
                 log.info(
                     f"Interjected in #{channel.name} @ {guild.name} (mood={mood})"
                 )
@@ -4579,6 +4696,141 @@ async def detect_open_threads():
 @detect_open_threads.before_loop
 async def before_detect_threads():
     await bot.wait_until_ready()
+
+
+def _proactive_target_channel(guild) -> discord.TextChannel | None:
+    """The channel proactive posts go to: PROACTIVE_CHANNEL_ID if set,
+    otherwise the guild's most active channel of the last 7 days."""
+    if PROACTIVE_CHANNEL_ID:
+        ch = bot.get_channel(int(PROACTIVE_CHANNEL_ID))
+        if ch:
+            return ch
+    week_ago = (now_et() - datetime.timedelta(days=7)).isoformat()
+    cid = memory.get_most_active_channel(guild.id, week_ago)
+    if cid:
+        ch = bot.get_channel(int(cid))
+        if ch and ch.permissions_for(guild.me).send_messages:
+            return ch
+    return None
+
+
+@tasks.loop(time=datetime.time(hour=9, minute=30, tzinfo=ET))
+async def daily_recap():
+    """Post an in-character recap of yesterday's chat (Phase 5)."""
+    if not proactive.allowed("daily_recap"):
+        return
+    for guild in bot.guilds:
+        try:
+            today = now_et().replace(hour=0, minute=0, second=0, microsecond=0)
+            yesterday = today - datetime.timedelta(days=1)
+            rows = memory.get_guild_messages_between(
+                guild.id, yesterday.isoformat(), today.isoformat()
+            )
+            if len(rows) < 20:
+                log.info(f"Daily recap skipped for {guild.name} — "
+                         f"only {len(rows)} messages yesterday")
+                continue
+            channel = _proactive_target_channel(guild)
+            if channel is None:
+                continue
+            convo = "\n".join(f"{u}: {c[:200]}" for _cid, u, c in rows[-300:])
+            recap_msgs = build_llm_messages(
+                channel.id, guild_id=guild.id,
+                extra_user_msg=(
+                    "[DAILY RECAP TASK — not a user message. Write a short, fun, "
+                    "in-character morning recap of yesterday's chat below: highlights, "
+                    "who was on one, running jokes, anything left unresolved. "
+                    "4-8 sentences, no preamble, don't @ anyone.]\n\n" + convo[-8000:]
+                ),
+                guild=guild,
+            )
+            recap = await llm.chat(recap_msgs)
+            if recap:
+                await channel.send(recap[:1900])
+                proactive.record("daily_recap")
+        except Exception as e:
+            log.error(f"Daily recap failed for {guild.name}: {e}")
+        break   # one guild — The Break Room
+
+
+@tasks.loop(time=datetime.time(hour=10, minute=0, tzinfo=ET))
+async def birthday_check():
+    """Post birthday wishes from birthdays.json (Phase 5).
+    File format: {"MM-DD": ["Name or <@userid>", ...]}"""
+    if not proactive.allowed("birthday"):
+        return
+    try:
+        path = os.path.join(os.path.dirname(__file__), "birthdays.json")
+        with open(path) as f:
+            birthdays = json.load(f)
+    except Exception:
+        return
+    today_key = now_et().strftime("%m-%d")
+    names = [n for n in birthdays.get(today_key, []) if isinstance(n, str)]
+    if not names:
+        return
+    for guild in bot.guilds:
+        channel = _proactive_target_channel(guild)
+        if channel is None:
+            continue
+        try:
+            msgs = build_llm_messages(
+                channel.id, guild_id=guild.id,
+                extra_user_msg=(
+                    "[BIRTHDAY TASK — not a user message. It's the birthday of: "
+                    f"{', '.join(names)}. Write them an over-the-top in-character "
+                    "birthday message. 2-4 sentences.]"
+                ),
+                guild=guild,
+            )
+            wish = await llm.chat(msgs)
+            if wish:
+                await channel.send(wish[:1900])
+                proactive.record("birthday")
+        except Exception as e:
+            log.error(f"Birthday post failed: {e}")
+        break
+
+
+@tasks.loop(hours=1)
+async def quiet_server_callout():
+    """If the server's been dead for QUIET_CALLOUT_HOURS, poke it (Phase 5)."""
+    if not proactive.allowed("quiet_callout"):
+        return
+    # at most one callout per 48h regardless of budget
+    if time.time() - proactive.state.get("last_quiet_callout", 0) < 48 * 3600:
+        return
+    for guild in bot.guilds:
+        try:
+            last = memory.get_last_user_message_time(guild.id)
+            if not last:
+                continue
+            last_dt = datetime.datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=ET)
+            gap_hours = (now_et() - last_dt).total_seconds() / 3600
+            if gap_hours < QUIET_CALLOUT_HOURS:
+                continue
+            channel = _proactive_target_channel(guild)
+            if channel is None:
+                continue
+            msgs = build_llm_messages(
+                channel.id, guild_id=guild.id,
+                extra_user_msg=(
+                    "[QUIET SERVER TASK — not a user message. Nobody has said anything "
+                    f"in about {int(gap_hours)} hours. Call the crew out for abandoning "
+                    "you — funny, dramatic, in character. 1-3 sentences, don't @ anyone.]"
+                ),
+                guild=guild,
+            )
+            callout = await llm.chat(msgs)
+            if callout:
+                await channel.send(callout[:1900])
+                proactive.state["last_quiet_callout"] = time.time()
+                proactive.record("quiet_callout")
+        except Exception as e:
+            log.error(f"Quiet callout failed: {e}")
+        break
 
 
 @tasks.loop(hours=24)
@@ -4768,6 +5020,11 @@ async def on_ready():
         log.info("Model routing OFF — all intents → primary")
     if not daily_usage_summary.is_running():
         daily_usage_summary.start()
+
+    for task in (daily_recap, birthday_check, quiet_server_callout):
+        if not task.is_running():
+            task.start()
+    log.info(f"Proactive behavior started — {proactive.status()}")
 
     # RAG died silently for two months once (module deleted, import swallowed
     # by try/except) — always announce its real state at startup.
@@ -5761,6 +6018,27 @@ async def on_message(message: discord.Message):
                 message.author.display_name,
                 str(message.channel.id)
             ))
+        # Milestone shout-outs (Phase 5) — governor-gated like all proactive posts
+        if count in {100, 500, 1000, 2500, 5000} and proactive.allowed("milestone"):
+            async def _milestone_post(ch, name, n):
+                try:
+                    msgs = build_llm_messages(
+                        ch.id, guild_id=message.guild.id,
+                        extra_user_msg=(
+                            f"[MILESTONE TASK — not a user message. {name} just hit "
+                            f"{n} interactions with you. Give them an in-character "
+                            "shout-out — proud but still Loki. 1-3 sentences.]"
+                        ),
+                        guild=message.guild,
+                    )
+                    text = await llm.chat(msgs)
+                    if text:
+                        await ch.send(text[:1900])
+                        proactive.record("milestone")
+                except Exception as e:
+                    log.error(f"Milestone post failed: {e}")
+            asyncio.create_task(_milestone_post(
+                message.channel, message.author.display_name, count))
 
     await bot.process_commands(message)
 
@@ -5805,6 +6083,26 @@ async def summarize(interaction: discord.Interaction):
         color=discord.Color.green()
     )
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="proactive", description="Boss only: control Loki's unprompted messages (on/off/status)")
+@discord.app_commands.describe(action="on, off, or status")
+async def proactive_cmd(interaction: discord.Interaction, action: str = "status"):
+    if str(interaction.user.id) != os.getenv("OWNER_USER_ID", ""):
+        await interaction.response.send_message(
+            "That switch is Boss-only. Nice try though.", ephemeral=True)
+        return
+    action = action.strip().lower()
+    if action == "off":
+        proactive.set_enabled(False)
+        msg = "🔇 Kill switch ON — no more unprompted messages until you say otherwise."
+    elif action == "on":
+        proactive.set_enabled(True)
+        msg = f"🔊 Proactive mode back ON. {proactive.status()}"
+    else:
+        msg = f"Proactive status: {proactive.status()}"
+    log.info(f"/proactive {action} by {interaction.user.display_name}")
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @bot.tree.command(name="forget", description="Make Loki forget everything he's learned about you")
