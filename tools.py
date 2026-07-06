@@ -35,7 +35,9 @@ log = logging.getLogger("Tools")
 OWNER_USER_ID = os.getenv("OWNER_USER_ID", "")
 CREW_USER_IDS = {u.strip() for u in os.getenv("CREW_USER_IDS", "").split(",") if u.strip()}
 
-SEARXNG_URL      = os.getenv("SEARXNG_URL", "http://192.168.1.247:8083")
+# SearXNG runs on dex247 itself (container `searxng`, host port 8083)
+SEARXNG_URL      = os.getenv("SEARXNG_URL", "http://127.0.0.1:8083")
+TAVILY_API_KEY   = os.getenv("TAVILY_API_KEY", "")
 JELLYFIN_URL     = os.getenv("JELLYFIN_URL", "http://localhost:8096")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
 SEERR_URL        = os.getenv("SEERR_URL", "")
@@ -174,17 +176,45 @@ async def _web_search(args: dict, ctx: ToolContext) -> str:
     query = str(args.get("query", "")).strip()[:300]
     if not query:
         return "Empty search query."
-    sess = await _session()
-    async with sess.get(
-        f"{SEARXNG_URL}/search",
-        params={"q": query, "format": "json", "categories": "general"},
-        timeout=aiohttp.ClientTimeout(total=8),
-    ) as resp:
-        data = await resp.json(content_type=None)
-    results = [r for r in data.get("results", []) if r.get("content")][:5]
-    if not results:
-        return f"No web results for '{query}'."
-    return "\n".join(f"- {r['content'][:250]} ({r.get('url', '')})" for r in results)
+
+    # Primary: self-hosted SearXNG (free, private).
+    try:
+        sess = await _session()
+        async with sess.get(
+            f"{SEARXNG_URL}/search",
+            params={"q": query, "format": "json", "categories": "general"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        results = [r for r in data.get("results", []) if r.get("content")][:5]
+        if results:
+            return "\n".join(f"- {r['content'][:250]} ({r.get('url', '')})"
+                             for r in results)
+    except Exception as e:
+        log.warning(f"SearXNG search failed ({e}) — trying Tavily fallback")
+
+    # Fallback: Tavily API (key already provisioned in .env).
+    if TAVILY_API_KEY:
+        try:
+            sess = await _session()
+            async with sess.post(
+                "https://api.tavily.com/search",
+                json={"api_key": TAVILY_API_KEY, "query": query,
+                      "max_results": 5, "include_answer": True},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+            lines = []
+            if data.get("answer"):
+                lines.append(f"Answer: {data['answer']}")
+            lines += [f"- {r.get('content', '')[:250]} ({r.get('url', '')})"
+                      for r in data.get("results", [])[:5]]
+            if lines:
+                return "\n".join(lines)
+        except Exception as e:
+            log.error(f"Tavily fallback failed: {e}")
+
+    return f"No web results for '{query}' — both search backends came up empty."
 
 
 async def _media_lookup(args: dict, ctx: ToolContext) -> str:

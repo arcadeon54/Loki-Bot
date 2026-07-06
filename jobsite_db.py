@@ -135,17 +135,16 @@ def record_departure(visit_id):
 
 
 def export_csv(output_path):
+    """Export completed work sessions (work_tracker.py's table) to CSV."""
     import csv
     with sqlite3.connect(DB_PATH) as c:
-        query = """
-            SELECT s.name, v.arrived_at, v.departed_at, v.duration_minutes, v.notes
-            FROM job_visits v
-            JOIN job_sites s ON v.site_id = s.id
-            ORDER BY v.arrived_at DESC
-        """
-        rows = c.execute(query).fetchall()
+        rows = c.execute("""
+            SELECT location, arrived_at, departed_at, duration_minutes
+            FROM work_sessions
+            ORDER BY arrived_at DESC
+        """).fetchall()
         with open(output_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["Job Site", "Arrival", "Departure", "Duration (Min)", "Notes"])
+            writer.writerow(["Location", "Arrival", "Departure", "Duration (Min)"])
             writer.writerows(rows)
     return True

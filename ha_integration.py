@@ -11,7 +11,8 @@ from aiohttp import web
 
 log = logging.getLogger(__name__)
 
-HA_URL              = os.getenv("HA_URL", "http://192.168.1.247:8123")
+# Default = the NAS deployment via NPM (unicron, the old host, is decommissioned)
+HA_URL              = os.getenv("HA_URL", "https://ha.ivn-group.cc")
 HA_TOKEN            = os.getenv("HA_TOKEN", "")
 HA_NOTIFY_CHANNEL_ID = int(os.getenv("HA_NOTIFY_CHANNEL_ID", "0"))
 HA_WEBHOOK_PORT     = int(os.getenv("HA_WEBHOOK_PORT", "9100"))

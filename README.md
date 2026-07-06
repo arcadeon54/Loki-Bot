@@ -1,6 +1,18 @@
-# Loki Bot — AI Discord Bot
+# Loki Bot — Personal AI Assistant
 
-A conversational AI Discord bot with persistent memory, image recognition, voice chat, per-server personalities, and support for ChatGPT or local LLMs.
+A conversational AI assistant with persistent memory, image recognition, voice chat, per-server personalities, and support for ChatGPT or local LLMs. Originally Discord-only; since the **July 2026 personal-AI upgrade** Loki is a cross-platform second brain.
+
+## Personal-AI upgrade (July 2026)
+
+One brain, multiple interfaces, real long-term memory. Full details per integration in [INTEGRATIONS.md](INTEGRATIONS.md).
+
+- **Telegram interface** (`telegram_interface.py`) — same tools/memory/LLM as Discord; auto-configures from a token in `.env` or Joplin; dormant (never fatal) without one
+- **Joplin long-term memory** (`joplin_integration.py` + `semantic_memory.py`) — notes CRUD/search/lists via a joplin-cli Data-API sidecar container; memories stored as human-editable notes and indexed semantically in ChromaDB ("what pressure do I use?" finds the scooter note, not the bike)
+- **Home Assistant** (`ha_integration.py` + tools) — entity lookup, state, service calls, automations, phone notifications, presence
+- **Automatic work tracking** (`work_tracker.py`) — ≥90 min at a non-home location = work session **starting at arrival**; sessions logged to SQLite + Joplin work log + Google Sheets
+- **Lockout warnings** (`presence_monitor.py`) — notifies whoever arrives home when the other resident is away (only when exactly one is home)
+- **Web search** — SearXNG with Tavily fallback; used for anything current
+- New boss-level tools: `remember`, `recall_memory`, `note_create/search/read/append`, `list_create`, `home_status`, `home_control`, `work_hours`
 
 ## Features
 

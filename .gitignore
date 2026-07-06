@@ -20,3 +20,6 @@ tool_calls.jsonl
 proactive_state.json
 *.log.*
 *.json.old
+presence_state.json
+work_tracker_state.json
+telegram_state.json

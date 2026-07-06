@@ -74,6 +74,9 @@ except ImportError:
 # ─── Shared aiohttp session (created in on_ready, used everywhere) ────────────
 _http_session: "aiohttp.ClientSession | None" = None
 
+# Telegram interface singleton (created once in on_ready; survives reconnects)
+_telegram_iface = None
+
 async def get_http_session() -> "aiohttp.ClientSession":
     """Return the shared aiohttp session, creating it if needed."""
     global _http_session
@@ -121,6 +124,44 @@ try:
 except ImportError:
     _voice_listen_available = False
 
+# ─── July 2026 personal-AI upgrade modules ────────────────────────────────────
+try:
+    import joplin_integration
+    _joplin_available = True
+except ImportError:
+    _joplin_available = False
+
+try:
+    import semantic_memory
+    _semantic_memory_available = True
+except ImportError:
+    _semantic_memory_available = False
+
+try:
+    import work_tracker
+    work_tracker.init_db()   # before any task loop can touch work_sessions
+    _work_tracker_available = True
+except ImportError:
+    _work_tracker_available = False
+
+try:
+    import presence_monitor
+    _presence_available = True
+except ImportError:
+    _presence_available = False
+
+try:
+    from telegram_interface import TelegramInterface
+    _telegram_available = True
+except ImportError:
+    _telegram_available = False
+
+try:
+    import assistant_tools  # side effect: registers boss tools in tools.REGISTRY
+    _assistant_tools_available = True
+except Exception:
+    _assistant_tools_available = False
+
 # ─── Timezone ─────────────────────────────────────────────────────────────────
 ET = ZoneInfo("America/New_York")
 
@@ -152,6 +193,9 @@ RELAY_CHANNEL_ID = int(os.getenv("RELAY_CHANNEL_ID") or "0")
 JOBSITE_CHANNEL_ID      = int(os.getenv("JOBSITE_CHANNEL_ID") or os.getenv("HA_NOTIFY_CHANNEL_ID") or "0")
 JOBSITE_DEVICE_TRACKER  = os.getenv("JOBSITE_DEVICE_TRACKER", "device_tracker.nokia_e23")
 JOBSITE_DWELL_MINUTES   = int(os.getenv("JOBSITE_DWELL_MINUTES", "120"))
+# The work tracker follows the person entity (aggregates all of the Boss's
+# trackers) rather than one raw device_tracker.
+WORK_PERSON_ENTITY      = os.getenv("WORK_PERSON_ENTITY", "person.kavaris")
 RELAY_CHANNEL_NAME = os.getenv("RELAY_CHANNEL_NAME", "chit-chat")
 
 # ─── Claude Code settings ─────────────────────────────────────────────────────
@@ -4140,7 +4184,7 @@ async def _handle_jobsite_command(message: discord.Message, content_text: str) -
         if not nearby:
             sites = jobsite_db.list_sites()
             if not sites:
-                return "No job sites saved yet. I'll prompt you when you've been at a new location for 2 hours."
+                return "No job sites saved yet. I'll prompt you when you've been at a new location for 90 minutes."
             # Try to attach note to most recently visited site instead
             last = sites[0]
             jobsite_db.append_note(last["id"], note_text)
@@ -4153,7 +4197,7 @@ async def _handle_jobsite_command(message: discord.Message, content_text: str) -
     if _JS_LIST_RE.search(content_text):
         sites = jobsite_db.list_sites()
         if not sites:
-            return "No job sites saved yet. I'll prompt you when you've been at a new location for 2+ hours."
+            return "No job sites saved yet. I'll prompt you when you've been at a new location for 90+ minutes."
         lines = [f"**Job Sites** ({len(sites)} total)"]
         for s in sites:
             last = s["last_visited"][:10] if s["last_visited"] else "never"
@@ -4174,238 +4218,65 @@ async def _handle_jobsite_command(message: discord.Message, content_text: str) -
     return None
 
 
-@tasks.loop(minutes=10)
+@tasks.loop(minutes=5)
 async def jobsite_poll():
-    """Poll HA device tracker every 10 min; detect dwell at unknown locations."""
-    if not _jobsite_available:
-        return
+    """Location tick (every 5 min): feeds the work tracker's 90-minute-rule
+    state machine and keeps the legacy conveniences alive (current-GPS cache
+    for `add note:`, calendar-matched job-site naming).
+
+    Session bookkeeping (arrival/confirm/close, Joplin work log, Google
+    Sheets, Discord announcements) all lives in work_tracker.py now — the
+    old inline version double-counted dwell and had a shadowed-datetime bug
+    that silently killed the Sheets export.
+    """
     if not _ha_available or not ha_integration.HA_TOKEN:
         return
-    if not JOBSITE_CHANNEL_ID:
+
+    # 1) Advance the work tracker.
+    if _work_tracker_available:
+        try:
+            await work_tracker.poll(WORK_PERSON_ENTITY)
+        except Exception as e:
+            log.error(f"work_tracker.poll failed: {e}", exc_info=True)
+
+    # 2) Legacy niceties that other features rely on.
+    if not _jobsite_available:
         return
+    try:
+        st = await ha_integration.get_state(WORK_PERSON_ENTITY)
+        if not st:
+            return
+        attrs = st.get("attributes", {})
+        lat, lon = attrs.get("latitude"), attrs.get("longitude")
+        zone_state = (st.get("state") or "").lower()
+        if lat is None or lon is None:
+            return
 
-    state = await ha_integration.get_state(JOBSITE_DEVICE_TRACKER)
-    if not state:
-        return
+        # `add note:` uses the freshest GPS fix.
+        _jobsite_state["lat"] = lat
+        _jobsite_state["lon"] = lon
+        _jobsite_state["prev_zone"] = zone_state
 
-    attrs = state.get("attributes", {})
-    lat = attrs.get("latitude")
-    lon = attrs.get("longitude")
-    zone_state = state.get("state", "").lower()
-
-    if lat is None or lon is None:
-        return
-
-    now = datetime.datetime.utcnow()
-    channel = bot.get_channel(JOBSITE_CHANNEL_ID)
-
-    # ─── CALENDAR TRIGGERED LOGGING ──────────────────────────────────────────
-    calendar_state = await ha_integration.get_state("calendar.work_grind")
-    if calendar_state and calendar_state.get("state") == "on":
-        cal_attrs = calendar_state.get("attributes", {})
-        cal_location = cal_attrs.get("location")
-        cal_summary = cal_attrs.get("message") or "Work Grind Event"
-
-        if cal_location and zone_state not in ("home", "work"):
-            nearby = jobsite_db.find_nearby(lat, lon)
-            if not nearby:
-                # New site from calendar - log IMMEDIATELY
-                jobsite_db.add_site(cal_summary, lat, lon)
-                new_site = jobsite_db.find_nearby(lat, lon)[0]
-                jobsite_db.append_note(new_site["id"], f"Source: Google Calendar (Work Grind)\nLocation: {cal_location}")
-
+        # Calendar-matched naming: a "Work Grind" calendar event at an
+        # unnamed location pre-creates the job site so the work tracker
+        # names the session after the event.
+        if zone_state not in ("home", "work"):
+            cal = await ha_integration.get_state("calendar.work_grind")
+            if cal and cal.get("state") == "on" and not jobsite_db.find_nearby(lat, lon):
+                summary = cal.get("attributes", {}).get("message") or "Work Grind Event"
+                site_id = jobsite_db.add_site(summary, lat, lon)
+                cal_loc = cal.get("attributes", {}).get("location") or ""
+                jobsite_db.append_note(
+                    site_id, "Source: Google Calendar (Work Grind)"
+                             + (f"\nLocation: {cal_loc}" if cal_loc else ""))
+                log.info(f"Calendar-matched new job site: {summary}")
+                channel = bot.get_channel(JOBSITE_CHANNEL_ID)
                 if channel:
                     await channel.send(
-                        f"📍 **Calendar Match:** Automatically logged **{cal_summary}** as a job site.\n"
-                        f"Matched your current location to your 'Work Grind' calendar event: *{cal_location}*."
-                    )
-
-                # Force state update to prevent 2h dwell prompt
-                _jobsite_state["notified_unknown"] = True
-                _jobsite_state["arrived_at"] = now
-    # ─────────────────────────────────────────────────────────────────────────
-
-    prev_zone = _jobsite_state.get("prev_zone")
-
-    _jobsite_state["prev_zone"] = zone_state
-
-    # Skip home and work — no job site prompts there
-    if zone_state in ("home", "work"):
-        if _jobsite_state["notified_known"] is not None and _jobsite_state.get("notified_known_at") and channel:
-            site = jobsite_db.get_site(_jobsite_state["notified_known"])
-            if site:
-                elapsed = int((now - _jobsite_state["notified_known_at"]).total_seconds() / 60) + JOBSITE_DWELL_MINUTES
-                hours, mins = divmod(elapsed, 60)
-                dur = f"{hours}h {mins}m" if hours else f"{mins}m"
-                await channel.send(f"Leaving **{site['name']}** - {dur} on site. ({now_et().strftime('%-I:%M %p, %b %-d %Y')})")
-                try:
-                    import aiohttp
-                    from datetime import datetime
-                    
-                    # Calculate Pay Period
-                    anchor_date = datetime(2026, 5, 16).date()
-                    current_date = now.date()
-                    days_since = (current_date - anchor_date).days
-                    cycle_number = int(days_since / 14)
-                    
-                    period_start = anchor_date + datetime.timedelta(days=(cycle_number * 14))
-                    period_end = anchor_date + datetime.timedelta(days=(cycle_number * 14) + 13)
-                    
-                    pay_period = f"{period_start.strftime('%b %d')} - {period_end.strftime('%b %d')}"
-                    total_earned = f"${(elapsed / 60.0) * 16:.2f}"
-                    
-                    payload = {
-                        "config_entry": "01KV6AEYDJ6DNXE6GVXCGT0CRR",
-                        "worksheet": "Sheet1",
-                        "data": {
-                            "Pay Period": pay_period,
-                            "Date": now_et().strftime('%Y-%m-%d'),
-                            "Job Location": site['name'],
-                            "Arrival": _jobsite_state["notified_known_at"].strftime('%-I:%M %p'),
-                            "Departure": now_et().strftime('%-I:%M %p'),
-                            "Hours Worked": f"{elapsed / 60.0:.2f}",
-                            "Total Earned": total_earned
-                        }
-                    }
-                    
-                    ha_token = os.getenv('HA_TOKEN')
-                    ha_url = os.getenv('HA_URL', 'http://192.168.1.247:8123')
-                    
-                    if ha_token:
-                        headers = {
-                            "Authorization": f"Bearer {ha_token}",
-                            "Content-Type": "application/json"
-                        }
-                        async with aiohttp.ClientSession() as session:
-                            await session.post(f"{ha_url}/api/services/google_sheets/append_sheet", headers=headers, json=payload)
-                            
-                except Exception as e:
-                    log.error(f"Google Sheets direct post failed: {e}")
-                # Record departure in database
-                if _jobsite_state.get("visit_id"):
-                    jobsite_db.record_departure(_jobsite_state["visit_id"])
-                    _jobsite_state["visit_id"] = None  
-        _jobsite_state.update({"lat": lat, "lon": lon, "arrived_at": None,
-                               "notified_unknown": False, "notified_known": None,
-                               "notified_known_at": None})
-        return
-    prev_lat = _jobsite_state["lat"]
-    prev_lon = _jobsite_state["lon"]
-
-    # Check if we've moved more than 100m since last poll
-    moved = True
-    if prev_lat is not None and prev_lon is not None:
-        dist = jobsite_db._dist_m(lat, lon, prev_lat, prev_lon)
-        moved = dist > 100
-
-    if moved:
-        if _jobsite_state["notified_known"] is not None and _jobsite_state.get("notified_known_at") and channel:
-            site = jobsite_db.get_site(_jobsite_state["notified_known"])
-            if site:
-                elapsed = int((now - _jobsite_state["notified_known_at"]).total_seconds() / 60) + JOBSITE_DWELL_MINUTES
-                hours, mins = divmod(elapsed, 60)
-                dur = f"{hours}h {mins}m" if hours else f"{mins}m"
-                await channel.send(f"Leaving **{site['name']}** - {dur} on site. ({now_et().strftime('%-I:%M %p, %b %-d %Y')})")
-                try:
-                    import aiohttp
-                    from datetime import datetime
-                    
-                    # Calculate Pay Period
-                    anchor_date = datetime(2026, 5, 16).date()
-                    current_date = now.date()
-                    days_since = (current_date - anchor_date).days
-                    cycle_number = int(days_since / 14)
-                    
-                    period_start = anchor_date + datetime.timedelta(days=(cycle_number * 14))
-                    period_end = anchor_date + datetime.timedelta(days=(cycle_number * 14) + 13)
-                    
-                    pay_period = f"{period_start.strftime('%b %d')} - {period_end.strftime('%b %d')}"
-                    total_earned = f"${(elapsed / 60.0) * 16:.2f}"
-                    
-                    payload = {
-                        "config_entry": "01KV6AEYDJ6DNXE6GVXCGT0CRR",
-                        "worksheet": "Sheet1",
-                        "data": {
-                            "Pay Period": pay_period,
-                            "Date": now_et().strftime('%Y-%m-%d'),
-                            "Job Location": site['name'],
-                            "Arrival": _jobsite_state["notified_known_at"].strftime('%-I:%M %p'),
-                            "Departure": now_et().strftime('%-I:%M %p'),
-                            "Hours Worked": f"{elapsed / 60.0:.2f}",
-                            "Total Earned": total_earned
-                        }
-                    }
-                    
-                    ha_token = os.getenv('HA_TOKEN')
-                    ha_url = os.getenv('HA_URL', 'http://192.168.1.247:8123')
-                    
-                    if ha_token:
-                        headers = {
-                            "Authorization": f"Bearer {ha_token}",
-                            "Content-Type": "application/json"
-                        }
-                        async with aiohttp.ClientSession() as session:
-                            await session.post(f"{ha_url}/api/services/google_sheets/append_sheet", headers=headers, json=payload)
-                            
-                except Exception as e:
-                    log.error(f"Google Sheets direct post failed: {e}")
-                # Record departure in database
-                if _jobsite_state.get("visit_id"):
-                    jobsite_db.record_departure(_jobsite_state["visit_id"])
-                    _jobsite_state["visit_id"] = None  
-        _jobsite_state.update({"lat": lat, "lon": lon, "arrived_at": now,
-                               "notified_unknown": False, "notified_known": None,
-                               "notified_known_at": None})
-        return
-
-    arrived_at = _jobsite_state["arrived_at"]
-    if arrived_at is None:
-        _jobsite_state["arrived_at"] = now
-        return
-
-    dwell_minutes = (now - arrived_at).total_seconds() / 60
-    if dwell_minutes < JOBSITE_DWELL_MINUTES:
-        return
-
-    if not channel:
-        return
-
-    nearby = jobsite_db.find_nearby(lat, lon)
-
-    if nearby:
-        site = nearby[0]
-        if _jobsite_state["notified_known"] != site["id"]:
-            _jobsite_state["notified_known"] = site["id"]
-            _jobsite_state["notified_known_at"] = now
-            jobsite_db.update_last_visited(site["id"])
-            # Record arrival in database
-            _jobsite_state["visit_id"] = jobsite_db.record_arrival(site["id"])
-            notes = (site["notes"] or "").strip()
-            notes_block = f"\n**Notes:**\n{notes}" if notes else "\n*No notes on file.*"
-            await channel.send(
-                f"📍 Back at **{site['name']}** — you've been here {int(dwell_minutes)} min.{notes_block}"
-            )
-    else:
-        if not _jobsite_state["notified_unknown"]:
-            import datetime
-            _jobsite_state["notified_unknown"] = True
-            addr = await _reverse_geocode(lat, lon)
-            loc_str = addr or f"{lat:.5f}, {lon:.5f}"
-            name = loc_str or f"Site {datetime.datetime.utcnow().strftime('%Y-%m-%d')}"
-            jobsite_db.add_site(name, lat, lon)
-            
-            # Immediately mark as known so we don't spam
-            nearby = jobsite_db.find_nearby(lat, lon)
-            if nearby:
-                _jobsite_state["notified_known"] = nearby[0]["id"]
-                _jobsite_state["notified_known_at"] = now
-                # Record arrival in database
-                _jobsite_state["visit_id"] = jobsite_db.record_arrival(nearby[0]["id"])
-                
-            await channel.send(
-                f"📍 Automatically logged **{name}** as a new job site (dwelled for {int(dwell_minutes)} minutes).\n"
-                f"You can rename it with `save as [new name]` or add notes with `add note: [text]`."
-            )
+                        f"📍 **Calendar match:** logged **{summary}** as a job site "
+                        f"from your 'Work Grind' event.")
+    except Exception as e:
+        log.error(f"jobsite housekeeping failed: {e}")
 
 
 @jobsite_poll.before_loop
@@ -4414,6 +4285,36 @@ async def before_jobsite_poll():
 
 
 # =============================================================================
+
+@tasks.loop(minutes=2)
+async def presence_poll():
+    """Lockout-prevention watcher (see presence_monitor.py)."""
+    try:
+        await presence_monitor.poll()
+    except Exception as e:
+        log.error(f"presence poll failed: {e}")
+
+
+@presence_poll.before_loop
+async def before_presence_poll():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(hours=24)
+async def memory_reindex():
+    """Keep the semantic index honest: rebuild from the Joplin Memories
+    notebook daily, so notes the Boss edits/deletes by hand propagate."""
+    try:
+        n = await semantic_memory.reindex()
+        log.info(f"Daily memory reindex complete — {n} memories")
+    except Exception as e:
+        log.error(f"memory reindex failed: {e}")
+
+
+@memory_reindex.before_loop
+async def before_memory_reindex():
+    await bot.wait_until_ready()
+
 
 @tasks.loop(hours=168) # Weekly
 async def weekly_hours_export():
@@ -5179,7 +5080,95 @@ async def on_ready():
         if not jobsite_poll.is_running():
             jobsite_poll.start()
             weekly_hours_export.start()
-        log.info(f"Job site tracker started (polling {JOBSITE_DEVICE_TRACKER} every 10 min)")
+        log.info(f"Job site tracker started (following {WORK_PERSON_ENTITY} every 5 min)")
+
+    # ─── July 2026 personal-AI upgrade wiring ─────────────────────────────
+    async def _dm_boss(text: str):
+        try:
+            user = await bot.fetch_user(OWNER_USER_ID)
+            await user.send(text)
+        except Exception as e:
+            log.error(f"DM to Boss failed: {e}")
+
+    # Joplin long-term memory
+    if _joplin_available and joplin_integration.is_configured():
+        joplin_integration.bind_session(get_http_session)
+        if await joplin_integration.ping():
+            log.info("Joplin memory online — Data API sidecar reachable")
+        else:
+            log.warning("Joplin sidecar not answering (yet) — notes/memory "
+                        "degraded until loki-joplin-api is up")
+    else:
+        log.warning("Joplin integration DISABLED — JOPLIN_API_TOKEN not set")
+
+    # Semantic memory (Joplin + ChromaDB)
+    if _semantic_memory_available and semantic_memory.is_available():
+        log.info(f"Semantic memory online — {semantic_memory.memory_count()} "
+                 "memories indexed")
+        if not memory_reindex.is_running():
+            memory_reindex.start()
+    else:
+        log.warning("Semantic memory unavailable (ChromaDB or module missing)")
+
+    if _assistant_tools_available:
+        assistant_tools.bind(llm=llm)
+        log.info("Assistant tools bound (memory/notes/home/work)")
+    else:
+        log.warning("assistant_tools not importable — boss tools DISABLED")
+
+    # Work tracker (90-minute rule)
+    if _work_tracker_available and _ha_available:
+        work_tracker.init_db()
+
+        async def _work_announce(text: str):
+            ch = bot.get_channel(JOBSITE_CHANNEL_ID) if JOBSITE_CHANNEL_ID else None
+            if ch:
+                await ch.send(text)
+            else:
+                await _dm_boss(text)
+
+        work_tracker.bind(
+            ha_get_state=ha_integration.get_state,
+            ha_call_service=ha_integration.call_service,
+            announce=_work_announce,
+            nearby_site=(lambda lat, lon:
+                         (jobsite_db.find_nearby(lat, lon) or [None])[0]
+                         if _jobsite_available else None),
+            reverse_geocode=_reverse_geocode,
+        )
+        log.info(f"Work tracker online — {work_tracker.WORK_CONFIRM_MINUTES}-min "
+                 "rule, sessions → SQLite + Joplin + Sheets")
+
+    # Presence / lockout notifications
+    if _presence_available and _ha_available and ha_integration.HA_TOKEN:
+        presence_monitor.bind(
+            ha_get_state=ha_integration.get_state,
+            ha_call_service=ha_integration.call_service,
+            dm_boss=_dm_boss,
+        )
+        if not presence_poll.is_running():
+            presence_poll.start()
+        log.info(f"Presence monitor online — {presence_monitor.status()}")
+
+    # Telegram interface (same brain, second mouth)
+    global _telegram_iface
+    if _telegram_available and _tools_available and _telegram_iface is None:
+        def _tg_tool_ctx(user_id, user_name, chat_id):
+            # Telegram is the Boss's private line; the interface rejects
+            # everyone but the paired owner before this factory is reached.
+            return loki_tools.ToolContext(
+                user_id=str(OWNER_USER_ID), user_name=user_name,
+                channel_id=f"tg:{chat_id}")
+
+        _telegram_iface = TelegramInterface(
+            llm, _tg_tool_ctx, get_http_session,
+            memory_recall=(semantic_memory.recall
+                           if _semantic_memory_available else None),
+            on_paired=_dm_boss,
+        )
+        asyncio.create_task(_telegram_iface.start())
+    elif not _telegram_available:
+        log.warning("telegram_interface not importable — Telegram DISABLED")
 
 
 _POSITIVE_REACTION_EMOJIS = {"👍", "😂", "❤️", "🔥", "💯", "😭", "🤣", "👏", "⭐", "🎯"}
