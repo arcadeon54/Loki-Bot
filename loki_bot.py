@@ -5491,7 +5491,7 @@ async def on_message(message: discord.Message):
             _red_alert_active = False
             try:
                 _sess = await get_http_session()
-                await _sess.post("http://192.168.1.247:8123/api/webhook/loki_stop_alert", timeout=aiohttp.ClientTimeout(total=5))
+                await _sess.post(f"{ha_integration.HA_URL}/api/webhook/loki_stop_alert", timeout=aiohttp.ClientTimeout(total=5))
             except Exception:
                 pass
             await message.channel.send("🔇 Alarm stopped.")
@@ -5519,7 +5519,7 @@ async def on_message(message: discord.Message):
                     asyncio.create_task(_auto_reset_red_alert())
                 try:
                     _sess = await get_http_session()
-                    async with _sess.post(f"http://192.168.1.247:8123/api/webhook/{_webhook}", timeout=aiohttp.ClientTimeout(total=5)) as _resp:
+                    async with _sess.post(f"{ha_integration.HA_URL}/api/webhook/{_webhook}", timeout=aiohttp.ClientTimeout(total=5)) as _resp:
                         _emoji = "🚨" if _alert_level == "red" else "⚠️"
                         if _resp.status in (200, 201, 204):
                             msg = f"{_emoji} Alarm sent — it should be going off now."
@@ -5556,7 +5556,7 @@ async def on_message(message: discord.Message):
             _red_alert_active = False
             try:
                 _sess = await get_http_session()
-                await _sess.post("http://192.168.1.247:8123/api/webhook/loki_stop_alert", timeout=aiohttp.ClientTimeout(total=5))
+                await _sess.post(f"{ha_integration.HA_URL}/api/webhook/loki_stop_alert", timeout=aiohttp.ClientTimeout(total=5))
             except Exception:
                 pass
             await message.channel.send("🔇 Alarm stopped.")
@@ -5833,7 +5833,7 @@ async def on_message(message: discord.Message):
                 raise ValueError("lottery query — using Tavily advanced")
             _sess = await get_http_session()
             async with _sess.get(
-                "http://192.168.1.247:8083/search",
+                f"{loki_tools.SEARXNG_URL}/search",
                 params={"q": _search_query, "format": "json", "categories": "general"},
                 timeout=aiohttp.ClientTimeout(total=6),
             ) as _sx_resp:
