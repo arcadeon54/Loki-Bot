@@ -18,3 +18,5 @@ AGENTS.md
 eval_queries.json
 tool_calls.jsonl
 proactive_state.json
+*.log.*
+*.json.old

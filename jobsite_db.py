@@ -107,3 +107,45 @@ def rename_site(site_id, new_name):
 def delete_site(site_id):
     with sqlite3.connect(DB_PATH) as c:
         c.execute("DELETE FROM job_sites WHERE id=?", (site_id,))
+
+
+def record_arrival(site_id):
+    now = datetime.utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute(
+            "INSERT INTO job_visits (site_id, arrived_at) VALUES (?,?)",
+            (site_id, now),
+        )
+        return cur.lastrowid
+
+
+def record_departure(visit_id):
+    now = datetime.utcnow()
+    now_iso = now.isoformat()
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT arrived_at FROM job_visits WHERE id=?", (visit_id,)).fetchone()
+        if not row:
+            return
+        arrived_at = datetime.fromisoformat(row[0])
+        duration = (now - arrived_at).total_seconds() / 60
+        c.execute(
+            "UPDATE job_visits SET departed_at=?, duration_minutes=? WHERE id=?",
+            (now_iso, duration, visit_id),
+        )
+
+
+def export_csv(output_path):
+    import csv
+    with sqlite3.connect(DB_PATH) as c:
+        query = """
+            SELECT s.name, v.arrived_at, v.departed_at, v.duration_minutes, v.notes
+            FROM job_visits v
+            JOIN job_sites s ON v.site_id = s.id
+            ORDER BY v.arrived_at DESC
+        """
+        rows = c.execute(query).fetchall()
+        with open(output_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Job Site", "Arrival", "Departure", "Duration (Min)", "Notes"])
+            writer.writerows(rows)
+    return True

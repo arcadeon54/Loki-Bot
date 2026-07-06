@@ -16,6 +16,10 @@ HA_TOKEN            = os.getenv("HA_TOKEN", "")
 HA_NOTIFY_CHANNEL_ID = int(os.getenv("HA_NOTIFY_CHANNEL_ID", "0"))
 HA_WEBHOOK_PORT     = int(os.getenv("HA_WEBHOOK_PORT", "9100"))
 
+GROQ_API_KEY        = os.getenv("FALLBACK_LLM_API_KEY", "")
+GROQ_MODEL          = os.getenv("FALLBACK_LLM_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL            = "https://api.groq.com/openai/v1/chat/completions"
+
 _CONTROL_DOMAINS = {"light", "switch", "sensor", "binary_sensor",
                     "climate", "fan", "media_player", "camera", "person", "device_tracker"}
 
@@ -64,6 +68,50 @@ async def call_service(domain: str, service: str, entity_id: str = None, extra: 
         except Exception as e:
             log.error(f"HA call_service error: {e}")
     return False
+
+
+async def get_smart_notification(title: str, message: str) -> str:
+    log.info(f"Processing smart notification: {title}")
+    if not GROQ_API_KEY:
+        return f"**{title}**\n{message}"
+
+    states = await get_all_states()
+    presence = "unknown"
+    if states:
+        persons = [s for s in states if s["entity_id"] == "person.kavaris"]
+        presence = ", ".join([f"{p['entity_id'].split('.')[1]} is {p['state']}" for p in persons])
+
+    system_prompt = (
+        "You are Loki, the God of Mischief and a smart home assistant. "
+        "Your job is to rewrite home security notifications to be more intelligent, witty, and contextual. "
+        "You will be given a notification title, message, and the current presence of people in the house. "
+        "CRITICAL: You are addressing your creator directly. You MUST call him 'Boss'. Do not mention or address Ammiel or anyone else. "
+        "If the notification seems unimportant (e.g., a person detected when they are home), keep it brief or witty. "
+        "If it's important, be clear but stay in character (roast-heavy, sarcastic, but helpful). "
+        "Response should be a single string, ready for Discord. Use Markdown for styling."
+    )
+
+    user_content = f"Title: {title}\nMessage: {message}\nPresence: {presence}"
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "temperature": 0.7
+    }
+
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.post(GROQ_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, json=payload) as r:
+                if r.status == 200:
+                    resp = await r.json()
+                    return resp["choices"][0]["message"]["content"]
+        except Exception as e:
+            log.error(f"Groq smart notification error: {e}")
+
+    return f"**{title}**\n{message}"
 
 
 async def ha_control(query: str, llm) -> str:
@@ -148,8 +196,12 @@ def _make_webhook_app(bot):
             from datetime import datetime
             from zoneinfo import ZoneInfo
             ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-I:%M %p, %b %-d %Y")
-            text = f"**{title}**\n{msg}" if title else msg
-            asyncio.create_task(channel.send(f"{text} ({ts})"))
+            
+            async def send_smart():
+                text = await get_smart_notification(title, msg)
+                await channel.send(f"{text}\n*({ts})*")
+            
+            asyncio.create_task(send_smart())
 
         return web.Response(status=200, text="ok")
 

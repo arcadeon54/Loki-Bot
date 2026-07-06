@@ -3989,6 +3989,7 @@ _jobsite_state: dict = {
     "notified_known": None,    # site_id of last arrival briefing sent
     "notified_known_at": None, # datetime when arrival at known site was first announced
     "prev_zone": None,         # zone state from last poll cycle
+    "visit_id": None,          # ID of current active visit in job_visits table
 }
 # Pending confirmations keyed by Discord user_id (int)
 _JOBSITE_PENDING_PATH = os.path.join(os.path.dirname(__file__), "jobsite_pending.json")
@@ -4196,8 +4197,35 @@ async def jobsite_poll():
         return
 
     now = datetime.datetime.utcnow()
-    prev_zone = _jobsite_state.get("prev_zone")
     channel = bot.get_channel(JOBSITE_CHANNEL_ID)
+
+    # ─── CALENDAR TRIGGERED LOGGING ──────────────────────────────────────────
+    calendar_state = await ha_integration.get_state("calendar.work_grind")
+    if calendar_state and calendar_state.get("state") == "on":
+        cal_attrs = calendar_state.get("attributes", {})
+        cal_location = cal_attrs.get("location")
+        cal_summary = cal_attrs.get("message") or "Work Grind Event"
+
+        if cal_location and zone_state not in ("home", "work"):
+            nearby = jobsite_db.find_nearby(lat, lon)
+            if not nearby:
+                # New site from calendar - log IMMEDIATELY
+                jobsite_db.add_site(cal_summary, lat, lon)
+                new_site = jobsite_db.find_nearby(lat, lon)[0]
+                jobsite_db.append_note(new_site["id"], f"Source: Google Calendar (Work Grind)\nLocation: {cal_location}")
+
+                if channel:
+                    await channel.send(
+                        f"📍 **Calendar Match:** Automatically logged **{cal_summary}** as a job site.\n"
+                        f"Matched your current location to your 'Work Grind' calendar event: *{cal_location}*."
+                    )
+
+                # Force state update to prevent 2h dwell prompt
+                _jobsite_state["notified_unknown"] = True
+                _jobsite_state["arrived_at"] = now
+    # ─────────────────────────────────────────────────────────────────────────
+
+    prev_zone = _jobsite_state.get("prev_zone")
 
     _jobsite_state["prev_zone"] = zone_state
 
@@ -4209,7 +4237,54 @@ async def jobsite_poll():
                 elapsed = int((now - _jobsite_state["notified_known_at"]).total_seconds() / 60) + JOBSITE_DWELL_MINUTES
                 hours, mins = divmod(elapsed, 60)
                 dur = f"{hours}h {mins}m" if hours else f"{mins}m"
-                await channel.send(f"Leaving **{site['name']}** - {dur} on site. ({now_et().strftime('%-I:%M %p, %b %-d %Y')})")  
+                await channel.send(f"Leaving **{site['name']}** - {dur} on site. ({now_et().strftime('%-I:%M %p, %b %-d %Y')})")
+                try:
+                    import aiohttp
+                    from datetime import datetime
+                    
+                    # Calculate Pay Period
+                    anchor_date = datetime(2026, 5, 16).date()
+                    current_date = now.date()
+                    days_since = (current_date - anchor_date).days
+                    cycle_number = int(days_since / 14)
+                    
+                    period_start = anchor_date + datetime.timedelta(days=(cycle_number * 14))
+                    period_end = anchor_date + datetime.timedelta(days=(cycle_number * 14) + 13)
+                    
+                    pay_period = f"{period_start.strftime('%b %d')} - {period_end.strftime('%b %d')}"
+                    total_earned = f"${(elapsed / 60.0) * 16:.2f}"
+                    
+                    payload = {
+                        "config_entry": "01KV6AEYDJ6DNXE6GVXCGT0CRR",
+                        "worksheet": "Sheet1",
+                        "data": {
+                            "Pay Period": pay_period,
+                            "Date": now_et().strftime('%Y-%m-%d'),
+                            "Job Location": site['name'],
+                            "Arrival": _jobsite_state["notified_known_at"].strftime('%-I:%M %p'),
+                            "Departure": now_et().strftime('%-I:%M %p'),
+                            "Hours Worked": f"{elapsed / 60.0:.2f}",
+                            "Total Earned": total_earned
+                        }
+                    }
+                    
+                    ha_token = os.getenv('HA_TOKEN')
+                    ha_url = os.getenv('HA_URL', 'http://192.168.1.247:8123')
+                    
+                    if ha_token:
+                        headers = {
+                            "Authorization": f"Bearer {ha_token}",
+                            "Content-Type": "application/json"
+                        }
+                        async with aiohttp.ClientSession() as session:
+                            await session.post(f"{ha_url}/api/services/google_sheets/append_sheet", headers=headers, json=payload)
+                            
+                except Exception as e:
+                    log.error(f"Google Sheets direct post failed: {e}")
+                # Record departure in database
+                if _jobsite_state.get("visit_id"):
+                    jobsite_db.record_departure(_jobsite_state["visit_id"])
+                    _jobsite_state["visit_id"] = None  
         _jobsite_state.update({"lat": lat, "lon": lon, "arrived_at": None,
                                "notified_unknown": False, "notified_known": None,
                                "notified_known_at": None})
@@ -4230,7 +4305,54 @@ async def jobsite_poll():
                 elapsed = int((now - _jobsite_state["notified_known_at"]).total_seconds() / 60) + JOBSITE_DWELL_MINUTES
                 hours, mins = divmod(elapsed, 60)
                 dur = f"{hours}h {mins}m" if hours else f"{mins}m"
-                await channel.send(f"Leaving **{site['name']}** - {dur} on site. ({now_et().strftime('%-I:%M %p, %b %-d %Y')})")  
+                await channel.send(f"Leaving **{site['name']}** - {dur} on site. ({now_et().strftime('%-I:%M %p, %b %-d %Y')})")
+                try:
+                    import aiohttp
+                    from datetime import datetime
+                    
+                    # Calculate Pay Period
+                    anchor_date = datetime(2026, 5, 16).date()
+                    current_date = now.date()
+                    days_since = (current_date - anchor_date).days
+                    cycle_number = int(days_since / 14)
+                    
+                    period_start = anchor_date + datetime.timedelta(days=(cycle_number * 14))
+                    period_end = anchor_date + datetime.timedelta(days=(cycle_number * 14) + 13)
+                    
+                    pay_period = f"{period_start.strftime('%b %d')} - {period_end.strftime('%b %d')}"
+                    total_earned = f"${(elapsed / 60.0) * 16:.2f}"
+                    
+                    payload = {
+                        "config_entry": "01KV6AEYDJ6DNXE6GVXCGT0CRR",
+                        "worksheet": "Sheet1",
+                        "data": {
+                            "Pay Period": pay_period,
+                            "Date": now_et().strftime('%Y-%m-%d'),
+                            "Job Location": site['name'],
+                            "Arrival": _jobsite_state["notified_known_at"].strftime('%-I:%M %p'),
+                            "Departure": now_et().strftime('%-I:%M %p'),
+                            "Hours Worked": f"{elapsed / 60.0:.2f}",
+                            "Total Earned": total_earned
+                        }
+                    }
+                    
+                    ha_token = os.getenv('HA_TOKEN')
+                    ha_url = os.getenv('HA_URL', 'http://192.168.1.247:8123')
+                    
+                    if ha_token:
+                        headers = {
+                            "Authorization": f"Bearer {ha_token}",
+                            "Content-Type": "application/json"
+                        }
+                        async with aiohttp.ClientSession() as session:
+                            await session.post(f"{ha_url}/api/services/google_sheets/append_sheet", headers=headers, json=payload)
+                            
+                except Exception as e:
+                    log.error(f"Google Sheets direct post failed: {e}")
+                # Record departure in database
+                if _jobsite_state.get("visit_id"):
+                    jobsite_db.record_departure(_jobsite_state["visit_id"])
+                    _jobsite_state["visit_id"] = None  
         _jobsite_state.update({"lat": lat, "lon": lon, "arrived_at": now,
                                "notified_unknown": False, "notified_known": None,
                                "notified_known_at": None})
@@ -4256,6 +4378,8 @@ async def jobsite_poll():
             _jobsite_state["notified_known"] = site["id"]
             _jobsite_state["notified_known_at"] = now
             jobsite_db.update_last_visited(site["id"])
+            # Record arrival in database
+            _jobsite_state["visit_id"] = jobsite_db.record_arrival(site["id"])
             notes = (site["notes"] or "").strip()
             notes_block = f"\n**Notes:**\n{notes}" if notes else "\n*No notes on file.*"
             await channel.send(
@@ -4263,14 +4387,24 @@ async def jobsite_poll():
             )
     else:
         if not _jobsite_state["notified_unknown"]:
+            import datetime
             _jobsite_state["notified_unknown"] = True
             addr = await _reverse_geocode(lat, lon)
             loc_str = addr or f"{lat:.5f}, {lon:.5f}"
-            _jobsite_pending[OWNER_USER_ID] = {"lat": lat, "lon": lon, "addr": loc_str}
-            _save_jobsite_pending(_jobsite_pending)
+            name = loc_str or f"Site {datetime.datetime.utcnow().strftime('%Y-%m-%d')}"
+            jobsite_db.add_site(name, lat, lon)
+            
+            # Immediately mark as known so we don't spam
+            nearby = jobsite_db.find_nearby(lat, lon)
+            if nearby:
+                _jobsite_state["notified_known"] = nearby[0]["id"]
+                _jobsite_state["notified_known_at"] = now
+                # Record arrival in database
+                _jobsite_state["visit_id"] = jobsite_db.record_arrival(nearby[0]["id"])
+                
             await channel.send(
-                f"📍 You've been at **{loc_str}** for {int(dwell_minutes)} minutes.\n"
-                f"Is this a job site? Reply `yes`, `save as [name]`, or `skip`."
+                f"📍 Automatically logged **{name}** as a new job site (dwelled for {int(dwell_minutes)} minutes).\n"
+                f"You can rename it with `save as [new name]` or add notes with `add note: [text]`."
             )
 
 
@@ -4280,6 +4414,26 @@ async def before_jobsite_poll():
 
 
 # =============================================================================
+
+@tasks.loop(hours=168) # Weekly
+async def weekly_hours_export():
+    csv_path = "/home/g2k247/downloads/work_hours_weekly.csv"
+    jobsite_db.export_csv(csv_path)
+    channel = bot.get_channel(JOBSITE_CHANNEL_ID)
+    if channel:
+        try:
+            await channel.send(
+                "📅 **Weekly Hours Summary**\n"
+                "Here is your work hours log for the past week.",
+                file=discord.File(csv_path)
+            )
+        except Exception as e:
+            log.error(f"Failed to send weekly export: {e}")
+
+@weekly_hours_export.before_loop
+async def before_weekly_export():
+    await bot.wait_until_ready()
+
 #  BACKGROUND TASKS
 # =============================================================================
 
@@ -5024,6 +5178,7 @@ async def on_ready():
     if _jobsite_available and JOBSITE_CHANNEL_ID:
         if not jobsite_poll.is_running():
             jobsite_poll.start()
+            weekly_hours_export.start()
         log.info(f"Job site tracker started (polling {JOBSITE_DEVICE_TRACKER} every 10 min)")
 
 
@@ -5197,6 +5352,18 @@ async def on_message(message: discord.Message):
 
     # ── Owner DM relay (silent, owner-only) ──────────────────────────────
     if await _handle_owner_relay(message):
+        return
+
+    # ── Export Work Hours Command ─────────────────────────────────────────
+    if message.author.id == OWNER_USER_ID and ("export hours" in message.content.lower() or "work hours" in message.content.lower()):
+        csv_path = "/home/g2k247/downloads/work_hours.csv"
+        jobsite_db.export_csv(csv_path)
+        await message.channel.send(
+            "📊 **Work Hours Exported!**\n"
+            "I've generated a new CSV file with all your logged visits.\n"
+            "You can download it from Filebrowser here: https://media.ivn-group.cc/files/dex247/work_hours.csv",
+            file=discord.File(csv_path)
+        )
         return
 
     # ── Process images / GIFs attached to ANY message for context ──────────
