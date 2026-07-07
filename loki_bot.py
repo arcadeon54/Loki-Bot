@@ -162,6 +162,13 @@ try:
 except Exception:
     _assistant_tools_available = False
 
+try:
+    import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
+    _skill_bridge_available = True
+except Exception as _sb_err:
+    _skill_bridge_available = False
+    logging.getLogger("SkillBridge").warning(f"skill bridge unavailable: {_sb_err}")
+
 # ─── Timezone ─────────────────────────────────────────────────────────────────
 ET = ZoneInfo("America/New_York")
 
@@ -169,6 +176,8 @@ def now_et() -> datetime.datetime:
     """Return the current time in US/Eastern."""
     return datetime.datetime.now(ET)
 
+
+import personality  # response profiles — one per conversation interface
 
 DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
 LLM_PROVIDER          = os.getenv("LLM_PROVIDER", "openai")        # "openai" or "local"
@@ -182,7 +191,7 @@ FALLBACK_LLM_API_KEY  = os.getenv("FALLBACK_LLM_API_KEY", "")
 ELEVENLABS_API_KEY    = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID   = os.getenv("ELEVENLABS_VOICE_ID", "")
 GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
-SYSTEM_PROMPT         = os.getenv("SYSTEM_PROMPT", "You are Loki, the God of Mischief.")
+SYSTEM_PROMPT         = personality.DISCORD_PUBLIC  # public channels; profile in personality.py
 MEMORY_DB_PATH        = os.getenv("MEMORY_DB_PATH", "loki_memory.db")
 CONTEXT_MESSAGE_COUNT = int(os.getenv("CONTEXT_MESSAGE_COUNT", "50"))
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID") or "0")
@@ -2480,12 +2489,7 @@ def is_trigger(text: str) -> bool:
     return bool(_TRIGGER_RE.search(text))
 
 
-SERIOUS_PROMPT = (
-    "You are Loki — but right now, drop the theatrics entirely. No mischief, no roasts, "
-    "no sarcasm, no chaos. Be genuinely helpful, direct, and thoughtful. Answer like "
-    "someone intelligent who actually gives a damn. Honest, clear, concise. "
-    "Save the god-of-mischief act for the group channels — this is one-on-one and real."
-)
+SERIOUS_PROMPT = personality.DISCORD_DM  # Discord DMs and -s prefix; profile in personality.py
 
 
 def _detect_platform(url: str) -> str:
@@ -5005,6 +5009,8 @@ async def on_ready():
         loki_tools.bind(download=run_download, http_session=get_http_session)
         log.info(f"Tools online — {len(loki_tools.REGISTRY)} registered: "
                  f"{', '.join(loki_tools.REGISTRY)}")
+        if not _skill_bridge_available:
+            log.warning("Skill bridge unavailable — skillkit skills NOT registered")
     else:
         log.warning("tools module not importable — function calling DISABLED")
 
