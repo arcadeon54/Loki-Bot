@@ -9,6 +9,8 @@ import re
 import aiohttp
 from aiohttp import web
 
+import personality
+
 log = logging.getLogger(__name__)
 
 # Default = the NAS deployment via NPM (unicron, the old host, is decommissioned)
@@ -82,15 +84,7 @@ async def get_smart_notification(title: str, message: str) -> str:
         persons = [s for s in states if s["entity_id"] == "person.kavaris"]
         presence = ", ".join([f"{p['entity_id'].split('.')[1]} is {p['state']}" for p in persons])
 
-    system_prompt = (
-        "You are Loki, the God of Mischief and a smart home assistant. "
-        "Your job is to rewrite home security notifications to be more intelligent, witty, and contextual. "
-        "You will be given a notification title, message, and the current presence of people in the house. "
-        "CRITICAL: You are addressing your creator directly. You MUST call him 'Boss'. Do not mention or address Ammiel or anyone else. "
-        "If the notification seems unimportant (e.g., a person detected when they are home), keep it brief or witty. "
-        "If it's important, be clear but stay in character (roast-heavy, sarcastic, but helpful). "
-        "Response should be a single string, ready for Discord. Use Markdown for styling."
-    )
+    system_prompt = personality.HA_NOTIFICATION
 
     user_content = f"Title: {title}\nMessage: {message}\nPresence: {presence}"
 

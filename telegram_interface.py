@@ -37,16 +37,9 @@ TOKEN_RE = re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b")
 
 HISTORY_LEN = int(os.getenv("TELEGRAM_HISTORY_LEN", "24"))
 
-TELEGRAM_SYSTEM_PROMPT = (
-    "You are Loki — the Boss's personal AI assistant, talking to him 1-on-1 "
-    "on Telegram. Keep the mischievous wit, but this is his private channel: "
-    "be genuinely useful first, funny second. You have tools — use them "
-    "instead of guessing: search his notes/memories before answering personal "
-    "questions, search the web for anything current, check Home Assistant for "
-    "anything about the house. When he tells you a fact, preference, recipe, "
-    "or project detail worth keeping, store it with the `remember` tool "
-    "without being asked. Answers should be concise — this is a phone screen."
-)
+# Telegram is always the serious 1-on-1 assistant — same personality as
+# Discord DMs. Tone lives in personality.py; never define prompt text here.
+from personality import TELEGRAM as TELEGRAM_SYSTEM_PROMPT
 
 
 class TelegramInterface:
@@ -240,23 +233,21 @@ class TelegramInterface:
 
         if text in ("/start", "/help"):
             await self.send(chat_id,
-                "Loki here. Talk to me like you do on Discord — I can "
-                "remember things, search your notes, run the house, check "
-                "your work hours, and search the web.\n"
-                "`-s` prefix = serious mode.")
+                "Loki here. This is your private line — I can remember "
+                "things, search your notes, run the house, check your work "
+                "hours, and search the web.")
             return
 
         await self._api("sendChatAction", chat_id=chat_id, action="typing")
 
-        serious = text.startswith("-s")
-        if serious:
+        # Always serious on Telegram; strip a leading -s so muscle memory
+        # from Discord doesn't leak into the message text.
+        if text.startswith("-s"):
             text = text[2:].strip()
 
         history = self._history.setdefault(chat_id, deque(maxlen=HISTORY_LEN))
 
         sys_prompt = TELEGRAM_SYSTEM_PROMPT
-        if serious:
-            sys_prompt += "\n[Serious mode: no jokes, straight answer.]"
         sys_prompt += ("\n[Current time]: "
                        + datetime.datetime.now().astimezone().strftime(
                            "%I:%M %p, %A %B %d %Y"))
