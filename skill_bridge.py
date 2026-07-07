@@ -50,6 +50,7 @@ for _s in sk_registry.visible_to(CALLER):
         parameters=_s.input_schema(),
         handler=_make_handler(_s.name),
         permission=_LEVEL_MAP[_s.permission],
+        timeout=max(30, _s.timeout_hint),  # solve's planner loop needs minutes
     ))
     _names.append(_s.name)
 

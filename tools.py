@@ -63,6 +63,7 @@ class ToolSpec:
     parameters: dict
     handler: Callable[[dict, ToolContext], Awaitable[str]]
     permission: str = "everyone"
+    timeout: int = 30
 
     def openai_schema(self) -> dict:
         return {
@@ -143,7 +144,7 @@ async def execute(name: str, raw_args: str, ctx: ToolContext) -> str:
 
     start = time.monotonic()
     try:
-        result = await asyncio.wait_for(spec.handler(args, ctx), timeout=30)
+        result = await asyncio.wait_for(spec.handler(args, ctx), timeout=spec.timeout)
         _log_call(ctx, name, args, True, result, int((time.monotonic() - start) * 1000))
         return result
     except asyncio.TimeoutError:
