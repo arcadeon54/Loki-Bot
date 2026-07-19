@@ -21,7 +21,9 @@ Import this module once at startup (after tools); registration is a side
 effect, mirroring how tools.py self-registers.
 """
 
+import json
 import logging
+import re
 
 from tools import ToolSpec, ToolContext, register
 
@@ -50,7 +52,7 @@ async def _remember(args: dict, ctx: ToolContext) -> str:
         return f"{verb}: \"{text[:120]}\" (note: {res['title']})"
     except Exception as e:
         log.error(f"remember failed: {e}")
-        return "Couldn't write that to memory — Joplin might be syncing. Try again in a minute."
+        return "Couldn't write that to memory — the Joplin note store isn't answering. Try again in a minute."
 
 
 async def _recall_memory(args: dict, ctx: ToolContext) -> str:
@@ -76,7 +78,7 @@ async def _note_create(args: dict, ctx: ToolContext) -> str:
         return "A note needs a title."
     note = await jp.create_note(title, body, notebook)
     where = notebook or f"{jp.LOKI_NOTEBOOK}/Inbox"
-    return f"Note created: \"{title}\" in {where} (syncs to your devices in ~5 min)."
+    return f"Note created: \"{title}\" in {where} ({jp.sync_summary()})."
 
 
 async def _note_search(args: dict, ctx: ToolContext) -> str:
@@ -119,23 +121,159 @@ async def _note_append(args: dict, ctx: ToolContext) -> str:
     if not title or not content:
         return "Need both a note title and content to append."
     await jp.append_or_create(title, notebook, content)
-    return f"Appended to \"{title}\"."
+    return f"Appended to \"{title}\" ({jp.sync_summary()})."
+
+
+_CHECKBOX_RE = re.compile(r"^\s*-\s*\[[ xX]?\]\s*")
+# For inbound items also tolerate checkbox markup without the dash ("[ ] milk").
+_ITEM_PREFIX_RE = re.compile(r"^\s*(?:-\s*)?(?:\[[ xX]?\]\s*)?")
+
+# Retry guard that needs no Joplin round-trip: lists created this process,
+# keyed (folder_id, lowercased title) -> note_id. The Joplin /search index
+# lags note creation (observed live 2026-07-19), so retries are deduped by
+# this cache and by the direct folder listing, never by full-text search.
+_recent_lists: dict[tuple[str, str], str] = {}
+
+
+def _normalize_items(raw) -> list[str]:
+    """Accept a list or a comma/newline-separated string; strip bullets and
+    checkbox markup the model sometimes includes; dedupe case-insensitively."""
+    if isinstance(raw, str):
+        parts = re.split(r"[\n;,]+", raw)
+    elif isinstance(raw, list):
+        parts = [str(i) for i in raw]
+    else:
+        parts = []
+    items: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        p = _ITEM_PREFIX_RE.sub("", p.strip().lstrip("•*").strip(), count=1).strip()
+        if p and p.lower() not in seen:
+            seen.add(p.lower())
+            items.append(p)
+    return items
 
 
 async def _list_create(args: dict, ctx: ToolContext) -> str:
     import joplin_integration as jp
+
+    def fail(error: str, **extra) -> str:
+        return json.dumps({"success": False, "error": error, **extra})
+
     title = str(args.get("title", "")).strip()
-    items = args.get("items") or []
-    notebook = str(args.get("notebook", "")).strip() or f"{jp.LOKI_NOTEBOOK}/Lists"
-    if not title or not isinstance(items, list) or not items:
-        return "Need a list title and at least one item."
-    body = "\n".join(f"- [ ] {str(i).strip()}" for i in items if str(i).strip())
-    existing = await jp.find_note_by_title(title, notebook)
-    if existing:
-        await jp.append_to_note(existing["id"], body)
-        return f"Added {len(items)} item(s) to the existing \"{title}\" list."
-    await jp.create_note(title, body, notebook, tags=["list"])
-    return f"List \"{title}\" created with {len(items)} item(s)."
+    items = _normalize_items(args.get("items"))
+    explicit_nb = str(args.get("notebook", "")).strip()
+    default_nb = f"{jp.LOKI_NOTEBOOK}/Lists"
+    notebook = explicit_nb or default_nb
+
+    if not title:
+        return fail("missing_title",
+                    fix="Call list_create again with a short title, e.g. 'Grocery List'.")
+    if not items:
+        return fail("missing_items",
+                    fix="Call list_create again with every item in the `items` array, e.g. "
+                        '{"title": "Grocery List", "items": ["Milk", "Eggs"]}. You DO have '
+                        "Joplin write access — never tell the user you cannot write to Joplin.")
+    if not jp.is_configured():
+        return fail("joplin_not_configured",
+                    fix="JOPLIN_API_TOKEN is not configured for the bot. Tell the user the "
+                        "Joplin connection is down; the list was NOT saved.")
+
+    try:
+        # Explicitly named notebooks must already exist; only the default
+        # Loki/Lists path may be auto-created (existing namespace behavior).
+        folder_id = await jp.resolve_notebook_path(notebook, create=not explicit_nb)
+        if not folder_id:
+            return fail("notebook_not_found", notebook=notebook,
+                        fix="That notebook doesn't exist. Retry with one of the Boss's real "
+                            "notebooks, or omit `notebook` to use the default list notebook. "
+                            "The list was NOT saved yet.")
+
+        # Idempotency: an exact-title list is extended, never duplicated.
+        # Deterministic lookups first — the /search full-text index lags new
+        # notes, so it must never be what dedupe depends on.
+        existing = None
+        cached_id = _recent_lists.get((folder_id, title.lower()))
+        if cached_id:
+            cached = await jp.get_note(cached_id)
+            if cached and cached.get("parent_id") == folder_id:
+                existing = cached
+            else:
+                _recent_lists.pop((folder_id, title.lower()), None)
+        if existing is None:
+            existing = await jp.find_note_in_folder(title, folder_id)
+        # Courtesy only, when no notebook was named: an exact-title list living
+        # in some other notebook wins over creating a second one (best-effort —
+        # search-index lag just means a miss here, never a duplicate in the
+        # target notebook).
+        if existing is None and not explicit_nb:
+            hits = await jp.search_notes(f'title:"{title}"', limit=20)
+            exact = [h for h in hits
+                     if (h.get("title") or "").strip().lower() == title.lower()]
+            if exact:
+                existing = exact[0]
+                folder_id = existing.get("parent_id") or folder_id
+                notebook = await jp.folder_path_of(folder_id) or notebook
+
+        if existing:
+            body = ((await jp.get_note(existing["id"])) or {}).get("body", "")
+            have = {_CHECKBOX_RE.sub("", l).strip().lower()
+                    for l in body.splitlines() if _CHECKBOX_RE.match(l)}
+            new_items = [i for i in items if i.lower() not in have]
+            if new_items:
+                await jp.append_to_note(existing["id"],
+                                        "\n".join(f"- [ ] {i}" for i in new_items))
+            note_id, added = existing["id"], len(new_items)
+            _recent_lists[(folder_id, title.lower())] = note_id
+            message = (f"Added {added} item(s) to the existing '{title}' list in Joplin "
+                       f"under '{notebook}'." if added else
+                       f"'{title}' in Joplin under '{notebook}' already has all of those "
+                       "items; nothing was added.")
+        else:
+            note = await jp.create_note(
+                title, "\n".join(f"- [ ] {i}" for i in items), notebook, tags=["list"])
+            note_id = (note or {}).get("id")
+            if not note_id:
+                return fail("create_failed",
+                            detail="Joplin did not return a note id — the list was NOT saved.")
+            _recent_lists[(folder_id, title.lower())] = note_id
+            added = len(items)
+            message = f"Created '{title}' in Joplin under '{notebook}' with {added} items."
+
+        sync = jp.sync_health()
+        return json.dumps({
+            "success": True, "note_id": note_id, "title": title,
+            "notebook_id": folder_id, "notebook_title": notebook,
+            "item_count": added,
+            "message": f"{message} ({jp.sync_summary(sync)}.)",
+            "sync_state": sync["state"],
+        })
+    except jp.JoplinError as e:
+        log.error(f"list_create Joplin error: {str(e)[:200]}")
+        return fail("joplin_api_error", detail=str(e)[:200],
+                    fix="The list was NOT saved. Tell the user honestly and offer to retry.")
+    except Exception as e:
+        log.error(f"list_create failed: {type(e).__name__}: {str(e)[:200]}")
+        return fail("unexpected_error", detail=f"{type(e).__name__}: {str(e)[:120]}",
+                    fix="The list was NOT saved. Tell the user honestly.")
+
+
+async def _joplin_sync_status(args: dict, ctx: ToolContext) -> str:
+    import joplin_integration as jp
+    h = jp.sync_health()
+    api_up = await jp.ping()
+    return json.dumps({
+        "local_api": "up" if api_up else "DOWN — Loki cannot read/write notes",
+        "device_sync": h["state"],
+        "last_sync_attempt": h["last_attempt"],
+        "detail": h["detail"],
+        "meaning": ("Local saves work and reach the Boss's devices."
+                    if api_up and h["state"] == "healthy" else
+                    "Local saves work, but new notes will NOT show up on the "
+                    "Boss's phone/desktop until device sync is repaired."
+                    if api_up else
+                    "Note reads/writes are failing entirely right now."),
+    })
 
 
 # ─── Home Assistant ──────────────────────────────────────────────────────────
@@ -211,7 +349,7 @@ register(ToolSpec(
         },
         "required": ["text"],
     },
-    handler=_remember, permission="boss",
+    handler=_remember, permission="boss", redact_log=True,
 ))
 
 register(ToolSpec(
@@ -225,7 +363,7 @@ register(ToolSpec(
         "properties": {"query": {"type": "string"}},
         "required": ["query"],
     },
-    handler=_recall_memory, permission="boss",
+    handler=_recall_memory, permission="boss", redact_log=True,
 ))
 
 register(ToolSpec(
@@ -264,7 +402,7 @@ register(ToolSpec(
         "properties": {"title": {"type": "string"}},
         "required": ["title"],
     },
-    handler=_note_read, permission="boss",
+    handler=_note_read, permission="boss", redact_log=True,
 ))
 
 register(ToolSpec(
@@ -284,17 +422,35 @@ register(ToolSpec(
 
 register(ToolSpec(
     name="list_create",
-    description="Create (or extend) a checkbox to-do/shopping list in Joplin.",
+    description=("FIRST CHOICE whenever the Boss asks to make or save ANY list — "
+                 "grocery, shopping, to-do, packing, or a named list. Creates (or "
+                 "extends) a real checkbox note in his Joplin; a list that only "
+                 "exists in this chat is lost. Pass EVERY item in `items`."),
     parameters={
         "type": "object",
         "properties": {
-            "title": {"type": "string"},
-            "items": {"type": "array", "items": {"type": "string"}},
-            "notebook": {"type": "string"},
+            "title": {"type": "string",
+                      "description": "List name, e.g. 'Grocery List'"},
+            "items": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                      "description": "All list entries, one string each — never empty"},
+            "notebook": {"type": "string",
+                         "description": "Existing notebook path only if the Boss "
+                                        "names one; omit for the default list notebook"},
         },
         "required": ["title", "items"],
     },
-    handler=_list_create, permission="boss",
+    handler=_list_create, permission="boss", timeout=45,
+))
+
+register(ToolSpec(
+    name="joplin_sync_status",
+    description=("Check Joplin health: whether Loki's local note storage is up "
+                 "AND whether notes are syncing to the Boss's phone/desktop. "
+                 "Use when a note or list seems missing on his devices — a "
+                 "missing note usually means device sync is failing, not that "
+                 "Loki lacks write access. Read-only."),
+    parameters={"type": "object", "properties": {}},
+    handler=_joplin_sync_status, permission="boss",
 ))
 
 register(ToolSpec(

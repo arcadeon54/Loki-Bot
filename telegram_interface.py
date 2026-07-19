@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from collections import deque
 
 import aiohttp
@@ -37,6 +38,36 @@ TOKEN_RE = re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b")
 
 HISTORY_LEN = int(os.getenv("TELEGRAM_HISTORY_LEN", "24"))
 
+# ── Media limits (env-tunable; Bot API refuses downloads >20 MB anyway) ──
+IMAGE_MAX_BYTES = int(os.getenv("TELEGRAM_IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))
+AUDIO_MAX_BYTES = int(os.getenv("TELEGRAM_AUDIO_MAX_BYTES", str(20 * 1024 * 1024)))
+AUDIO_MAX_SECONDS = int(os.getenv("TELEGRAM_AUDIO_MAX_SECONDS", "600"))
+
+# Formats the existing Discord pipelines already accept.
+IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+AUDIO_MIMES = {"audio/ogg", "audio/oga", "audio/opus", "audio/mpeg", "audio/mp3",
+               "audio/mp4", "audio/x-m4a", "audio/m4a", "audio/aac",
+               "audio/wav", "audio/x-wav", "audio/flac", "audio/webm"}
+
+_AUDIO_EXT = {"audio/ogg": ".ogg", "audio/oga": ".ogg", "audio/opus": ".ogg",
+              "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+              "audio/x-m4a": ".m4a", "audio/m4a": ".m4a", "audio/aac": ".m4a",
+              "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/flac": ".flac",
+              "audio/webm": ".webm"}
+
+
+def sniff_image_mime(data: bytes) -> str | None:
+    """Magic-byte check that the payload really is a supported image."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return None
+
 # Telegram is always the serious 1-on-1 assistant — same personality as
 # Discord DMs. Tone lives in personality.py; never define prompt text here.
 from personality import TELEGRAM as TELEGRAM_SYSTEM_PROMPT
@@ -44,19 +75,27 @@ from personality import TELEGRAM as TELEGRAM_SYSTEM_PROMPT
 
 class TelegramInterface:
     def __init__(self, llm, tool_ctx_factory, session_factory,
-                 memory_recall=None, on_paired=None):
+                 memory_recall=None, on_paired=None,
+                 describe_image=None, transcribe_audio=None):
         """
         llm              — LLMHandler (needs .chat_with_tools / .chat)
         tool_ctx_factory — (user_id, user_name, chat_id) -> ToolContext
         session_factory  — async () -> aiohttp.ClientSession
         memory_recall    — async (query, n) -> list[{text, kind}] (optional)
         on_paired        — async (info_text) -> None (optional, Discord announce)
+        describe_image   — async (bytes, mime) -> str (Discord vision pipeline)
+        transcribe_audio — async (bytes, filename) -> str (Discord Whisper path)
         """
         self.llm = llm
         self.tool_ctx_factory = tool_ctx_factory
         self.session_factory = session_factory
         self.memory_recall = memory_recall
         self.on_paired = on_paired
+        self.describe_image = describe_image
+        self.transcribe_audio = transcribe_audio
+        # Telegram re-delivers updates it thinks were missed; never process
+        # the same message twice (a voice note would re-run tools).
+        self._seen_msgs: deque = deque(maxlen=500)
 
         self.token: str | None = None
         self.bot_username = ""
@@ -149,6 +188,160 @@ class TelegramInterface:
             if ok is None:  # markdown parse failure → resend plain
                 await self._api("sendMessage", chat_id=chat_id, text=chunk)
 
+    # ── media (photos / voice) ───────────────────────────────────────────
+    def _extract_media(self, msg: dict) -> dict | None:
+        """Map a Telegram message to a media descriptor, or None for pure text.
+
+        Returns {"kind": "photo"|"audio", "file_id", "mime", "name"} or
+        {"kind": "error", "reason": user-facing text} for media we must
+        honestly refuse (too large, unsupported format, too long).
+        """
+        doc = msg.get("document") or {}
+        doc_mime = (doc.get("mime_type") or "").lower()
+
+        if msg.get("photo"):
+            # Bot API lists variants smallest→largest; take the largest one
+            # that fits the size limit (missing file_size → let the download
+            # cap enforce it).
+            fits = [p for p in msg["photo"]
+                    if p.get("file_id")
+                    and (p.get("file_size") or 0) <= IMAGE_MAX_BYTES]
+            if not fits:
+                return {"kind": "error",
+                        "reason": "That image is too large for me — keep it "
+                                  f"under {IMAGE_MAX_BYTES // (1024*1024)} MB."}
+            best = max(fits, key=lambda p: (p.get("width") or 0) * (p.get("height") or 0))
+            return {"kind": "photo", "file_id": best["file_id"],
+                    "mime": "image/jpeg", "name": "photo.jpg"}
+
+        if doc_mime.startswith("image/"):
+            if doc_mime not in IMAGE_MIMES:
+                return {"kind": "error",
+                        "reason": "I can't read that image format — send "
+                                  "JPEG, PNG, WebP, or GIF."}
+            if (doc.get("file_size") or 0) > IMAGE_MAX_BYTES:
+                return {"kind": "error",
+                        "reason": "That image is too large for me — keep it "
+                                  f"under {IMAGE_MAX_BYTES // (1024*1024)} MB."}
+            return {"kind": "photo", "file_id": doc["file_id"],
+                    "mime": doc_mime,
+                    "name": doc.get("file_name") or "image"}
+
+        audio = msg.get("voice") or msg.get("audio") \
+            or (doc if doc_mime.startswith("audio/") else None)
+        if audio:
+            mime = (audio.get("mime_type") or "audio/ogg").lower()
+            if mime not in AUDIO_MIMES:
+                return {"kind": "error",
+                        "reason": "I can't process that audio format — voice "
+                                  "notes, OGG, MP3, M4A, or WAV work."}
+            if (audio.get("duration") or 0) > AUDIO_MAX_SECONDS:
+                return {"kind": "error",
+                        "reason": "That recording is too long for me — keep "
+                                  f"it under {AUDIO_MAX_SECONDS // 60} minutes."}
+            if (audio.get("file_size") or 0) > AUDIO_MAX_BYTES:
+                return {"kind": "error",
+                        "reason": "That audio file is too large for me — keep "
+                                  f"it under {AUDIO_MAX_BYTES // (1024*1024)} MB."}
+            name = audio.get("file_name") or ("voice" + _AUDIO_EXT.get(mime, ".ogg"))
+            return {"kind": "audio", "file_id": audio["file_id"],
+                    "mime": mime, "name": name}
+
+        return None
+
+    async def _download_media(self, file_id: str, max_bytes: int):
+        """getFile + download. Returns (bytes, "") or (None, error_code).
+
+        The download URL embeds the bot token — it must never be logged, so
+        errors are reported by exception type only.
+        """
+        info = await self._api("getFile", file_id=file_id)
+        if not info or not info.get("file_path"):
+            return None, "download_failed"
+        if (info.get("file_size") or 0) > max_bytes:
+            return None, "too_large"
+        try:
+            sess = await self.session_factory()
+            async with sess.get(
+                f"https://api.telegram.org/file/bot{self.token}/{info['file_path']}",
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as r:
+                if r.status != 200:
+                    log.warning(f"Telegram file download failed: HTTP {r.status}")
+                    return None, "download_failed"
+                data = await r.read()
+        except Exception as e:
+            log.warning(f"Telegram file download failed: {type(e).__name__}")
+            return None, "download_failed"
+        if len(data) > max_bytes:
+            return None, "too_large"
+        return data, ""
+
+    @staticmethod
+    def _spool_to_temp(data: bytes, suffix: str) -> str:
+        """Write media to a private (0600) temp file; caller unlinks in finally."""
+        fd, path = tempfile.mkstemp(prefix="loki_tg_", suffix=suffix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return path
+
+    async def _process_photo(self, media: dict) -> tuple[str | None, str]:
+        """Download → validate → existing vision pipeline. (description, err)."""
+        data, err = await self._download_media(media["file_id"], IMAGE_MAX_BYTES)
+        if data is None:
+            return None, ("That image is too large for me to pull down."
+                          if err == "too_large" else
+                          "I couldn't download that image from Telegram — try again.")
+        mime = sniff_image_mime(data)
+        if mime is None:
+            return None, ("That file doesn't look like an image I can read — "
+                          "JPEG, PNG, WebP, or GIF only.")
+        tmp = None
+        try:
+            tmp = self._spool_to_temp(data, ".img")
+            with open(tmp, "rb") as f:
+                img_bytes = f.read()
+            log.info(f"Telegram photo → vision ({len(img_bytes)} bytes, {mime})")
+            desc = (await self.describe_image(img_bytes, mime) or "").strip()
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        if not desc or desc.startswith(("[Could not analyze",
+                                        "[Image recognition")):
+            return None, ("I got the image but couldn't analyze it — vision "
+                          "processing failed on my end.")
+        return desc, ""
+
+    async def _process_audio(self, media: dict) -> tuple[str | None, str]:
+        """Download → validate → existing Whisper pipeline. (transcript, err)."""
+        data, err = await self._download_media(media["file_id"], AUDIO_MAX_BYTES)
+        if data is None:
+            return None, ("That audio file is too large for me to pull down."
+                          if err == "too_large" else
+                          "I couldn't download that voice message from "
+                          "Telegram — try again.")
+        tmp = None
+        try:
+            tmp = self._spool_to_temp(data, ".audio")
+            with open(tmp, "rb") as f:
+                audio_bytes = f.read()
+            log.info(f"Telegram audio → transcription ({len(audio_bytes)} bytes)")
+            transcript = (await self.transcribe_audio(audio_bytes,
+                                                      media["name"]) or "").strip()
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        if not transcript:
+            return None, ("I couldn't make out that voice message — the "
+                          "transcription came back empty. Mind typing it?")
+        return transcript, ""
+
     # ── lifecycle ────────────────────────────────────────────────────────
     async def start(self) -> bool:
         self.token = await self._discover_token()
@@ -207,8 +400,17 @@ class TelegramInterface:
         user = msg.get("from", {})
         user_id = user.get("id", 0)
         text = (msg.get("text") or msg.get("caption") or "").strip()
-        if not text or user.get("is_bot"):
+        media = self._extract_media(msg)
+        if user.get("is_bot") or (not text and media is None):
             return
+
+        # Drop re-delivered updates (auth and media handling must run at
+        # most once per message).
+        seen_key = (chat_id, msg.get("message_id"))
+        if msg.get("message_id") is not None:
+            if seen_key in self._seen_msgs:
+                return
+            self._seen_msgs.append(seen_key)
 
         # Pairing / auth
         if not self.owner_id:
@@ -244,6 +446,36 @@ class TelegramInterface:
         # from Discord doesn't leak into the message text.
         if text.startswith("-s"):
             text = text[2:].strip()
+
+        # Media rides the same brain path as Discord attachments: photos are
+        # described by the shared vision pipeline and injected as context;
+        # voice notes are transcribed and become the user's message.
+        if media and media["kind"] == "error":
+            await self.send(chat_id, media["reason"])
+            return
+        if media and media["kind"] == "photo":
+            if not self.describe_image:
+                await self.send(chat_id, "I can't see images on this line — "
+                                         "vision isn't available right now.")
+                return
+            desc, err = await self._process_photo(media)
+            if desc is None:
+                await self.send(chat_id, err)
+                return
+            if not text:
+                text = "Take a look at this image and tell me what you make of it."
+            text += f"\n[They sent an image. What you see in it: {desc}]"
+        elif media and media["kind"] == "audio":
+            if not self.transcribe_audio:
+                await self.send(chat_id, "I can't listen to voice messages on "
+                                         "this line — transcription isn't "
+                                         "available right now.")
+                return
+            transcript, err = await self._process_audio(media)
+            if transcript is None:
+                await self.send(chat_id, err)
+                return
+            text = f"{text}\n{transcript}".strip() if text else transcript
 
         history = self._history.setdefault(chat_id, deque(maxlen=HISTORY_LEN))
 

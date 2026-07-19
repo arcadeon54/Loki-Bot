@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
@@ -64,6 +65,9 @@ class ToolSpec:
     handler: Callable[[dict, ToolContext], Awaitable[str]]
     permission: str = "everyone"
     timeout: int = 30
+    # Content-bearing personal tools (memory, note bodies): log call metadata
+    # only, never args/results — they can carry credentials the Boss dictated.
+    redact_log: bool = False
 
     def openai_schema(self) -> dict:
         return {
@@ -110,7 +114,35 @@ def schemas_for(user_id: str) -> list[dict]:
     ]
 
 
+# Catches "password: X", "Password to Dex247: X", "api_key=X", "token: X" —
+# a keyword, at most a few words of context, a separator, then the value.
+_SECRET_RE = re.compile(
+    r"(?i)\b(password|passwd|token|api[_\- ]?key|secret|bearer|credential)\b"
+    r"([^:=\n]{0,40}?[:=]\s*)(\S+)")
+
+
+def _scrub_text(text: str) -> str:
+    return _SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + "[REDACTED]", text)
+
+
+def _scrub(value):
+    if isinstance(value, str):
+        return _scrub_text(value)
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    return value
+
+
 def _log_call(ctx: ToolContext, name: str, args: dict, ok: bool, detail: str, ms: int):
+    spec = REGISTRY.get(name)
+    if spec is not None and spec.redact_log:
+        args = {k: f"[{len(str(v))} chars withheld]" for k, v in args.items()}
+        detail = f"[{len(detail)} chars withheld]"
+    else:
+        args = _scrub(args)
+        detail = _scrub_text(detail)
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "user": ctx.user_name, "user_id": ctx.user_id,

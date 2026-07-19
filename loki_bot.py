@@ -1679,7 +1679,9 @@ async def transcribe_voice_message(audio_bytes: bytes, filename: str = "voice.og
         ) as resp:
             if resp.status == 200:
                 transcript = (await resp.text()).strip()
-                log.info(f"Voice transcribed ({len(audio_bytes)} bytes): {transcript[:80]}...")
+                # Transcript content is private — log sizes only.
+                log.info(f"Voice transcribed ({len(audio_bytes)} bytes → "
+                         f"{len(transcript)} chars)")
                 return transcript
             else:
                 body = await resp.text()
@@ -5171,6 +5173,8 @@ async def on_ready():
             memory_recall=(semantic_memory.recall
                            if _semantic_memory_available else None),
             on_paired=_dm_boss,
+            describe_image=vision.describe_image,
+            transcribe_audio=transcribe_voice_message,
         )
         asyncio.create_task(_telegram_iface.start())
     elif not _telegram_available:

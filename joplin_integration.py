@@ -3,9 +3,10 @@ joplin_integration.py — Joplin as Loki's long-term memory (July 2026 upgrade).
 
 Talks to the Joplin Data API exposed by the `loki-joplin-api` sidecar
 container on dex247 (joplin-cli syncing with notes.ivn-group.cc, see
-/home/g2k247/docker/joplin-api/). Everything written here syncs to the
-Joplin Server and shows up on the Boss's phone/desktop within one sync
-interval (~5 min).
+/home/g2k247/docker/joplin-api/). Writes land locally immediately; whether
+they reach the Boss's phone/desktop depends on the sidecar's sync loop —
+sync_health() reports that separately, and callers must never promise
+device visibility unless it says the sync is healthy.
 
 Design notes:
 - Notebook paths are slash-delimited ("Loki/Memories"); resolve_notebook_path
@@ -21,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import quote
 
@@ -30,6 +32,13 @@ log = logging.getLogger("Joplin")
 
 JOPLIN_API_URL   = os.getenv("JOPLIN_API_URL", "http://127.0.0.1:41184").rstrip("/")
 JOPLIN_API_TOKEN = os.getenv("JOPLIN_API_TOKEN", "")
+
+# The sidecar's own log file (bind-mounted profile, world-readable). Reading
+# it is the only credential-free way to observe the sync loop's health.
+JOPLIN_SYNC_LOG = os.getenv(
+    "JOPLIN_SYNC_LOG", "/home/g2k247/docker/joplin-api/data/log.txt")
+# Sync loop runs every ~5 min; older than this and we call the status stale.
+JOPLIN_SYNC_STALE_SECS = int(os.getenv("JOPLIN_SYNC_STALE_SECS", "1800"))
 
 # Default namespace for notes Loki creates on its own initiative.
 LOKI_NOTEBOOK = os.getenv("LOKI_NOTEBOOK", "Loki")
@@ -122,6 +131,92 @@ async def ping() -> bool:
             return r.status == 200
     except Exception:
         return False
+
+
+# ─── Sync health (read-only) ──────────────────────────────────────────────────
+
+_SYNC_START_MARK = "Starting synchronisation"
+_SYNC_DONE_MARK = "Operations completed"
+_LOG_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+# Belt-and-braces: never surface anything credential-shaped from the log.
+_CRED_RE = re.compile(
+    r"(?i)(token|password|secret|authorization|bearer)\S*[=:]\s*\S+")
+
+
+def sync_health() -> dict:
+    """Health of the sidecar's Joplin-Server sync, from its log tail.
+
+    Purely read-only and credential-free. Returns:
+      {"state": "healthy"|"failing"|"stale"|"unknown",
+       "detail": short human string, "last_attempt": "YYYY-mm-dd HH:MM:SS"|None}
+
+    Local Data-API writes always succeed independently of this — this only
+    says whether those writes are reaching the Boss's other devices.
+    """
+    try:
+        with open(JOPLIN_SYNC_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 131072))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError as e:
+        return {"state": "unknown", "last_attempt": None,
+                "detail": f"sync log not readable ({type(e).__name__})"}
+
+    # Latest attempt that actually finished (start mark followed by the
+    # completion mark) — an attempt still in flight is not judged.
+    starts = [m.start() for m in re.finditer(_SYNC_START_MARK, tail)]
+    segment = start_pos = None
+    for pos in reversed(starts):
+        seg = tail[pos:]
+        nxt = seg.find(_SYNC_START_MARK, 1)
+        seg = seg if nxt == -1 else seg[:nxt]
+        if _SYNC_DONE_MARK in seg:
+            segment, start_pos = seg, pos
+            break
+    if segment is None:
+        return {"state": "unknown", "last_attempt": None,
+                "detail": "no completed sync attempt in recent log"}
+
+    line_start = tail.rfind("\n", 0, start_pos) + 1
+    ts_match = _LOG_TS_RE.search(tail[line_start:start_pos + len(_SYNC_START_MARK)])
+    last_attempt = ts_match.group(1) if ts_match else None
+
+    stale = False
+    if last_attempt:
+        try:
+            attempt_t = time.mktime(time.strptime(last_attempt,
+                                                  "%Y-%m-%d %H:%M:%S"))
+            stale = (time.time() - attempt_t) > JOPLIN_SYNC_STALE_SECS
+        except ValueError:
+            pass
+
+    errors = [l for l in segment.splitlines() if "[error]" in l]
+    if errors:
+        detail = errors[-1].split("[error]", 1)[1].strip()
+        detail = _CRED_RE.sub("[REDACTED]", detail)[:160]
+        return {"state": "failing", "last_attempt": last_attempt,
+                "detail": detail or "sync error"}
+    if stale:
+        return {"state": "stale", "last_attempt": last_attempt,
+                "detail": "last completed sync attempt is old — sync loop "
+                          "may be stuck"}
+    return {"state": "healthy", "last_attempt": last_attempt,
+            "detail": "last sync attempt completed without errors"}
+
+
+def sync_summary(health: dict | None = None) -> str:
+    """One honest parenthetical about device visibility, for tool replies."""
+    h = health or sync_health()
+    return {
+        "healthy": "saved locally; device sync is healthy, so it should reach "
+                   "your other devices within a few minutes",
+        "failing": "saved locally in Joplin, BUT sync to your devices is "
+                   "currently FAILING — it will not appear on your phone or "
+                   "desktop until sync is repaired",
+        "stale":   "saved locally in Joplin, but the sync loop looks stalled — "
+                   "it may not reach your devices until sync catches up",
+    }.get(h["state"],
+          "saved locally in Joplin; device-sync status could not be confirmed")
 
 
 # ─── Notebooks ────────────────────────────────────────────────────────────────
@@ -247,6 +342,16 @@ async def search_notes(query: str, limit: int = 10) -> list[dict]:
     })
     items = (data or {}).get("items", [])
     return items[:limit]
+
+
+async def find_note_in_folder(title: str, folder_id: str) -> dict | None:
+    """Exact-title (case-insensitive) lookup via the direct folder listing.
+    Immediately consistent, unlike /search which lags the full-text index."""
+    items = await _paginated(f"/folders/{folder_id}/notes",
+                             {"fields": "id,title,parent_id"})
+    t = title.strip().lower()
+    return next((n for n in items
+                 if (n.get("title") or "").strip().lower() == t), None)
 
 
 async def find_note_by_title(title: str, notebook: str | None = None) -> dict | None:
