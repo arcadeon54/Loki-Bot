@@ -221,6 +221,14 @@ except Exception as _cu_err:
         f"container updates unavailable: {_cu_err}")
 
 try:
+    import homelab_monitor  # side effect: none — polling starts only via .start()
+    _homelab_monitor_available = homelab_monitor.enabled
+except Exception as _mon_err:
+    _homelab_monitor_available = False
+    logging.getLogger("HomelabMonitor").warning(
+        f"homelab monitor unavailable: {_mon_err}")
+
+try:
     import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
     _skill_bridge_available = True
 except Exception as _sb_err:
@@ -5326,6 +5334,32 @@ async def on_ready():
     # metadata, so nothing extra to wire here.
     if _container_updates_available:
         log.info("Container updates online — inventory + approval-gated updates")
+
+    # Homelab monitor — conservative automatic health checks + known-issue
+    # repair on top of the maintenance controller. Boss-only notifications:
+    # Telegram (the Boss's private line) once paired, else a Discord DM.
+    if _homelab_monitor_available:
+        def _boss_channel_id() -> str:
+            if _telegram_iface is not None and _telegram_iface.owner_id:
+                return f"tg:{_telegram_iface.owner_id}"
+            return str(OWNER_USER_ID)
+
+        async def _notify_boss_monitor(text: str):
+            if _telegram_iface is not None and _telegram_iface.owner_id:
+                await _telegram_iface.send(_telegram_iface.owner_id, text)
+            else:
+                await _dm_boss(text)
+
+        def _discord_status():
+            return {"ready": bot.is_ready(), "latency_ms":
+                    (bot.latency * 1000) if bot.latency == bot.latency else None}
+
+        homelab_monitor.bind(notify_boss=_notify_boss_monitor,
+                             discord_status=_discord_status,
+                             boss_channel_id=_boss_channel_id)
+        homelab_monitor.start()
+        log.info("Homelab monitor online — polling every %ss",
+                 homelab_monitor.POLL_INTERVAL_SECS)
 
     # Memory lifecycle — bind the ECONOMICAL model (Groq fallback, never Opus),
     # migrate metadata once (backs up first), and schedule a WEEKLY dry-run

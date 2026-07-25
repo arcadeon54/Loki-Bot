@@ -115,6 +115,25 @@ assets:
     systemd:
       sync_unit: loki-joplin-desktop.service   # headless Desktop sync sidecar
 
+  cloudflare-ddns:
+    display_name: Cloudflare DDNS
+    host: dex247
+    type: docker_service
+    aliases:
+      - cloudflare-ddns
+      - cloudflare ddns
+      - ddns
+      - dynamic dns
+    runbook: stateless_container
+    stateful: false
+    update_policy: approval
+    docker:
+      container: cloudflare-ddns
+      compose_project: cloudflare-ddns
+      compose_file: /home/g2k247/docker/cloudflare-ddns/docker-compose.yml
+      compose_service: cloudflare-ddns
+      image: favonia/cloudflare-ddns:latest
+
   loki-interfaces:
     display_name: Loki interfaces
     host: dex247

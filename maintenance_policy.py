@@ -131,6 +131,14 @@ _COMMANDS: dict[str, dict] = {
     # Is another agent (watchtower/diun) already managing updates?
     "docker_ps_names":
         {"argv": ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}"]},
+    # -a includes stopped containers, needed for the general "any container
+    # unhealthy or stopped" sweep. No parameters at all — zero injection surface.
+    "docker_ps_status":
+        {"argv": ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"]},
+    "df_root":
+        {"argv": ["df", "-h", "--output=size,avail,pcent", "/"]},
+    "mem_info":
+        {"argv": ["cat", "/proc/meminfo"]},
     "pg_isready":
         {"argv": ["docker", "exec", "{container}", "pg_isready",
                   "-U", "{dbident}", "-d", "{dbident2}"]},
