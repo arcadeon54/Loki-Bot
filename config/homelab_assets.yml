@@ -78,6 +78,40 @@ assets:
         - /media/nas/Music
         - /media/nas/Sports
 
+  joplin:
+    display_name: Joplin
+    host: dex247
+    type: docker_stack
+    aliases:
+      - joplin
+      - notes
+      - note sync
+      - joplin sync
+    runbook: joplin_sync
+    stateful: true               # Postgres + the Boss's notes
+    update_policy: approval
+    docker:
+      compose_project: joplin
+      compose_file: /home/g2k247/docker/joplin/docker-compose.yml
+      containers:
+        - joplin
+        - joplin-db
+        - loki-joplin-api
+    systemd:
+      sync_unit: loki-joplin-desktop.service   # headless Desktop sync sidecar
+
+  loki-interfaces:
+    display_name: Loki interfaces
+    host: dex247
+    type: internal_service
+    aliases:
+      - telegram interface
+      - loki telegram
+      - interface worker
+      - loki interfaces
+    runbook: loki_interfaces
+    stateful: false
+
   immich:
     display_name: Immich
     host: dex247

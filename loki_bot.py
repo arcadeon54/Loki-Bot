@@ -5272,6 +5272,31 @@ async def on_ready():
         browser_research.bind(get_http_session, _channel_send)
         log.info("Browser research online — RAZR worker at configured URL")
 
+    # Homelab maintenance — shared HTTP session + the narrow in-process hooks
+    # the loki_interfaces runbook uses to see/restart interface workers.
+    if _homelab_available:
+        def _iface_status():
+            t = _telegram_iface._task if _telegram_iface else None
+            return {"telegram": {
+                "configured": _telegram_iface is not None
+                              and _telegram_iface.token is not None,
+                "alive": bool(t and not t.done()),
+            }}
+
+        async def _iface_restart(worker: str) -> bool:
+            if worker != "telegram" or _telegram_iface is None:
+                return False
+            task = _telegram_iface._task
+            if task and not task.done():
+                task.cancel()
+            return await _telegram_iface.start()
+
+        homelab_maintenance.bind(get_http_session,
+                                 interface_status=_iface_status,
+                                 interface_restart=_iface_restart)
+        log.info("Homelab maintenance online — %d assets",
+                 len(homelab_maintenance._reg().assets))
+
     # Memory lifecycle — bind the ECONOMICAL model (Groq fallback, never Opus),
     # migrate metadata once (backs up first), and schedule a WEEKLY dry-run
     # (report-only) consolidation. Applying is manual/Boss-only.

@@ -34,7 +34,8 @@ tools.CREW_USER_IDS = {CREW_ID}
 
 import homelab_maintenance as hm
 import maintenance_policy as policy
-from maintenance_runbooks import black_boxx_connectivity, jellyfin_health
+from maintenance_runbooks import (black_boxx_connectivity, jellyfin_health,
+                                  joplin_sync, loki_interfaces)
 
 
 def ctx(user_id, channel="tg:424242"):
@@ -49,6 +50,8 @@ REG = hm.reload_registry()
 BB = REG.get("black-boxx")
 JF = REG.get("jellyfin")
 IM = REG.get("immich")
+JP = REG.get("joplin")
+LI = REG.get("loki-interfaces")
 
 NOW = int(time.time())
 
@@ -95,6 +98,11 @@ class MockOps:
         self.http = dict(http or {})
         self.paths = dict(paths or {})
         self.attempts = set()
+        self.joplin_ping_ok = True
+        self.joplin_sync = {"healthy": True, "detail": "sync fresh"}
+        self.iface = {"telegram": {"configured": True, "alive": True}}
+        self.iface_restart_ok = True
+        self.iface_restarts = []
 
     redact = staticmethod(hm.redact)
 
@@ -133,6 +141,24 @@ class MockOps:
 
     async def dns_check(self, host):
         return True
+
+    async def joplin_ping(self):
+        return self.joplin_ping_ok
+
+    async def joplin_sync_health(self):
+        return dict(self.joplin_sync)
+
+    async def interface_status(self):
+        return None if self.iface is None else {k: dict(v)
+                                                for k, v in self.iface.items()}
+
+    async def interface_restart(self, worker):
+        if not self.allow_repairs:
+            raise policy.PolicyError("interface restart refused")
+        self.iface_restarts.append(worker)
+        if self.iface_restart_ok:
+            self.iface[worker]["alive"] = True
+        return self.iface_restart_ok
 
     async def attempted(self, action, target):
         return (action, target) in self.attempts
@@ -366,6 +392,139 @@ class JellyfinTests(Base):
         self.assertNotIn("docker_restart", [c["name"] for c in ops.commands_run])
 
 
+# ── Joplin sync runbook ─────────────────────────────────────────────────────
+def _joplin_outputs(unit_active=(0, "active")):
+    return {"docker_inspect": JELLY_RUNNING,
+            "systemctl_is_active": unit_active,
+            "systemctl_restart_unit": (0, "")}
+
+
+class JoplinSyncTests(Base):
+    def test_stale_sync_retried_and_verified(self):
+        ops = MockOps(_joplin_outputs(), allow_repairs=True)
+        ops.joplin_sync = {"healthy": False, "detail": "last sync 5400s ago"}
+        result = run(joplin_sync.run(JP, ops))
+        self.assertEqual(result["repair"]["action"], "retry_joplin_sync")
+        self.assertTrue(result["repair_result"]["ok"])
+        ran = [c["name"] for c in ops.commands_run]
+        self.assertEqual(ran.count("systemctl_restart_unit"), 1)
+
+    def test_dead_unit_restarted(self):
+        ops = MockOps(_joplin_outputs(unit_active=[(3, "inactive"), (0, "active")]),
+                      allow_repairs=True)
+        result = run(joplin_sync.run(JP, ops))
+        self.assertTrue(result["repair_result"]["ok"])
+
+    def test_container_failure_escalates_without_restart(self):
+        outputs = _joplin_outputs()
+        outputs["docker_inspect"] = JELLY_EXITED
+        ops = MockOps(outputs, allow_repairs=True)
+        result = run(joplin_sync.run(JP, ops))
+        self.assertTrue(result["escalate"])
+        self.assertNotIn("systemctl_restart_unit",
+                         [c["name"] for c in ops.commands_run])
+
+    def test_retry_only_once_per_window(self):
+        ops = MockOps(_joplin_outputs(), allow_repairs=True)
+        ops.joplin_sync = {"healthy": False, "detail": "stale"}
+        ops.attempts.add(("retry_joplin_sync", "loki-joplin-desktop.service"))
+        result = run(joplin_sync.run(JP, ops))
+        self.assertTrue(result["escalate"])
+        self.assertNotIn("systemctl_restart_unit",
+                         [c["name"] for c in ops.commands_run])
+
+    def test_undeclared_unit_rejected_by_allowlist(self):
+        argv = policy.build_command("systemctl_restart_unit",
+                                    unit="loki-joplin-desktop.service")
+        self.assertEqual(argv[-1], "loki-joplin-desktop.service")
+        with self.assertRaises(policy.PolicyError):
+            policy.build_command("systemctl_restart_unit", unit="loki.service")
+
+
+# ── Interface worker runbook ────────────────────────────────────────────────
+class InterfaceWorkerTests(Base):
+    def test_dead_worker_restarted_and_verified(self):
+        ops = MockOps({}, allow_repairs=True)
+        ops.iface["telegram"]["alive"] = False
+        result = run(loki_interfaces.run(LI, ops))
+        self.assertEqual(result["repair"]["action"], "restart_interface_worker")
+        self.assertTrue(result["repair_result"]["ok"])
+        self.assertEqual(ops.iface_restarts, ["telegram"])
+
+    def test_restart_failure_escalates(self):
+        ops = MockOps({}, allow_repairs=True)
+        ops.iface["telegram"]["alive"] = False
+        ops.iface_restart_ok = False
+        result = run(loki_interfaces.run(LI, ops))
+        self.assertTrue(result["escalate"])
+        self.assertFalse(result["repair_result"]["ok"])
+
+    def test_standalone_mode_escalates_without_action(self):
+        ops = MockOps({}, allow_repairs=True)
+        ops.iface = None                      # hooks unbound (outside the bot)
+        result = run(loki_interfaces.run(LI, ops))
+        self.assertTrue(result["escalate"])
+        self.assertEqual(ops.iface_restarts, [])
+
+    def test_unconfigured_worker_is_healthy_dormant(self):
+        ops = MockOps({}, allow_repairs=True)
+        ops.iface["telegram"] = {"configured": False, "alive": False}
+        result = run(loki_interfaces.run(LI, ops))
+        self.assertTrue(result["healthy"])
+
+
+# ── Hermes handoff ──────────────────────────────────────────────────────────
+class HermesHandoffTests(Base):
+    def test_unconfigured_records_skip(self):
+        orig = hm.HERMES_WORKER_URL, hm.HERMES_WORKER_TOKEN
+        hm.HERMES_WORKER_URL, hm.HERMES_WORKER_TOKEN = "", ""
+        try:
+            out = run(hm.hermes_handoff({"format": hm.BUNDLE_FORMAT}))
+        finally:
+            hm.HERMES_WORKER_URL, hm.HERMES_WORKER_TOKEN = orig
+        self.assertFalse(out["delivered"])
+        self.assertIn("not configured", out["reason"])
+
+    def test_configured_posts_bundle(self):
+        class FakeResp:
+            status = 202
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class FakeSess:
+            def __init__(self):
+                self.calls = []
+
+            def post(self, url, **kw):
+                self.calls.append((url, kw.get("json")))
+                return FakeResp()
+
+        fake = FakeSess()
+
+        async def factory():
+            return fake
+
+        orig = (hm.HERMES_WORKER_URL, hm.HERMES_WORKER_TOKEN,
+                hm._session_factory)
+        hm.HERMES_WORKER_URL = "http://razr-1.invalid:9911"
+        hm.HERMES_WORKER_TOKEN = "unit-test-token"
+        hm._session_factory = factory
+        try:
+            out = run(hm.hermes_handoff({"format": hm.BUNDLE_FORMAT,
+                                         "asset": "jellyfin"}))
+        finally:
+            (hm.HERMES_WORKER_URL, hm.HERMES_WORKER_TOKEN,
+             hm._session_factory) = orig
+        self.assertTrue(out["delivered"])
+        url, body = fake.calls[0]
+        self.assertTrue(url.endswith("/v1/escalations"))
+        self.assertEqual(body["format"], hm.BUNDLE_FORMAT)
+
+
 # ── Update inventory ────────────────────────────────────────────────────────
 class UpdateInventoryTests(Base):
     def test_update_detection_and_flags(self):
@@ -511,6 +670,9 @@ class IncidentPersistenceTests(Base):
         self.assertEqual(inc["status"], "escalated")
         bundle = json.loads(inc["bundle_json"])
         self.assertEqual(bundle["format"], hm.BUNDLE_FORMAT)
+        # Hermes is not configured in tests: the skip is recorded, not raised.
+        delivery = json.loads(inc["hermes_json"])
+        self.assertFalse(delivery["delivered"])
         # Correlation: the task row carries conversation/message linkage.
         row = ts.get_task(tid)
         self.assertEqual(row["conversation_id"], "tg:424242")

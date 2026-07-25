@@ -26,7 +26,8 @@ REGISTRY_PATH = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
                  "config", "homelab_assets.yml"))
 
-VALID_TYPES = {"wireless_access_point", "docker_service", "docker_stack"}
+VALID_TYPES = {"wireless_access_point", "docker_service", "docker_stack",
+               "internal_service"}
 
 _IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -107,7 +108,7 @@ class Registry:
         """Every parameter value a shell command may carry, derived strictly
         from the registry. The policy allowlist rejects anything else."""
         vals = {"iface": set(), "container": set(), "compose_file": set(),
-                "path": set(), "image": set(), "num": set(),
+                "path": set(), "image": set(), "num": set(), "unit": set(),
                 "probe_ip": {"1.1.1.1", "9.9.9.9"}}
         for asset in self.assets.values():
             net = asset.get("network") or {}
@@ -127,6 +128,9 @@ class Registry:
                 vals["path"].add(str(docker["compose_file"]))
             if docker.get("image"):
                 vals["image"].add(str(docker["image"]))
+            systemd = asset.get("systemd") or {}
+            for v in systemd.values():
+                vals["unit"].add(str(v))
             mounts = asset.get("mounts") or {}
             for v in mounts.values():
                 for p in (v if isinstance(v, list) else [v]):

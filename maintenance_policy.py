@@ -78,6 +78,7 @@ _PARAM_SHAPES = {
     "image":        re.compile(r"^[A-Za-z0-9_./:-]{1,200}$"),
     "num":          re.compile(r"^\d{1,5}$"),
     "probe_ip":     re.compile(r"^\d{1,3}(\.\d{1,3}){3}$"),
+    "unit":         re.compile(r"^[A-Za-z0-9@_.-]{1,64}$"),
 }
 
 _COMMANDS: dict[str, dict] = {
@@ -110,6 +111,7 @@ _COMMANDS: dict[str, dict] = {
                                   "ps", "--format", "json"]},
     "df_path":          {"argv": ["df", "-h", "--output=target,size,avail,pcent",
                                   "{path}"]},
+    "systemctl_is_active": {"argv": ["systemctl", "is-active", "{unit}"]},
 
     # ── repairs (still template-locked; tier enforced by the runbook) ──
     "ip_rule_add_fwmark":
@@ -122,6 +124,12 @@ _COMMANDS: dict[str, dict] = {
                          "repair": True},
     "docker_restart":   {"argv": ["docker", "restart", "{container}"],
                          "repair": True},
+    # Only units declared in the registry (the Joplin sync sidecar). Never
+    # loki.service itself — Loki restarting Loki from a runbook is a footgun;
+    # systemd's Restart=always owns that.
+    "systemctl_restart_unit":
+        {"argv": ["sudo", "-n", "systemctl", "restart", "{unit}"],
+         "repair": True},
 }
 
 _PLACEHOLDER_RE = re.compile(r"^\{([a-z_]+?)(\d*)\}$")

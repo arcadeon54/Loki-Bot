@@ -54,14 +54,24 @@ BUNDLE_FORMAT = "loki.homelab.bundle/1"
 
 DNS_PROBE_HOSTS = {"one.one.one.one", "cloudflare.com"}
 
+# Hermes escalation worker (planned home: razr, over Tailscale — same pattern
+# as the browser worker). Unset until Hermes is deployed; bundles are stored
+# locally either way and hand-off is best-effort.
+HERMES_WORKER_URL = os.getenv("HERMES_WORKER_URL", "").rstrip("/")
+HERMES_WORKER_TOKEN = os.getenv("HERMES_WORKER_TOKEN", "")
+
 enabled = True
 _registry: Optional[homelab_assets.Registry] = None
 _session_factory = None      # async () -> aiohttp.ClientSession (bound by loki_bot)
+_interface_status = None     # () -> {worker: {"configured","alive"}}  (loki_bot)
+_interface_restart = None    # async (worker) -> bool                  (loki_bot)
 
 
-def bind(session_factory=None):
-    global _session_factory
+def bind(session_factory=None, interface_status=None, interface_restart=None):
+    global _session_factory, _interface_status, _interface_restart
     _session_factory = session_factory
+    _interface_status = interface_status
+    _interface_restart = interface_restart
 
 
 def _reg() -> homelab_assets.Registry:
@@ -107,7 +117,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     repair_json  TEXT NOT NULL DEFAULT 'null',
     repair_result_json TEXT NOT NULL DEFAULT 'null',
     bundle_json  TEXT NOT NULL DEFAULT 'null',
-    commands_json TEXT NOT NULL DEFAULT '[]'
+    commands_json TEXT NOT NULL DEFAULT '[]',
+    hermes_json  TEXT NOT NULL DEFAULT 'null'
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_task ON incidents(task_id);
 CREATE TABLE IF NOT EXISTS repair_attempts (
@@ -117,6 +128,10 @@ CREATE TABLE IF NOT EXISTS repair_attempts (
     at     REAL NOT NULL
 );
 """
+
+_MIGRATIONS = (
+    "ALTER TABLE incidents ADD COLUMN hermes_json TEXT NOT NULL DEFAULT 'null'",
+)
 
 _conn: Optional[sqlite3.Connection] = None
 
@@ -128,6 +143,11 @@ def _db() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(_SCHEMA)
+        for mig in _MIGRATIONS:
+            try:
+                _conn.execute(mig)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         _conn.commit()
     return _conn
 
@@ -277,6 +297,44 @@ class Ops:
         except Exception:
             return False
 
+    async def joplin_ping(self) -> bool:
+        try:
+            import joplin_integration as jp
+            return jp.is_configured() and await jp.ping()
+        except Exception:
+            return False
+
+    async def joplin_sync_health(self) -> dict:
+        try:
+            import joplin_integration as jp
+            h = jp.sync_health()
+            return {"healthy": h.get("state") == "healthy",
+                    "detail": redact(f"{h.get('state')}: {h.get('detail', '')}")[:200]}
+        except Exception as e:
+            return {"healthy": False, "detail": f"sync health unreadable "
+                                                f"({type(e).__name__})"}
+
+    async def interface_status(self) -> Optional[dict]:
+        """In-process worker state via the loki_bot hook; None standalone."""
+        if _interface_status is None:
+            return None
+        try:
+            return _interface_status()
+        except Exception:
+            log.exception("interface_status hook failed")
+            return None
+
+    async def interface_restart(self, worker: str) -> bool:
+        if not self.allow_repairs:
+            raise policy.PolicyError("interface restart refused in read-only mode")
+        if _interface_restart is None:
+            return False
+        try:
+            return bool(await _interface_restart(worker))
+        except Exception:
+            log.exception("interface_restart hook failed")
+            return False
+
     async def attempted(self, action: str, target: str) -> bool:
         return _recently_attempted(action, target)
 
@@ -332,6 +390,35 @@ def build_escalation_bundle(asset: dict, symptom: str, result: dict,
         "prohibited_actions": sorted(a for a, t in tiers.items()
                                      if t == policy.MANUAL),
     }
+
+
+async def hermes_handoff(bundle: dict) -> dict:
+    """Best-effort delivery of an escalation bundle to the Hermes worker on
+    razr. Never raises; the bundle stays stored locally regardless, and no
+    LLM is invoked from here — Hermes decides what to do on its own side."""
+    if not (HERMES_WORKER_URL and HERMES_WORKER_TOKEN):
+        return {"delivered": False, "reason": "hermes worker not configured"}
+    import aiohttp
+    try:
+        if _session_factory is not None:
+            sess = await _session_factory()
+            close = False
+        else:
+            sess = aiohttp.ClientSession()
+            close = True
+        try:
+            async with sess.post(
+                    f"{HERMES_WORKER_URL}/v1/escalations", json=bundle,
+                    headers={"Authorization": f"Bearer {HERMES_WORKER_TOKEN}"},
+                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                return {"delivered": r.status in (200, 201, 202),
+                        "status": r.status, "at": int(time.time())}
+        finally:
+            if close:
+                await sess.close()
+    except Exception as e:
+        return {"delivered": False, "reason": type(e).__name__,
+                "at": int(time.time())}
 
 
 def _attempts_for(asset: dict) -> list[dict]:
@@ -402,8 +489,12 @@ async def _incident_handler(h):
                                          ops, _attempts_for(asset))
         fields["status"] = "escalated"
         fields["bundle_json"] = json.dumps(bundle)
+        delivery = await hermes_handoff(bundle)
+        fields["hermes_json"] = json.dumps(delivery)
+        handoff_note = ("handed to Hermes on razr." if delivery.get("delivered")
+                        else "diagnostic bundle saved for escalation.")
         summary = (f"{name}: {result.get('diagnosis', '')} I did not attempt a "
-                   f"risky fix — diagnostic bundle saved for escalation.")
+                   f"risky fix — {handoff_note}")
     else:
         fields["status"] = "failed"
         summary = f"{name}: {result.get('diagnosis', 'diagnosis inconclusive')}"
@@ -495,6 +586,7 @@ async def _tool_incident_status(args: dict, ctx: ToolContext) -> str:
     bundle = json.loads(inc["bundle_json"] or "null")
     if bundle:
         out["escalation_bundle_ready"] = True
+        out["hermes_delivery"] = json.loads(inc.get("hermes_json") or "null")
     return json.dumps(out)
 
 
