@@ -101,6 +101,9 @@ class TaskType:
     # Handler re-attaches to external work via external_ref instead of
     # re-submitting, so it is safe to re-run after a restart (no duplicates).
     reattach: bool = False
+    # Internal types are driven by other subsystems (e.g. the draft executor),
+    # never started directly by the model via task_start.
+    internal: bool = False
     validate: Optional[Callable[[dict, ToolContext], "tuple[dict, str]"]] = None
     on_cancel: Optional[Callable[[dict], Awaitable[None]]] = None
     title: Optional[Callable[[dict], str]] = None
@@ -481,9 +484,10 @@ def _fmt_task(row: dict) -> str:
 async def _tool_start(args: dict, ctx: ToolContext) -> str:
     ttype = str(args.get("task_type") or "").strip()
     tt = _TYPES.get(ttype)
-    if tt is None:
+    startable = sorted(n for n, t in _TYPES.items() if not t.internal)
+    if tt is None or tt.internal:
         return json.dumps({"ok": False,
-                           "error": f"unknown task_type — choose one of {sorted(_TYPES)}"})
+                           "error": f"unknown task_type — choose one of {startable}"})
     if PERM_RANK[user_level(ctx.user_id)] < PERM_RANK[tt.permission]:
         return json.dumps({"ok": False,
                            "error": "you are not authorized to start this task type"})
@@ -577,7 +581,7 @@ def _p(props: dict, required: list) -> dict:
 
 
 def _register_tools():
-    type_names = sorted(_TYPES)
+    type_names = sorted(n for n, t in _TYPES.items() if not t.internal)
     register(ToolSpec(
         name="task_start",
         description=(

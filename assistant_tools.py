@@ -315,6 +315,18 @@ async def _home_control(args: dict, ctx: ToolContext) -> str:
     return await ha_integration.ha_control(request, llm)
 
 
+def _home_control_prepare(args: dict, ctx: ToolContext):
+    """Validate/normalize a house command into a minimal payload + safe summary.
+    Home Assistant changes are consequential, so this stages a draft rather than
+    acting (see tools.ToolSpec.action_type)."""
+    request = str(args.get("request", "")).strip()
+    if not request:
+        return {}, "", "What should I do with the house?"
+    if len(request) > 500:
+        return {}, "", "That house command is too long — keep it to one action."
+    return {"request": request}, f"Home Assistant command: “{request}”", ""
+
+
 # ─── Work hours ──────────────────────────────────────────────────────────────
 
 async def _work_hours(args: dict, ctx: ToolContext) -> str:
@@ -477,6 +489,10 @@ register(ToolSpec(
         "required": ["request"],
     },
     handler=_home_control, permission="boss",
+    # Consequential: house changes are staged as a draft and only run once the
+    # Boss approves the exact draft ID (see draft_approval.py).
+    action_type="ha_control", approval_ttl=1800,
+    prepare=_home_control_prepare, redact_log=True,
 ))
 
 register(ToolSpec(

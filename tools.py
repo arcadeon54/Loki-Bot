@@ -26,7 +26,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -68,6 +68,16 @@ class ToolSpec:
     # Content-bearing personal tools (memory, note bodies): log call metadata
     # only, never args/results — they can carry credentials the Boss dictated.
     redact_log: bool = False
+    # Approval gating: a non-empty action_type marks this tool CONSEQUENTIAL.
+    # The registry — not a name-matching heuristic — is the source of truth.
+    # When set, execute() stages a durable draft instead of running the handler;
+    # the handler only runs later via run_approved() once a draft is approved.
+    # prepare(args, ctx) -> (validated_payload, safe_summary, error) normalizes
+    # the request and produces the human-facing summary; on error the tuple's
+    # third element is a friendly message and no draft is created.
+    action_type: str = ""
+    approval_ttl: int = 3600
+    prepare: Optional[Callable[[dict, "ToolContext"], "tuple[dict, str, str]"]] = None
 
     def openai_schema(self) -> dict:
         return {
@@ -93,6 +103,18 @@ def bind(**handlers):
 
 def register(spec: ToolSpec):
     REGISTRY[spec.name] = spec
+
+
+# Draft-and-approval gate. draft_approval.py installs this at import; when a
+# consequential tool (action_type set) is called, execute() routes through it to
+# stage a draft instead of running the handler. Kept as a hook so tools.py never
+# imports the drafts module (one-way dependency).
+_approval_intercept: "Optional[Callable[[ToolSpec, dict, ToolContext], Awaitable[str]]]" = None
+
+
+def set_approval_intercept(fn):
+    global _approval_intercept
+    _approval_intercept = fn
 
 
 def user_level(user_id: str) -> str:
@@ -174,6 +196,17 @@ async def execute(name: str, raw_args: str, ctx: ToolContext) -> str:
         _log_call(ctx, name, {}, False, f"bad args: {raw_args[:100]}", 0)
         return "Tool call had malformed arguments — try rephrasing the request."
 
+    # Consequential tools never execute inline — stage a draft for approval.
+    if spec.action_type and _approval_intercept is not None:
+        try:
+            staged = await _approval_intercept(spec, args, ctx)
+            _log_call(ctx, name, args, True, "draft staged for approval", 0)
+            return staged
+        except Exception as e:
+            log.error(f"Draft staging for {name} failed: {e}", exc_info=True)
+            _log_call(ctx, name, args, False, f"draft staging: {type(e).__name__}", 0)
+            return "I couldn't prepare that action for approval — nothing was done."
+
     start = time.monotonic()
     try:
         result = await asyncio.wait_for(spec.handler(args, ctx), timeout=spec.timeout)
@@ -187,6 +220,29 @@ async def execute(name: str, raw_args: str, ctx: ToolContext) -> str:
         _log_call(ctx, name, args, False, f"{type(e).__name__}: {e}",
                   int((time.monotonic() - start) * 1000))
         return "Something broke on my end running that. The Boss can check my tool log."
+
+
+async def run_approved(name: str, payload: dict, ctx: ToolContext) -> str:
+    """Execute a consequential tool's handler directly (bypassing the approval
+    gate) with an already-validated payload. Used only by the draft executor
+    after a draft has been approved and its payload hash verified. Re-checks
+    permission against the originating user. Raises on failure so the caller
+    can mark the draft failed."""
+    spec = REGISTRY.get(name)
+    if spec is None:
+        raise KeyError(f"unknown tool '{name}'")
+    if PERM_RANK[spec.permission] > PERM_RANK[user_level(ctx.user_id)]:
+        _log_call(ctx, name, {}, False, "permission denied (approved-exec)", 0)
+        raise PermissionError(f"{name} not permitted for this user")
+    start = time.monotonic()
+    try:
+        result = await asyncio.wait_for(spec.handler(payload, ctx), timeout=spec.timeout)
+        _log_call(ctx, name, payload, True, result, int((time.monotonic() - start) * 1000))
+        return result
+    except Exception as e:
+        _log_call(ctx, name, payload, False, f"{type(e).__name__}: {e}",
+                  int((time.monotonic() - start) * 1000))
+        raise
 
 
 async def _session() -> aiohttp.ClientSession:

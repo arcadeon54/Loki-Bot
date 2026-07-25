@@ -176,6 +176,13 @@ except Exception as _ts_err:
     logging.getLogger("TaskSupervisor").warning(f"task supervisor unavailable: {_ts_err}")
 
 try:
+    import draft_approval  # side effect: gates consequential tools + draft_* tools
+    _draft_approval_available = True
+except Exception as _da_err:
+    _draft_approval_available = False
+    logging.getLogger("DraftApproval").warning(f"draft approval unavailable: {_da_err}")
+
+try:
     import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
     _skill_bridge_available = True
 except Exception as _sb_err:
