@@ -12,6 +12,7 @@ jobsite_pending.json
 relay_aliases.json
 quip_usage.json
 career_ops_state.json
+loki_memory_meta_backup_*.json
 *.db-shm
 *.db-wal
 *.json.bak

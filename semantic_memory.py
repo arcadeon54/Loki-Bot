@@ -78,6 +78,15 @@ def _embed(text: str) -> list[float]:
     return _get_model().encode(text, normalize_embeddings=True).tolist()
 
 
+def _ml():
+    """Optional lifecycle-metadata sidecar; memory ops must not depend on it."""
+    try:
+        import memory_lifecycle
+        return memory_lifecycle
+    except Exception:
+        return None
+
+
 # ─── Core operations ─────────────────────────────────────────────────────────
 
 async def remember(text: str, kind: str = "fact", context: str = "") -> dict:
@@ -103,8 +112,10 @@ async def remember(text: str, kind: str = "fact", context: str = "") -> dict:
                            include=["metadatas", "distances", "documents"])
         if coll.count() else None
     )
+    nearest = None
     if near and near["ids"] and near["ids"][0]:
         dist = near["distances"][0][0]
+        nearest = (near["documents"][0][0], dist)
         if dist < DEDUPE_DISTANCE:
             note_id = near["ids"][0][0]
             note = await jp.get_note(note_id)
@@ -114,6 +125,12 @@ async def remember(text: str, kind: str = "fact", context: str = "") -> dict:
                 await asyncio.to_thread(
                     coll.update, ids=[note_id], documents=[text], embeddings=[emb],
                     metadatas=[{"kind": kind, "updated": today}])
+                ml = _ml()
+                if ml:
+                    try:
+                        ml.upsert_meta(note_id, source="remember")  # bump updated_at
+                    except Exception:
+                        pass
                 log.info(f"Memory updated (near-dup d={dist:.3f}): {text[:60]}")
                 return {"action": "updated", "title": note["title"], "note_id": note_id}
 
@@ -133,6 +150,19 @@ async def remember(text: str, kind: str = "fact", context: str = "") -> dict:
         _get_collection().upsert,
         ids=[note["id"]], documents=[text], embeddings=[emb],
         metadatas=[{"kind": kind, "updated": today}])
+    ml = _ml()
+    if ml:
+        try:
+            seg, tier, importance, decay = ml.assign_defaults(kind)
+            # A semantically-adjacent but conflicting memory is flagged for
+            # review, never silently overwritten (we still keep both notes).
+            label = ml.classify_write(text, nearest)
+            flag = (f"contradiction:{near['ids'][0][0]}"
+                    if label == "contradiction" and near else "")
+            ml.upsert_meta(note["id"], segment=seg, tier=tier, importance=importance,
+                           decay_rate=decay, source="remember", review_flag=flag)
+        except Exception:
+            pass
     log.info(f"Memory stored ({kind}): {text[:70]}")
     return {"action": "created", "title": title, "note_id": note["id"]}
 
@@ -148,12 +178,26 @@ async def recall(query: str, n: int = 5,
     res = await asyncio.to_thread(
         lambda: coll.query(query_embeddings=[emb], n_results=min(n, 10),
                            include=["documents", "metadatas", "distances"]))
+    ml = _ml()
     out = []
     for nid, doc, meta, dist in zip(res["ids"][0], res["documents"][0],
                                     res["metadatas"][0], res["distances"][0]):
-        if dist <= max_distance:
-            out.append({"text": doc, "kind": (meta or {}).get("kind", "fact"),
-                        "note_id": nid, "distance": round(dist, 3)})
+        if dist > max_distance:
+            continue
+        if ml:
+            try:
+                m = ml.get_meta(nid)
+                if m and m["lifecycle"] != "active":
+                    continue                      # hide archived/superseded
+            except Exception:
+                pass
+        out.append({"text": doc, "kind": (meta or {}).get("kind", "fact"),
+                    "note_id": nid, "distance": round(dist, 3)})
+    if ml and out:
+        try:
+            ml.record_access([h["note_id"] for h in out])   # batched, no per-read write
+        except Exception:
+            pass
     return out
 
 

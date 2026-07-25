@@ -138,6 +138,13 @@ except ImportError:
     _semantic_memory_available = False
 
 try:
+    import memory_lifecycle  # side effect: registers memory_* lifecycle tools
+    _memory_lifecycle_available = True
+except Exception as _mlf_err:
+    _memory_lifecycle_available = False
+    logging.getLogger("MemoryLifecycle").warning(f"memory lifecycle unavailable: {_mlf_err}")
+
+try:
     import work_tracker
     work_tracker.init_db()   # before any task loop can touch work_sessions
     _work_tracker_available = True
@@ -5237,6 +5244,48 @@ async def on_ready():
         task_supervisor.bind(get_http_session, _channel_send)
         task_supervisor.start()
         log.info("Task supervisor online")
+
+    # Memory lifecycle — bind the ECONOMICAL model (Groq fallback, never Opus),
+    # migrate metadata once (backs up first), and schedule a WEEKLY dry-run
+    # (report-only) consolidation. Applying is manual/Boss-only.
+    if _memory_lifecycle_available:
+        async def _cheap_llm(system: str, user: str) -> str:
+            msgs = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+            model = os.getenv("MEMORY_CONSOLIDATION_MODEL", FALLBACK_LLM_MODEL)
+            if FALLBACK_LLM_URL and FALLBACK_LLM_API_KEY and model:
+                url = FALLBACK_LLM_URL.rstrip("/") + "/chat/completions"
+                res = await llm._call(url, FALLBACK_LLM_API_KEY, model, msgs,
+                                      is_openai=False)
+                if res is not None:
+                    return res
+            return await llm.chat(msgs)
+
+        memory_lifecycle.bind(_cheap_llm)
+        if _semantic_memory_available and semantic_memory.is_available():
+            try:
+                _coll = semantic_memory._get_collection()
+                _got = await asyncio.to_thread(lambda: _coll.get(include=["metadatas"]))
+                _existing = [{"id": i, "kind": (m or {}).get("kind", "fact")}
+                             for i, m in zip(_got.get("ids", []),
+                                             _got.get("metadatas", []))]
+                await asyncio.to_thread(memory_lifecycle.migrate, _existing)
+            except Exception as e:
+                log.warning(f"memory metadata migration skipped: {e}")
+
+        async def _weekly_memory_consolidation():
+            while True:
+                await asyncio.sleep(7 * 24 * 3600)
+                try:
+                    res = await memory_lifecycle.consolidate(
+                        dry_run=True, trigger="scheduled")   # report-only
+                    log.info(f"weekly memory consolidation (dry-run): {res.get('report') and 'ok'} "
+                             f"scanned={res.get('scanned')} proposed={res.get('proposed')}")
+                except Exception:
+                    log.exception("weekly memory consolidation failed")
+
+        asyncio.create_task(_weekly_memory_consolidation())
+        log.info("Memory lifecycle online — weekly dry-run consolidation scheduled")
 
 
 _POSITIVE_REACTION_EMOJIS = {"👍", "😂", "❤️", "🔥", "💯", "😭", "🤣", "👏", "⭐", "🎯"}
