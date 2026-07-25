@@ -169,6 +169,13 @@ except Exception:
     _career_ops_available = False
 
 try:
+    import task_supervisor  # side effect: registers task_* tools + adapters
+    _task_supervisor_available = True
+except Exception as _ts_err:
+    _task_supervisor_available = False
+    logging.getLogger("TaskSupervisor").warning(f"task supervisor unavailable: {_ts_err}")
+
+try:
     import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
     _skill_bridge_available = True
 except Exception as _sb_err:
@@ -5186,34 +5193,43 @@ async def on_ready():
     elif not _telegram_available:
         log.warning("telegram_interface not importable — Telegram DISABLED")
 
+    # Shared channel sender: routes a message (optionally an attachment) back to
+    # the originating Discord channel/DM or Telegram chat. Used by both the
+    # Career-Ops liaison and the durable task supervisor.
+    async def _channel_send(channel_id: str, text: str,
+                            file_path: str | None = None,
+                            filename: str | None = None):
+        if channel_id.startswith("tg:"):
+            chat_id = int(channel_id[3:])
+            if _telegram_iface is None:
+                raise RuntimeError("telegram interface offline")
+            if file_path:
+                await _telegram_iface.send_document(chat_id, file_path,
+                                                    caption=text,
+                                                    filename=filename)
+            else:
+                await _telegram_iface.send(chat_id, text)
+        else:
+            channel = (bot.get_channel(int(channel_id))
+                       or await bot.fetch_channel(int(channel_id)))
+            if file_path:
+                await channel.send(text, file=discord.File(
+                    file_path, filename=filename or "attachment"))
+            else:
+                await channel.send(text)
+
     # Career-Ops liaison (bridge on razr) — monitor announces job progress
     # back to whichever conversation submitted the job.
     if _career_ops_available:
-        async def _career_send(channel_id: str, text: str,
-                               file_path: str | None = None,
-                               filename: str | None = None):
-            if channel_id.startswith("tg:"):
-                chat_id = int(channel_id[3:])
-                if _telegram_iface is None:
-                    raise RuntimeError("telegram interface offline")
-                if file_path:
-                    await _telegram_iface.send_document(chat_id, file_path,
-                                                        caption=text,
-                                                        filename=filename)
-                else:
-                    await _telegram_iface.send(chat_id, text)
-            else:
-                channel = (bot.get_channel(int(channel_id))
-                           or await bot.fetch_channel(int(channel_id)))
-                if file_path:
-                    await channel.send(text, file=discord.File(
-                        file_path, filename=filename or "attachment"))
-                else:
-                    await channel.send(text)
-
-        career_ops.bind(get_http_session, _career_send)
+        career_ops.bind(get_http_session, _channel_send)
         asyncio.create_task(career_ops.monitor_loop())
         log.info("Career-Ops liaison online — bridge at configured URL")
+
+    # Durable task supervisor — background worker + heartbeat + restart recovery.
+    if _task_supervisor_available:
+        task_supervisor.bind(get_http_session, _channel_send)
+        task_supervisor.start()
+        log.info("Task supervisor online")
 
 
 _POSITIVE_REACTION_EMOJIS = {"👍", "😂", "❤️", "🔥", "💯", "😭", "🤣", "👏", "⭐", "🎯"}
