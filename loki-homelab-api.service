@@ -1,0 +1,43 @@
+# Read-only homelab maintenance API — the interface Hermes (on razr) is
+# allowed to reach. Install to /etc/systemd/system/loki-homelab-api.service.
+#
+# Deliberately a separate unit from loki.service: activating or restarting this
+# facade must never require restarting the production bot.
+[Unit]
+Description=Loki homelab read-only maintenance API (Hermes interface)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# Crash-loop limiter (belongs in [Unit], not [Service]).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=g2k247
+Group=g2k247
+WorkingDirectory=/home/g2k247/loki-bot
+EnvironmentFile=/home/g2k247/.config/loki-homelab-api.env
+ExecStart=/home/g2k247/loki-bot/venv/bin/python homelab_api.py
+Environment=PYTHONUNBUFFERED=1
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+MemoryHigh=512M
+MemoryMax=768M
+TasksMax=128
+
+# NoNewPrivileges is deliberately NOT set: the network runbook's read-only
+# checks (iptables -S, wg show) go through `sudo -n`, which is setuid and would
+# be blocked by it. The commands themselves are still template-locked by
+# maintenance_policy, and repair-class commands are refused in this process.
+PrivateTmp=true
+RestrictRealtime=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
