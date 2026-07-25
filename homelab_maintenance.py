@@ -118,7 +118,12 @@ CREATE TABLE IF NOT EXISTS incidents (
     repair_result_json TEXT NOT NULL DEFAULT 'null',
     bundle_json  TEXT NOT NULL DEFAULT 'null',
     commands_json TEXT NOT NULL DEFAULT '[]',
-    hermes_json  TEXT NOT NULL DEFAULT 'null'
+    hermes_json  TEXT NOT NULL DEFAULT 'null',
+    hermes_task_id TEXT NOT NULL DEFAULT '',
+    hermes_job_id  TEXT NOT NULL DEFAULT '',
+    hermes_diagnosis_json TEXT NOT NULL DEFAULT 'null',
+    hermes_proposals_json TEXT NOT NULL DEFAULT '[]',
+    hermes_escalation_announced INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_task ON incidents(task_id);
 CREATE TABLE IF NOT EXISTS repair_attempts (
@@ -129,8 +134,21 @@ CREATE TABLE IF NOT EXISTS repair_attempts (
 );
 """
 
+# Columns (and anything indexing them) added after the first release — applied
+# to pre-existing DBs. Must run strictly AFTER _SCHEMA's executescript: on an
+# existing installation the table already exists, so CREATE TABLE IF NOT
+# EXISTS is a no-op and these columns are genuinely absent until the ALTERs
+# below run. An index on a not-yet-added column belongs here, never in
+# _SCHEMA — putting it there breaks executescript() on every upgrade before
+# the migration ever gets a chance to add the column.
 _MIGRATIONS = (
     "ALTER TABLE incidents ADD COLUMN hermes_json TEXT NOT NULL DEFAULT 'null'",
+    "ALTER TABLE incidents ADD COLUMN hermes_task_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE incidents ADD COLUMN hermes_job_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE incidents ADD COLUMN hermes_diagnosis_json TEXT NOT NULL DEFAULT 'null'",
+    "ALTER TABLE incidents ADD COLUMN hermes_proposals_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE incidents ADD COLUMN hermes_escalation_announced INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_incidents_hermes_task ON incidents(hermes_task_id)",
 )
 
 _conn: Optional[sqlite3.Connection] = None
@@ -393,9 +411,11 @@ def build_escalation_bundle(asset: dict, symptom: str, result: dict,
 
 
 async def hermes_handoff(bundle: dict) -> dict:
-    """Best-effort delivery of an escalation bundle to the Hermes worker on
-    razr. Never raises; the bundle stays stored locally regardless, and no
-    LLM is invoked from here — Hermes decides what to do on its own side."""
+    """Legacy fallback: best-effort delivery of an escalation bundle when the
+    supervised hermes_escalation task type isn't registered (homelab_hermes
+    failed to import, or task_supervisor is unavailable). The normal path is
+    _escalate_to_hermes() below, which tracks a real job. Never raises; the
+    bundle stays stored locally regardless, and no LLM is invoked from here."""
     if not (HERMES_WORKER_URL and HERMES_WORKER_TOKEN):
         return {"delivered": False, "reason": "hermes worker not configured"}
     import aiohttp
@@ -419,6 +439,181 @@ async def hermes_handoff(bundle: dict) -> dict:
     except Exception as e:
         return {"delivered": False, "reason": type(e).__name__,
                 "at": int(time.time())}
+
+
+def _hash_diagnosis(d: dict) -> str:
+    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()
+
+
+async def _escalate_to_hermes(asset: dict, symptom: str, bundle: dict,
+                              incident_id: str, origin_row: dict) -> tuple[str, dict]:
+    """Hand an incident to Hermes as a supervised background task, tied to the
+    SAME originating requester/channel as origin_row (a task row, or a plain
+    dict with requester_id/requester_name/channel_id). Returns
+    ("escalating_to_hermes", {"hermes_task_id": ...}) on success, or
+    ("escalated", {}) to signal the caller should fall back to the old
+    best-effort hermes_handoff (bridge not wired up)."""
+    try:
+        import task_supervisor as ts
+        import homelab_hermes as hh
+    except Exception:
+        return "escalated", {}
+    tt = ts._TYPES.get("hermes_escalation")
+    if tt is None or not hh.enabled:
+        return "escalated", {}
+    follow_ctx = tools.ToolContext(
+        user_id=str(origin_row.get("requester_id", "")),
+        user_name=origin_row.get("requester_name", "Boss"),
+        channel_id=origin_row.get("channel_id", ""))
+    task_id = ts.submit(tt, follow_ctx, {
+        "asset": asset["key"], "incident_id": incident_id,
+        "symptom": symptom, "bundle": bundle})
+    return "escalating_to_hermes", {"hermes_task_id": task_id}
+
+
+async def _hermes_handler(h):
+    """The hermes_escalation supervised task: submits (or, after a restart,
+    reattaches to) a Hermes bridge job and polls it to a terminal state.
+    Never runs a repair — Hermes only diagnoses and proposes; any state
+    change goes back through the draft-approval gate via hermes_escalate."""
+    import task_supervisor as ts
+    import homelab_hermes as hh
+    inp = h.input
+    incident_id = inp.get("incident_id", "")
+    ext = h.external_ref
+    if not ext:
+        try:
+            job = await hh.submit_diagnosis(
+                inp["asset"], inp.get("symptom", ""), inp["bundle"], incident_id,
+                request_id=h.row.get("request_id"))
+        except hh.HermesBridgeError as e:
+            if incident_id:
+                _incident_update(incident_id, status="hermes_failed")
+            return ts.TaskResult("failed", error_category="bridge_unreachable",
+                                 error_detail=str(e),
+                                 summary=f"Hermes bridge unreachable: {e}")
+        ext = job["id"]
+        h.set_external_ref(ext)
+        if incident_id:
+            _incident_update(incident_id, hermes_job_id=ext, status="hermes_triage")
+        log.info("task %s -> hermes job %s", h.task_id, ext)
+
+    while True:
+        if h.cancelled():
+            try:
+                await hh.cancel_job(ext)
+            except hh.HermesBridgeError:
+                pass
+            if incident_id:
+                _incident_update(incident_id, status="hermes_cancelled")
+            return ts.TaskResult("cancelled", summary="cancelled at the Hermes bridge")
+        try:
+            job = await hh.get_job(ext)
+        except hh.HermesBridgeError as e:
+            return ts.TaskResult("failed", error_category="bridge_unreachable",
+                                 error_detail=str(e),
+                                 summary="lost contact with the Hermes bridge")
+        await h.beat()
+
+        inc = get_incident(incident_id) if incident_id else None
+        if job.get("escalated") and inc and not inc.get("hermes_escalation_announced"):
+            _incident_update(incident_id, hermes_escalation_announced=1)
+            if ts._send is not None and h.row.get("channel_id"):
+                try:
+                    await ts._send(
+                        h.row["channel_id"],
+                        "🔎 Hermes needed a deeper look and escalated to its stronger "
+                        "model — still working, I'll follow up.")
+                except Exception:
+                    log.exception("hermes escalation notice failed")
+
+        diagnosis = job.get("diagnosis") or {}
+        if incident_id:
+            _incident_update(
+                incident_id,
+                hermes_diagnosis_json=json.dumps(diagnosis) if diagnosis else "null",
+                hermes_proposals_json=json.dumps(job.get("proposals", [])))
+
+        asset = _reg().get(inp.get("asset", ""))
+        display = asset.get("display_name", inp.get("asset", "asset")) if asset else inp.get("asset", "asset")
+        root = redact(str(diagnosis.get("probable_root_cause", "")))[:400]
+
+        s = job.get("state")
+        if s == "completed":
+            if incident_id:
+                _incident_update(incident_id, status="hermes_completed")
+            return ts.TaskResult("completed",
+                                 summary=f"{display}: Hermes diagnosis — {root}"[:780])
+        if s == "needs_approval":
+            if incident_id:
+                _incident_update(incident_id, status="hermes_needs_approval")
+            return ts.TaskResult(
+                "completed",
+                summary=(f"⚠️ {display}: Hermes found a likely cause but the proposed "
+                        f"fix needs your approval — {root} Ask me about it when "
+                        f"you're ready to review.")[:780])
+        if s == "failed":
+            if incident_id:
+                _incident_update(incident_id, status="hermes_failed")
+            return ts.TaskResult("failed", error_category="hermes_diagnosis_failed",
+                                 summary=f"{display}: Hermes could not complete a diagnosis.")
+        if s == "cancelled":
+            if incident_id:
+                _incident_update(incident_id, status="hermes_cancelled")
+            return ts.TaskResult("cancelled", summary=f"{display}: Hermes job cancelled.")
+        if s == "paused_auth":
+            if incident_id:
+                _incident_update(incident_id, status="hermes_paused_auth")
+            return ts.TaskResult("paused_auth",
+                                 summary="Hermes needs a provider credential refresh on razr.")
+        if s == "paused_quota":
+            if incident_id:
+                _incident_update(incident_id, status="hermes_paused_quota")
+            return ts.TaskResult("paused_quota",
+                                 summary="Hermes budget/quota exhausted for today.")
+        await asyncio.sleep(hh.POLL_SECS)
+
+
+async def _hermes_on_cancel(row: dict):
+    import homelab_hermes as hh
+    ext = row.get("external_ref")
+    if ext:
+        try:
+            await hh.cancel_job(ext)
+        except Exception:
+            pass
+
+
+def _maybe_register_hermes() -> bool:
+    try:
+        import homelab_hermes as hh  # noqa: F401
+        import task_supervisor as ts
+    except Exception:
+        return False
+    ts.register_type(ts.TaskType(
+        name="hermes_escalation", handler=_hermes_handler, permission="boss",
+        capabilities=frozenset({"hermes_bridge"}),
+        default_timeout=int(os.getenv("HERMES_TASK_TIMEOUT_SECS", "900")),
+        max_retries=0, reattach=True, priority=10,
+        on_cancel=_hermes_on_cancel,
+        title=lambda i: f"Hermes escalation: {i.get('asset', '?')}",
+    ))
+    return True
+
+
+def _resolve_incident_ref(ident: str) -> Optional[dict]:
+    """Accept a Loki incident_id (hi_...), a Loki task_id (lt_...), or a raw
+    Hermes bridge job id (hj_...) and resolve to the incident row."""
+    ident = (ident or "").strip()
+    if not ident:
+        return None
+    inc = get_incident(ident)
+    if inc:
+        return inc
+    r = _db().execute(
+        "SELECT * FROM incidents WHERE hermes_task_id=? OR hermes_job_id=? "
+        "ORDER BY created_at DESC LIMIT 1", (ident, ident)).fetchone()
+    return dict(r) if r else None
 
 
 def _attempts_for(asset: dict) -> list[dict]:
@@ -487,22 +682,30 @@ async def _incident_handler(h):
     elif result.get("escalate"):
         bundle = build_escalation_bundle(asset, inp.get("symptom", ""), result,
                                          ops, _attempts_for(asset))
-        fields["status"] = "escalated"
         fields["bundle_json"] = json.dumps(bundle)
-        delivery = await hermes_handoff(bundle)
-        fields["hermes_json"] = json.dumps(delivery)
-        handoff_note = ("handed to Hermes on razr." if delivery.get("delivered")
-                        else "diagnostic bundle saved for escalation.")
-        summary = (f"{name}: {result.get('diagnosis', '')} I did not attempt a "
-                   f"risky fix — {handoff_note}")
+        status_word, extra = await _escalate_to_hermes(
+            asset, inp.get("symptom", ""), bundle, incident_id, h.row)
+        if status_word == "escalating_to_hermes":
+            fields["status"] = status_word
+            fields.update(extra)
+            summary = (f"{name}: {result.get('diagnosis', '')} No deterministic fix "
+                       f"— handing this to a closer look now. I'll follow up here.")
+        else:
+            fields["status"] = "escalated"
+            delivery = await hermes_handoff(bundle)
+            fields["hermes_json"] = json.dumps(delivery)
+            handoff_note = ("handed to Hermes on razr." if delivery.get("delivered")
+                            else "diagnostic bundle saved for escalation.")
+            summary = (f"{name}: {result.get('diagnosis', '')} I did not attempt a "
+                       f"risky fix — {handoff_note}")
     else:
         fields["status"] = "failed"
         summary = f"{name}: {result.get('diagnosis', 'diagnosis inconclusive')}"
 
     _incident_update(incident_id, **fields)
-    status = "completed" if fields["status"] in ("healthy", "repaired") else \
-        ("completed" if fields["status"] in ("awaiting_approval", "escalated")
-         else "failed")
+    status = "completed" if fields["status"] in (
+        "healthy", "repaired", "awaiting_approval", "escalated",
+        "escalating_to_hermes") else "failed"
     return ts.TaskResult(status, summary=summary[:780])
 
 
@@ -654,6 +857,177 @@ async def _tool_runbook_list(args: dict, ctx: ToolContext) -> str:
                        "policy": {"auto": sorted(a for a, t in policy.ACTION_TIERS.items() if t == policy.AUTO),
                                   "approval": sorted(a for a, t in policy.ACTION_TIERS.items() if t == policy.APPROVAL),
                                   "manual": sorted(a for a, t in policy.ACTION_TIERS.items() if t == policy.MANUAL)}})
+
+
+# ── Hermes escalation tools (all Boss-only) ─────────────────────────────────
+async def _tool_hermes_diagnose(args: dict, ctx: ToolContext) -> str:
+    """Boss-only escalation entry point for a problem no deterministic runbook
+    recognizes. ALWAYS re-runs the asset's own runbook read-only FIRST — Hermes
+    is reached only when that runbook itself reports the failure as unfamiliar
+    (escalate=True). This makes 'a known runbook never calls Hermes' true in
+    code, not merely by prompt instruction."""
+    import homelab_hermes as hh
+    if not hh.enabled:
+        return json.dumps({"ok": False, "error": "Hermes escalation isn't configured"})
+    asset, err = _resolve_or_error(args.get("asset"))
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    symptom = redact(str(args.get("symptom", "")))[:300]
+    incident_id = str(args.get("incident_id") or "").strip() or ("hi_" + uuid.uuid4().hex[:12])
+    name = asset.get("display_name", asset["key"])
+
+    try:
+        result, ops = await run_runbook(asset, allow_repairs=False)
+    except policy.PolicyError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+    if not result.get("escalate"):
+        # The deterministic runbook already answered this — never call Hermes.
+        return json.dumps({
+            "ok": True, "used_hermes": False,
+            "say_now": f"Checking {name} now.",
+            "healthy": result.get("healthy", False),
+            "diagnosis": redact(result.get("diagnosis", ""))[:400],
+            "note": "The deterministic runbook already resolved this — summarize the "
+                    "diagnosis/healthy fields yourself; Hermes was not needed."})
+
+    now = time.time()
+    _db().execute(
+        "INSERT OR IGNORE INTO incidents (incident_id, task_id, asset, symptom,"
+        " status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        (incident_id, "", asset["key"], symptom, "diagnosing", now, now))
+    _db().commit()
+    bundle = build_escalation_bundle(asset, symptom, result, ops, _attempts_for(asset))
+    _incident_update(incident_id, bundle_json=json.dumps(bundle))
+
+    origin_row = {"requester_id": str(ctx.user_id), "requester_name": ctx.user_name,
+                  "channel_id": ctx.channel_id}
+    status_word, extra = await _escalate_to_hermes(asset, symptom, bundle, incident_id, origin_row)
+    if status_word != "escalating_to_hermes":
+        return json.dumps({"ok": False, "error": "Hermes escalation task type unavailable"})
+    _incident_update(incident_id, status=status_word, **extra)
+
+    return json.dumps({
+        "ok": True, "used_hermes": True, "incident_id": incident_id,
+        "task_id": extra.get("hermes_task_id"),
+        "say_now": f"Checking {name} now — this one needs a closer look.",
+        "note": ("No runbook matched, so this is running as a background Hermes "
+                 "diagnosis (starts on the faster model, escalates to a stronger one "
+                 "only if needed). I'll post updates here. Reply with the say_now "
+                 "text only — no generic troubleshooting advice.")})
+
+
+async def _tool_hermes_job_status(args: dict, ctx: ToolContext) -> str:
+    import homelab_hermes as hh
+    inc = _resolve_incident_ref(str(args.get("job_id", "")))
+    if inc is None:
+        return json.dumps({"ok": False, "error": "no Hermes job for that id"})
+    out = {"ok": True, "asset": inc["asset"], "status": inc["status"],
+           "symptom": inc["symptom"]}
+    diagnosis = json.loads(inc.get("hermes_diagnosis_json") or "null")
+    if diagnosis:
+        out["diagnosis"] = {k: (redact(v) if isinstance(v, str) else v)
+                            for k, v in diagnosis.items()}
+    proposals = json.loads(inc.get("hermes_proposals_json") or "[]")
+    if proposals:
+        out["proposals"] = proposals
+    if inc.get("hermes_job_id") and hh.enabled:
+        try:
+            job = await hh.get_job(inc["hermes_job_id"])
+            out["live_state"] = job.get("state")
+            out["cost_usd"] = job.get("cost_usd")
+            out["escalated"] = job.get("escalated", False)
+        except hh.HermesBridgeError as e:
+            out["live_state_error"] = str(e)
+    out["note"] = ("Summarize this for the user in your own voice — never quote "
+                   "Hermes verbatim, and never paste this into an unrelated message.")
+    return json.dumps(out)
+
+
+async def _tool_hermes_job_cancel(args: dict, ctx: ToolContext) -> str:
+    import task_supervisor as ts
+    inc = _resolve_incident_ref(str(args.get("job_id", "")))
+    if inc is None or not inc.get("hermes_task_id"):
+        return json.dumps({"ok": False, "error": "no active Hermes job for that id"})
+    return await ts._tool_cancel({"task_id": inc["hermes_task_id"]}, ctx)
+
+
+async def _tool_hermes_escalate(args: dict, ctx: ToolContext) -> str:
+    """Turn a Hermes-proposed fix into a Loki approval draft. Hermes itself
+    never executes anything — this is the ONLY path from a Hermes diagnosis to
+    a real state change, and it always goes through the existing draft gate."""
+    inc = _resolve_incident_ref(str(args.get("job_id", "")))
+    if inc is None:
+        return json.dumps({"ok": False, "error": "no Hermes job for that id"})
+    diagnosis = json.loads(inc.get("hermes_diagnosis_json") or "null")
+    if not diagnosis:
+        return json.dumps({"ok": False, "error": "Hermes hasn't produced a diagnosis yet"})
+    proposed = str(diagnosis.get("proposed_action", "")).strip()
+    risk = diagnosis.get("risk_level", "manual")
+    if not proposed or proposed.lower() == "none":
+        return json.dumps({"ok": True,
+                           "note": "Hermes found no action is needed — nothing to approve."})
+    if risk == policy.MANUAL:
+        return json.dumps({"ok": False,
+                           "error": "Hermes' proposed action is MANUAL-tier — I will not "
+                                    "stage this for approval; it needs your hands directly."})
+    if risk == policy.AUTO:
+        return json.dumps({"ok": True,
+                           "note": "That diagnosis was read-only (no state change proposed) "
+                                    "— nothing to approve."})
+    payload = {"incident_id": inc["incident_id"], "diagnosis_hash": _hash_diagnosis(diagnosis)}
+    return await tools.execute("hermes_apply_action", json.dumps(payload), ctx)
+
+
+# ── Hermes-proposed action execution (approval-gated; never auto-applies) ──
+def _hermes_apply_prepare(args: dict, ctx: ToolContext):
+    incident_id = str(args.get("incident_id", "")).strip()
+    inc = get_incident(incident_id)
+    if inc is None:
+        return {}, "", "no such incident"
+    diagnosis = json.loads(inc.get("hermes_diagnosis_json") or "null")
+    if not diagnosis:
+        return {}, "", "incident has no Hermes diagnosis"
+    if _hash_diagnosis(diagnosis) != args.get("diagnosis_hash"):
+        return {}, "", ("Hermes' diagnosis changed since this was proposed — "
+                        "re-check hermes_job_status")
+    summary = (f"{inc['asset']}: {diagnosis.get('proposed_action', '')} "
+              f"(Hermes-proposed, incident {incident_id})")[:400]
+    return ({"incident_id": incident_id, "diagnosis_hash": args.get("diagnosis_hash")},
+            summary, "")
+
+
+async def _hermes_apply_handler(payload: dict, ctx: ToolContext) -> str:
+    """Runs only via tools.run_approved() after a draft is approved. Hermes
+    never executes anything itself: if its diagnosis names a registered
+    runbook that now applies, this delegates to that runbook's OWN verified
+    repair path (the same one homelab_repair uses); otherwise it records the
+    Boss's approval for manual follow-through. A Hermes proposal's free text
+    is NEVER run as a command — there is no allowlisted way to do that."""
+    inc = get_incident(payload.get("incident_id", ""))
+    if inc is None:
+        raise KeyError("incident vanished")
+    diagnosis = json.loads(inc.get("hermes_diagnosis_json") or "null")
+    if not diagnosis or _hash_diagnosis(diagnosis) != payload.get("diagnosis_hash"):
+        raise ValueError("Hermes diagnosis hash mismatch — refusing to execute")
+    matching = diagnosis.get("matching_runbook")
+    asset = _reg().get(inc["asset"])
+    if matching and asset and asset.get("runbook") == matching:
+        result, ops = await run_runbook(asset, allow_repairs=True)
+        rr = result.get("repair_result")
+        _incident_update(inc["incident_id"],
+                         status="repaired" if (rr and rr.get("ok")) or
+                                result.get("healthy") else "hermes_needs_approval")
+        if result.get("healthy"):
+            return "already healthy — nothing left to repair"
+        if rr and rr.get("ok"):
+            return f"repaired and verified: {'; '.join(rr.get('steps', []))}"
+        return ("approved, but the runbook's own preconditions no longer hold — "
+                "re-diagnose before trying again")
+    _incident_update(inc["incident_id"], status="hermes_approved_manual")
+    return ("approved — Hermes' proposed action has no automated path (it wasn't a "
+            "registered runbook fix), so this needs to be carried out by hand: "
+            f"{redact(diagnosis.get('proposed_action', ''))[:300]}")
 
 
 # ── Container update inventory (read-only) ─────────────────────────────────
@@ -880,6 +1254,62 @@ def _register_tools():
         action_type="homelab_repair", approval_ttl=1800,
         prepare=_apply_repair_prepare,
     ))
+    register(ToolSpec(
+        name="hermes_diagnose",
+        description=(
+            "Escalate a homelab problem to Hermes (a restricted, read-only "
+            "escalation specialist on razr) when NO deterministic runbook "
+            "recognizes it — e.g. 'diagnose this unusual Docker error'. This "
+            "ALWAYS re-checks the asset's own deterministic runbook first and "
+            "will refuse to call Hermes if that runbook can already answer the "
+            "problem, so prefer homelab_diagnose for anything that sounds like "
+            "a known failure (BLACK-BOXX/AP connectivity, a service being down). "
+            "Hermes only diagnoses and proposes — it never changes anything."),
+        parameters=_p({"asset": {"type": "string", "description": "asset name or alias"},
+                       "symptom": {"type": "string",
+                                   "description": "the problem as the Boss stated it"},
+                       "incident_id": {"type": "string",
+                                       "description": "optional — reuse an existing incident"}},
+                      ["asset", "symptom"]),
+        handler=_tool_hermes_diagnose, permission="boss", timeout=90,
+    ))
+    register(ToolSpec(
+        name="hermes_job_status",
+        description=("Status/diagnosis of a Hermes escalation by incident id, "
+                     "task id, or Hermes job id. Use when asked 'what did Hermes "
+                     "find?' — summarize the result yourself, never quote it "
+                     "verbatim, and never mention this in an unrelated reply."),
+        parameters=_p({"job_id": {"type": "string"}}, ["job_id"]),
+        handler=_tool_hermes_job_status, permission="boss", timeout=20,
+    ))
+    register(ToolSpec(
+        name="hermes_job_cancel",
+        description="Cancel a running Hermes escalation by incident/task/job id.",
+        parameters=_p({"job_id": {"type": "string"}}, ["job_id"]),
+        handler=_tool_hermes_job_cancel, permission="boss", timeout=35,
+    ))
+    register(ToolSpec(
+        name="hermes_escalate",
+        description=(
+            "Stage Hermes' proposed fix as an approval draft — the ONLY way a "
+            "Hermes diagnosis can lead to an actual change. Hermes itself never "
+            "executes anything. Refuses outright if the proposal is MANUAL-tier; "
+            "read-only diagnoses have nothing to approve. Use only on explicit "
+            "Boss confirmation to move forward."),
+        parameters=_p({"job_id": {"type": "string"}}, ["job_id"]),
+        handler=_tool_hermes_escalate, permission="boss", timeout=30,
+    ))
+    register(ToolSpec(
+        name="hermes_apply_action",
+        description=("INTERNAL: approval-gated execution of a Hermes-proposed "
+                     "action. Prefer hermes_escalate, which routes here."),
+        parameters=_p({"incident_id": {"type": "string"},
+                       "diagnosis_hash": {"type": "string"}},
+                      ["incident_id", "diagnosis_hash"]),
+        handler=_hermes_apply_handler, permission="boss", timeout=180,
+        action_type="hermes_repair", approval_ttl=1800,
+        prepare=_hermes_apply_prepare,
+    ))
 
 
 try:
@@ -891,6 +1321,9 @@ except Exception as e:
 if enabled:
     _db()
     _task_type_ok = _register_task_type()
+    _hermes_type_ok = _maybe_register_hermes()
     _register_tools()
-    log.info("homelab maintenance online — %d asset(s), incident task type %s",
-             len(_reg().assets), "ready" if _task_type_ok else "UNAVAILABLE")
+    log.info("homelab maintenance online — %d asset(s), incident task type %s, "
+             "Hermes escalation %s",
+             len(_reg().assets), "ready" if _task_type_ok else "UNAVAILABLE",
+             "ready" if _hermes_type_ok else "unavailable (bridge not configured)")

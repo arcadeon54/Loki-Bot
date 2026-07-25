@@ -205,6 +205,14 @@ except Exception as _hm_err:
         f"homelab maintenance unavailable: {_hm_err}")
 
 try:
+    import homelab_hermes  # side effect: none — homelab_maintenance imports it lazily
+    _homelab_hermes_available = True
+except Exception as _hh_err:
+    _homelab_hermes_available = False
+    logging.getLogger("HomelabHermes").warning(
+        f"hermes escalation client unavailable: {_hh_err}")
+
+try:
     import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
     _skill_bridge_available = True
 except Exception as _sb_err:
@@ -5296,6 +5304,14 @@ async def on_ready():
                                  interface_restart=_iface_restart)
         log.info("Homelab maintenance online — %d assets",
                  len(homelab_maintenance._reg().assets))
+
+    # Hermes escalation client — shares the same HTTP session; the bridge on
+    # razr decides everything else (models, budget, escalation gate).
+    if _homelab_hermes_available:
+        homelab_hermes.bind(get_http_session)
+        log.info("Hermes escalation client online — %s",
+                 "bridge configured" if homelab_hermes.enabled
+                 else "HERMES_WORKER_URL/TOKEN not set, inactive")
 
     # Memory lifecycle — bind the ECONOMICAL model (Groq fallback, never Opus),
     # migrate metadata once (backs up first), and schedule a WEEKLY dry-run
