@@ -128,6 +128,8 @@ class Registry:
                 vals["path"].add(str(docker["compose_file"]))
             if docker.get("image"):
                 vals["image"].add(str(docker["image"]))
+            if docker.get("env_file"):
+                vals["path"].add(str(docker["env_file"]))
             systemd = asset.get("systemd") or {}
             for v in systemd.values():
                 vals["unit"].add(str(v))
@@ -135,7 +137,24 @@ class Registry:
             for v in mounts.values():
                 for p in (v if isinstance(v, list) else [v]):
                     vals["path"].add(str(p))
+            # Update-workflow paths: backup destination and any config tree an
+            # update copies before recreating. Declared here so the policy
+            # allowlist accepts them and nothing else.
+            upd = asset.get("updates") or {}
+            backup = upd.get("backup") or {}
+            if backup.get("dir"):
+                vals["path"].add(str(backup["dir"]))
+            for p in backup.get("config_paths") or []:
+                vals["path"].add(str(p))
+            for img in upd.get("versioned_images") or []:
+                # Repository without a tag; the exact pinned ref is added at
+                # runtime once a specific version has been approved.
+                vals["image"].add(str(img))
         return vals
+
+    def update_spec(self, asset: dict) -> dict:
+        """The asset's `updates:` block, or {} when it isn't update-managed."""
+        return asset.get("updates") or {}
 
 
 _cached: Registry | None = None

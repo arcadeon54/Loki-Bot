@@ -79,6 +79,12 @@ _PARAM_SHAPES = {
     "num":          re.compile(r"^\d{1,5}$"),
     "probe_ip":     re.compile(r"^\d{1,3}(\.\d{1,3}){3}$"),
     "unit":         re.compile(r"^[A-Za-z0-9@_.-]{1,64}$"),
+    # Postgres role / database identifier, read from the asset's compose env
+    # file at runtime (never model or user input) and registered via
+    # add_runtime_values("dbident", …).
+    "dbident":      re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$"),
+    # A single compose service name from the asset's own registry entry.
+    "service":      re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"),
 }
 
 _COMMANDS: dict[str, dict] = {
@@ -111,7 +117,57 @@ _COMMANDS: dict[str, dict] = {
                                   "ps", "--format", "json"]},
     "df_path":          {"argv": ["df", "-h", "--output=target,size,avail,pcent",
                                   "{path}"]},
+    # Machine-readable free bytes, for the pre-update disk-space gate.
+    "df_path_bytes":    {"argv": ["df", "-B1", "--output=avail", "{path}"]},
     "systemctl_is_active": {"argv": ["systemctl", "is-active", "{unit}"]},
+
+    # ── update inventory / pre-flight (all read-only) ──────────────────
+    # Resolved image list for a compose project, so the inventory reflects
+    # what compose would actually run rather than what happens to be up.
+    "compose_config_images":
+        {"argv": ["docker", "compose", "-f", "{compose_file}", "config", "--images"]},
+    "compose_config_validate":
+        {"argv": ["docker", "compose", "-f", "{compose_file}", "config", "--quiet"]},
+    # Is another agent (watchtower/diun) already managing updates?
+    "docker_ps_names":
+        {"argv": ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}"]},
+    "pg_isready":
+        {"argv": ["docker", "exec", "{container}", "pg_isready",
+                  "-U", "{dbident}", "-d", "{dbident2}"]},
+    # Datachecksum-failure count: the same signal the compose healthcheck uses.
+    "pg_checksum_failures":
+        {"argv": ["docker", "exec", "{container}", "psql", "-U", "{dbident}",
+                  "-d", "{dbident2}", "--tuples-only", "--no-align",
+                  "--command",
+                  "SELECT COALESCE(SUM(checksum_failures), 0) FROM pg_stat_database"]},
+    "pg_database_size":
+        {"argv": ["docker", "exec", "{container}", "psql", "-U", "{dbident}",
+                  "-d", "{dbident2}", "--tuples-only", "--no-align",
+                  "--command", "SELECT pg_database_size(current_database())"]},
+
+    # ── update actions (approval-gated by the runbook's tier) ──────────
+    # Pull an EXACT pinned image ref. Moving tags are resolved to a concrete
+    # version before this runs, so what gets pulled is what was approved.
+    "docker_pull_image":
+        {"argv": ["docker", "pull", "{image}"], "repair": True},
+    # Recreate one compose project only — never `-p` across projects.
+    "compose_up_project":
+        {"argv": ["docker", "compose", "-f", "{compose_file}", "up", "-d",
+                  "--no-deps", "{service}"], "repair": True},
+    "compose_up_all":
+        {"argv": ["docker", "compose", "-f", "{compose_file}", "up", "-d"],
+         "repair": True},
+    # Verified Postgres dump. stdout is streamed straight to a file by the Ops
+    # facade (no shell, no redirection in the command itself).
+    "pg_dump_custom":
+        {"argv": ["docker", "exec", "{container}", "pg_dump", "-U", "{dbident}",
+                  "-d", "{dbident2}", "--format=custom", "--compress=6"],
+         "repair": True},
+    # Verification of the dump above: pg_restore parses the archive TOC from
+    # stdin and fails on a truncated or corrupt file.
+    "pg_restore_list":
+        {"argv": ["docker", "exec", "-i", "{container}", "pg_restore", "--list"],
+         "repair": True},
 
     # ── repairs (still template-locked; tier enforced by the runbook) ──
     "ip_rule_add_fwmark":
@@ -131,6 +187,14 @@ _COMMANDS: dict[str, dict] = {
         {"argv": ["sudo", "-n", "systemctl", "restart", "{unit}"],
          "repair": True},
 }
+
+# Commands that only READ, even though some are spawned during an update.
+# Kept explicit so `repair: True` never becomes a proxy for "dangerous", and
+# so a dry-run inventory can prove it touched nothing.
+READ_ONLY_DURING_UPDATE = frozenset({
+    "compose_config_images", "compose_config_validate", "docker_ps_names",
+    "pg_isready", "pg_checksum_failures", "pg_database_size", "df_path_bytes",
+})
 
 _PLACEHOLDER_RE = re.compile(r"^\{([a-z_]+?)(\d*)\}$")
 

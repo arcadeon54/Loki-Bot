@@ -66,6 +66,21 @@ assets:
       compose_file: /home/g2k247/PrivacyServer/docker-compose.yml
       compose_service: jellyfin
       image: lscr.io/linuxserver/jellyfin:latest
+    updates:
+      runbook: stateless_update   # generic lower-risk workflow
+      release_source: github:jellyfin/jellyfin
+      tag_style: moving           # ':latest' — an approved update pins a digest
+      versioned_images:
+        - lscr.io/linuxserver/jellyfin
+      backup:
+        required: true            # config only; no database dump needed
+        dir: /home/g2k247/backups/jellyfin-updates
+        min_free_gb: 2
+        # Copied before recreate so a bad update can be reverted config-first.
+        config_paths:
+          - /home/g2k247/PrivacyServer/config/jellyfin
+      estimated_interruption: "under a minute (playback sessions drop)"
+      migration_makes_rollback_unsafe: false
     health:
       local_url: http://127.0.0.1:8096/health
       public_url: https://jfin.ivn-group.cc   # via nginx-proxy-manager
@@ -127,6 +142,7 @@ assets:
     docker:
       compose_project: immich
       compose_file: /home/g2k247/immich/docker-compose.yml
+      env_file: /home/g2k247/immich/.env
       containers:
         - immich_server
         - immich_machine_learning
@@ -135,3 +151,35 @@ assets:
     health:
       local_url: http://127.0.0.1:2283/api/server/ping
       public_url: https://immich.ivn-group.cc  # via nginx-proxy-manager
+    updates:
+      runbook: immich_update      # module in maintenance_runbooks/
+      # Where authoritative release metadata comes from. Digests and this
+      # feed decide an update — never image age on its own.
+      release_source: github:immich-app/immich
+      version_api: http://127.0.0.1:2283/api/server/version
+      # The compose file defaults to the MOVING ':release' tag. An approved
+      # update pins this env var to an exact version first, so what is pulled
+      # is what was approved, and so a rollback has a concrete target.
+      version_env: IMMICH_VERSION
+      tag_style: moving           # currently unpinned — see report
+      # Only these images are version-pinned by an Immich update. redis and
+      # postgres are pinned in-compose and are NOT touched by this runbook:
+      # a Postgres major-version change is a manual migration, never automatic.
+      versioned_images:
+        - ghcr.io/immich-app/immich-server
+        - ghcr.io/immich-app/immich-machine-learning
+      database:
+        container: immich_postgres
+        # Read from the compose env_file at runtime; never stored here.
+        user_env: DB_USERNAME
+        name_env: DB_DATABASE_NAME
+        data_path_env: DB_DATA_LOCATION
+      backup:
+        required: true
+        # Postgres dump + compose/env copy land here before anything changes.
+        dir: /home/g2k247/backups/immich-updates
+        min_free_gb: 5
+      estimated_interruption: "2-5 minutes (photo access offline while containers recreate)"
+      # A schema migration that has already run cannot be undone by pulling the
+      # old image back. When one has run, rollback is refused, not attempted.
+      migration_makes_rollback_unsafe: true

@@ -74,6 +74,29 @@ def bind(session_factory=None, interface_status=None, interface_restart=None):
     _interface_restart = interface_restart
 
 
+def _declared_backup_dirs() -> list[str]:
+    """Backup destinations declared by the registry's `updates.backup.dir`."""
+    out = []
+    for asset in _reg().assets.values():
+        d = ((asset.get("updates") or {}).get("backup") or {}).get("dir")
+        if d:
+            out.append(os.path.realpath(str(d)))
+    return out
+
+
+def _under_declared_backup_dir(path: str) -> bool:
+    """True when `path` sits inside a declared backup directory. Uses realpath
+    so a symlink or `..` cannot escape the allowed tree."""
+    try:
+        target = os.path.realpath(os.path.abspath(str(path)))
+    except (OSError, ValueError):
+        return False
+    for base in _declared_backup_dirs():
+        if target == base or target.startswith(base + os.sep):
+            return True
+    return False
+
+
 def _reg() -> homelab_assets.Registry:
     global _registry
     if _registry is None:
@@ -238,13 +261,67 @@ class Ops:
             self.log_excerpt = redact(text)[-LOG_EXCERPT_CAP:]
         return proc.returncode or 0, text
 
+    async def run_to_file(self, name: str, out_path: str, **params) -> tuple[int, str]:
+        """Run an allowlisted command with stdout streamed straight to a file.
+
+        Used for database dumps: keeps a multi-gigabyte archive out of memory
+        AND avoids a shell, so there is still no redirection operator anywhere
+        a caller could influence. The destination must be inside a
+        registry-declared backup directory."""
+        if not self.allow_repairs and policy.is_repair_command(name):
+            raise policy.PolicyError(
+                f"repair command '{name}' refused in read-only mode")
+        if not _under_declared_backup_dir(out_path):
+            raise policy.PolicyError(
+                "backup destination is not a registry-declared backup directory")
+        argv = policy.build_command(name, **params)
+        self.commands_run.append({"name": name, "params": params,
+                                  "stdout_to": out_path})
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as fh:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdout=fh, stderr=asyncio.subprocess.PIPE)
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(), CMD_TIMEOUT * 30)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return 124, f"command '{name}' timed out"
+        return proc.returncode or 0, err.decode(errors="replace")[:OUTPUT_CAP]
+
+    async def run_from_file(self, name: str, in_path: str, **params) -> tuple[int, str]:
+        """Run an allowlisted command with stdin read from a file (dump
+        verification). Read-only with respect to the source file."""
+        if not self.allow_repairs and policy.is_repair_command(name):
+            raise policy.PolicyError(
+                f"repair command '{name}' refused in read-only mode")
+        if not _under_declared_backup_dir(in_path):
+            raise policy.PolicyError(
+                "input file is not inside a registry-declared backup directory")
+        argv = policy.build_command(name, **params)
+        self.commands_run.append({"name": name, "params": params,
+                                  "stdin_from": in_path})
+        with open(in_path, "rb") as fh:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdin=fh, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), CMD_TIMEOUT * 10)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return 124, f"command '{name}' timed out"
+        return proc.returncode or 0, out.decode(errors="replace")[:OUTPUT_CAP]
+
     async def http_get(self, url: str, timeout: int = HTTP_TIMEOUT):
-        """GET one of the registry-declared health endpoints. Any other URL
-        is refused — runbooks cannot be used as a generic HTTP client."""
+        """GET one of the registry-declared endpoints (health, or an asset's
+        own version API). Any other URL is refused — runbooks cannot be used
+        as a generic HTTP client."""
         allowed = set()
         for asset in _reg().assets.values():
             h = asset.get("health") or {}
             allowed.update(v for v in (h.get("local_url"), h.get("public_url")) if v)
+            u = asset.get("updates") or {}
+            if u.get("version_api"):
+                allowed.add(u["version_api"])
         if url not in allowed:
             raise policy.PolicyError(f"URL not declared in the asset registry")
         import aiohttp
@@ -1231,17 +1308,13 @@ def _register_tools():
         parameters=_p({"asset": {"type": "string"}}, []),
         handler=_tool_runbook_list, permission="boss", timeout=15,
     ))
-    register(ToolSpec(
-        name="container_update_status",
-        description=("Read-only container update inventory for registry-known "
-                     "services: current vs registry digest, exposure, "
-                     "stateful classification, and whether an update needs "
-                     "approval/backup. Never updates anything."),
-        parameters=_p({"service": {"type": "string",
-                                   "description": "one container/asset, or empty for all"}},
-                      []),
-        handler=_tool_update_status, permission="boss", timeout=120,
-    ))
+    # NOTE: the update inventory tool is registered by container_updates.py as
+    # `container_update_inventory`, which supersedes this one (it adds release
+    # metadata, breaking-change and migration flags, risk and a recommendation).
+    # _tool_update_status / _update_status_for stay here as the shared
+    # digest-comparison primitive that module and homelab_api.py both build on;
+    # only the duplicate tool registration is dropped, so the model is never
+    # offered two overlapping inventories.
     register(ToolSpec(
         name="homelab_apply_repair",
         description=("INTERNAL: approval-gated execution of a stored incident "

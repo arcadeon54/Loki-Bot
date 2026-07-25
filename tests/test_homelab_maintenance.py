@@ -245,11 +245,14 @@ class AllowlistTests(Base):
 # ── Authorization ───────────────────────────────────────────────────────────
 class AuthzTests(Base):
     def test_all_homelab_tools_are_boss_only(self):
+        # The update inventory tool moved to container_updates.py as
+        # `container_update_inventory`; the old duplicate is deliberately
+        # no longer registered (see homelab_maintenance._register_tools).
         for name in ("homelab_diagnose", "homelab_status",
                      "homelab_incident_status", "homelab_repair",
-                     "homelab_runbook_list", "container_update_status",
-                     "homelab_apply_repair"):
+                     "homelab_runbook_list", "homelab_apply_repair"):
             self.assertEqual(tools.REGISTRY[name].permission, "boss", name)
+        self.assertNotIn("container_update_status", tools.REGISTRY)
 
     def test_crew_execution_denied(self):
         out = run(tools.execute("homelab_diagnose",

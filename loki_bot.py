@@ -213,6 +213,14 @@ except Exception as _hh_err:
         f"hermes escalation client unavailable: {_hh_err}")
 
 try:
+    import container_updates  # side effect: registers approval-gated update tools
+    _container_updates_available = container_updates.enabled
+except Exception as _cu_err:
+    _container_updates_available = False
+    logging.getLogger("ContainerUpdates").warning(
+        f"container updates unavailable: {_cu_err}")
+
+try:
     import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
     _skill_bridge_available = True
 except Exception as _sb_err:
@@ -5312,6 +5320,12 @@ async def on_ready():
         log.info("Hermes escalation client online — %s",
                  "bridge configured" if homelab_hermes.enabled
                  else "HERMES_WORKER_URL/TOKEN not set, inactive")
+
+    # Container updates — read-only inventory plus approval-gated update and
+    # rollback workflows. Uses homelab_maintenance's bound session for release
+    # metadata, so nothing extra to wire here.
+    if _container_updates_available:
+        log.info("Container updates online — inventory + approval-gated updates")
 
     # Memory lifecycle — bind the ECONOMICAL model (Groq fallback, never Opus),
     # migrate metadata once (backs up first), and schedule a WEEKLY dry-run
