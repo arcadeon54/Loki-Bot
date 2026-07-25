@@ -39,6 +39,10 @@ enabled = bool(WORKER_URL and WORKER_TOKEN)
 DISCORD_LIMIT = 10 * 1024 * 1024
 TELEGRAM_LIMIT = 50 * 1024 * 1024
 
+# How much verbatim extracted text the completion summary carries. Kept modest
+# so the mandatory truncation notice always survives the supervisor's summary cap.
+SNIPPET_CHARS = 300
+
 _session_factory = None   # async () -> aiohttp.ClientSession
 _send = None              # async (channel_id, text, file_path=None, filename=None)
 
@@ -158,20 +162,40 @@ async def _handler(h):
 
     title = data.get("title") or url
     final = data.get("final_url") or url
-    text = data.get("text") or ""
+    text = (data.get("text") or "").strip()
     shot_sent = False
     if want_shot and data.get("screenshot") and channel_id:
         try:
             shot_sent = await _deliver_screenshot(channel_id, title, data["screenshot"])
         except Exception:
             log.exception("screenshot delivery failed")
-    snippet = text[:400].strip()
-    summary = f"{title} — {final}" + (f" · {snippet}" if snippet else "")
+
+    # Grounding: the summary carries ONLY text the worker actually extracted, and
+    # never presents a fragment as the complete page. The worker caps page text
+    # (data["truncated"]); our own snippet caps it further. If either clipped the
+    # content, say so explicitly and forbid reconstructing the rest from memory —
+    # a truncated quote must never be relabelled a "full quote".
+    snippet = text[:SNIPPET_CHARS].strip()
+    clipped = bool(data.get("truncated")) or len(text) > SNIPPET_CHARS
+
+    parts = [f"{title} — {final}"]
+    if snippet:
+        label = "extracted page text (verbatim, PARTIAL)" if clipped \
+            else "extracted page text (verbatim)"
+        parts.append(f'{label}: "{snippet}"')
+        if clipped:
+            parts.append(
+                "[captured text was TRUNCATED — this is only the start of the page, "
+                "not the complete page text; do not complete any quote or fill in the "
+                "rest from memory. Anything beyond the verbatim text above is inference, "
+                "not extracted content, and must be labelled as such.]")
+    else:
+        parts.append("no readable text was extracted from the page")
     if data.get("screenshot_refused"):
-        summary += " (screenshot not allowed for this host)"
+        parts.append("screenshot not allowed for this host")
     elif shot_sent:
-        summary += " · screenshot posted"
-    return ts.TaskResult("completed", summary=summary[:800])
+        parts.append("screenshot posted")
+    return ts.TaskResult("completed", summary=" · ".join(parts)[:1000])
 
 
 def _register_task_type():

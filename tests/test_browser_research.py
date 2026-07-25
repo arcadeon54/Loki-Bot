@@ -153,6 +153,35 @@ class HandlerTests(unittest.TestCase):
             br._extract = orig
         self.assertEqual(res.status, "cancelled")
 
+    def test_truncated_content_is_flagged_not_reconstructed(self):
+        # The worker capped the page text; the summary must say so, keep the text
+        # verbatim, and never present it as the complete page / "full quote".
+        real = ("The world as we have created it is a process of our thinking. "
+                "It cannot be changed without changing our thinking. ") * 8   # > SNIPPET_CHARS
+
+        async def trunc_extract(url, screenshot, timeout_ms=None):
+            return {"title": "Quotes", "final_url": url, "text": real, "truncated": True}
+
+        br.bind(None, None)
+        orig = br._extract
+        br._extract = trunc_extract
+        try:
+            res = run(br._handler(FakeHandle({"url": "https://quotes.example/js"})))
+        finally:
+            br._extract = orig
+
+        s = res.summary
+        low = s.lower()
+        self.assertEqual(res.status, "completed")
+        self.assertIn("truncated", low)                       # states truncation
+        self.assertIn("partial", low)                         # labelled partial, not complete
+        self.assertNotIn("full quote", low)                   # never claims completeness
+        self.assertNotIn("full text", low)
+        # The shown text is a VERBATIM prefix of what was extracted — nothing invented.
+        self.assertIn(real[:120], s)
+        # ...and it is only a prefix (the full text did not fit).
+        self.assertNotIn(real.strip(), s)
+
     def test_worker_error_marks_failed(self):
         async def boom_extract(url, screenshot, timeout_ms=None):
             raise br.BrowserError("bridge unreachable")
