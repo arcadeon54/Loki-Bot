@@ -190,6 +190,13 @@ except Exception as _da_err:
     logging.getLogger("DraftApproval").warning(f"draft approval unavailable: {_da_err}")
 
 try:
+    import browser_research  # side effect: registers browser_research task + tool
+    _browser_research_available = browser_research.enabled
+except Exception as _br_err:
+    _browser_research_available = False
+    logging.getLogger("BrowserResearch").warning(f"browser research unavailable: {_br_err}")
+
+try:
     import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
     _skill_bridge_available = True
 except Exception as _sb_err:
@@ -5244,6 +5251,11 @@ async def on_ready():
         task_supervisor.bind(get_http_session, _channel_send)
         task_supervisor.start()
         log.info("Task supervisor online")
+
+    # Browser research — Loki's client for the scoped RAZR headless-browser worker.
+    if _browser_research_available:
+        browser_research.bind(get_http_session, _channel_send)
+        log.info("Browser research online — RAZR worker at configured URL")
 
     # Memory lifecycle — bind the ECONOMICAL model (Groq fallback, never Opus),
     # migrate metadata once (backs up first), and schedule a WEEKLY dry-run
