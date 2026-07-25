@@ -197,6 +197,14 @@ except Exception as _br_err:
     logging.getLogger("BrowserResearch").warning(f"browser research unavailable: {_br_err}")
 
 try:
+    import homelab_maintenance  # side effect: registers homelab_* tools + incident task type
+    _homelab_available = homelab_maintenance.enabled
+except Exception as _hm_err:
+    _homelab_available = False
+    logging.getLogger("HomelabMaintenance").warning(
+        f"homelab maintenance unavailable: {_hm_err}")
+
+try:
     import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
     _skill_bridge_available = True
 except Exception as _sb_err:
@@ -5230,6 +5238,13 @@ async def on_ready():
                                                     filename=filename)
             else:
                 await _telegram_iface.send(chat_id, text)
+            # Record the delivery in the chat history the LLM sees, so a
+            # finished task's result is never re-delivered into an unrelated
+            # later message (browser-task/BLACK-BOXX regression).
+            try:
+                _telegram_iface.note_outbound(chat_id, text)
+            except Exception:
+                log.debug("telegram outbound history note failed", exc_info=True)
         else:
             channel = (bot.get_channel(int(channel_id))
                        or await bot.fetch_channel(int(channel_id)))
@@ -6104,6 +6119,7 @@ async def on_message(message: discord.Message):
                 user_name=message.author.display_name,
                 channel_id=str(message.channel.id),
                 guild_id=str(message.guild.id) if message.guild else "",
+                message_id=str(message.id),
             )
             reply = await llm.chat_with_tools(messages_for_llm, tool_ctx)
         else:

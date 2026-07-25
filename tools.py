@@ -55,6 +55,10 @@ class ToolContext:
     user_name: str
     channel_id: str = ""
     guild_id: str = ""
+    # Platform message id of the message that triggered this tool call, when
+    # known. Background tasks persist it so their results stay tied to the
+    # originating message instead of leaking into a later conversation turn.
+    message_id: str = ""
 
 
 @dataclass

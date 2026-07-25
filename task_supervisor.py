@@ -65,6 +65,7 @@ _ALLOWED_COLS = {
     "heartbeat_at", "completed_at", "retry_count", "max_retries", "timeout_secs",
     "input_json", "result_summary", "error_category", "error_detail",
     "artifacts_json", "last_announced", "external_ref", "request_id",
+    "origin_message_id", "conversation_id", "priority",
 }
 
 enabled = True  # the supervisor always works — it needs only SQLite
@@ -98,6 +99,9 @@ class TaskType:
     capabilities: frozenset = frozenset()
     default_timeout: int = DEFAULT_TIMEOUT
     max_retries: int = 1
+    # Higher-priority queued tasks start first: a fresh incident diagnosis must
+    # never wait behind an old informational task (e.g. a queued browse).
+    priority: int = 0
     # Handler re-attaches to external work via external_ref instead of
     # re-submitting, so it is safe to re-run after a restart (no duplicates).
     reattach: bool = False
@@ -143,11 +147,21 @@ CREATE TABLE IF NOT EXISTS tasks (
     artifacts_json  TEXT NOT NULL DEFAULT '[]',
     last_announced  TEXT,
     external_ref    TEXT,
-    request_id      TEXT
+    request_id      TEXT,
+    origin_message_id TEXT NOT NULL DEFAULT '',
+    conversation_id   TEXT NOT NULL DEFAULT '',
+    priority          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
 """
+
+# Columns added after the first release — applied to pre-existing DBs.
+_MIGRATIONS = (
+    "ALTER TABLE tasks ADD COLUMN origin_message_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE tasks ADD COLUMN conversation_id   TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE tasks ADD COLUMN priority          INTEGER NOT NULL DEFAULT 0",
+)
 
 _conn: Optional[sqlite3.Connection] = None
 
@@ -159,6 +173,11 @@ def _db() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(_SCHEMA)
+        for mig in _MIGRATIONS:
+            try:
+                _conn.execute(mig)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         _conn.commit()
     return _conn
 
@@ -245,12 +264,15 @@ class TaskHandle:
 
 
 def _pump():
-    """Start queued tasks up to the concurrency limit. Sync + single-threaded."""
+    """Start queued tasks up to the concurrency limit. Sync + single-threaded.
+    Highest priority first (incidents jump ahead of informational tasks),
+    oldest first within a priority."""
     if not _started:
         return
     while len(_running) < MAX_CONCURRENCY:
-        nxt = next((t for t in _query("status='queued'")
-                    if t["task_id"] not in _running), None)
+        queued = sorted(_query("status='queued'"),
+                        key=lambda t: (-(t.get("priority") or 0), t["created_at"]))
+        nxt = next((t for t in queued if t["task_id"] not in _running), None)
         if nxt is None:
             return
         _spawn(nxt["task_id"])
@@ -458,16 +480,29 @@ def submit(tt: TaskType, ctx: ToolContext, clean_input: dict) -> str:
         "timeout_secs": tt.default_timeout,
         "input_json": json.dumps(clean_input),
         "request_id": uuid.uuid4().hex,
+        # Correlation: the task stays tied to the message + conversation that
+        # created it. Internal only — never surfaced in normal replies.
+        "origin_message_id": getattr(ctx, "message_id", "") or "",
+        "conversation_id": ctx.channel_id,
+        "priority": tt.priority,
     })
     log.info("task %s submitted type=%s by=%s", task_id, tt.name, ctx.user_name)
     _pump()
     return task_id
 
 
-def _fmt_task(row: dict) -> str:
+def _fmt_task(row: dict, explicit: bool = False) -> str:
     bits = [f"{row['task_id']} [{row['task_type']}] {row['status']} — {row['title']}"]
     if row["status"] == "completed" and row.get("result_summary"):
-        bits.append(row["result_summary"])
+        # Once the completion notification has been delivered to the chat, a
+        # LIST view must not carry the payload again — an old result would leak
+        # into whatever unrelated message the user sends next. The full result
+        # stays available via task_status (explicit=True).
+        if not explicit and row.get("last_announced") == "completed":
+            bits.append("[result already delivered in this chat — do NOT repeat "
+                        "it; it is unrelated to any new message]")
+        else:
+            bits.append(row["result_summary"])
     elif row["status"] in ("failed", "cancelled") or row["status"] in PAUSED:
         note = row.get("error_detail") or row.get("result_summary") or ""
         cat = row.get("error_category")
@@ -510,7 +545,9 @@ async def _tool_status(args: dict, ctx: ToolContext) -> str:
         return json.dumps({"ok": False, "error": "no such task"})
     if not _can_access(ctx, row):
         return json.dumps({"ok": False, "error": "that task is not yours to view"})
-    return json.dumps({"ok": True, "task": _fmt_task(row)})
+    # Explicitly requested by id → the user is asking about THIS task, so the
+    # stored result may be repeated.
+    return json.dumps({"ok": True, "task": _fmt_task(row, explicit=True)})
 
 
 async def _tool_list(args: dict, ctx: ToolContext) -> str:

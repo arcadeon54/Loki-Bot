@@ -170,6 +170,48 @@ class TelegramInterface:
             log.debug(f"Telegram {method} failed: {e}")
             return None
 
+    async def send_document(self, chat_id: int, file_path: str,
+                            caption: str = "", filename: str | None = None):
+        """Upload a document (multipart — _api is JSON-only). Token stays in
+        the URL only; errors are logged by status/type, never the URL."""
+        if not self.token:
+            return None
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption[:1024])
+        with open(file_path, "rb") as f:
+            form.add_field("document", f,
+                           filename=filename or os.path.basename(file_path))
+            try:
+                sess = await self.session_factory()
+                async with sess.post(
+                    f"https://api.telegram.org/bot{self.token}/sendDocument",
+                    data=form, timeout=aiohttp.ClientTimeout(total=120),
+                ) as r:
+                    data = await r.json(content_type=None)
+                    if not data.get("ok"):
+                        log.warning(f"sendDocument failed: HTTP {r.status}")
+                        return None
+                    return data.get("result")
+            except Exception as e:
+                log.warning(f"sendDocument failed: {type(e).__name__}")
+                return None
+
+    def note_outbound(self, chat_id: int, text: str):
+        """Record an out-of-band message (task completion notification,
+        Career-Ops update, …) into the chat history the LLM sees.
+
+        Without this, the model's last visible turn is still its own "I'll
+        post the result here" promise, so on the NEXT user message — however
+        unrelated — it re-fetches the finished task and pastes the stale
+        result into the reply (the browser-task / "BLACK-BOXX has no
+        internet" pollution). With the delivery in history the promise reads
+        as kept and old task content stays out of new conversations."""
+        history = self._history.setdefault(chat_id, deque(maxlen=HISTORY_LEN))
+        history.append({"role": "assistant",
+                        "content": f"[delivered as a separate notification]\n{text}"})
+
     async def send(self, chat_id: int, text: str):
         # Telegram hard limit 4096; split on paragraph edges.
         chunks, cur = [], ""
@@ -502,6 +544,12 @@ class TelegramInterface:
 
         ctx = self.tool_ctx_factory(user_id, user.get("first_name", "Boss"),
                                     chat_id)
+        # Correlate any background task this turn spawns with the exact
+        # originating message (persisted by the task supervisor).
+        try:
+            ctx.message_id = str(msg.get("message_id") or "")
+        except Exception:
+            pass
         reply = await self.llm.chat_with_tools(messages, ctx)
 
         history.append({"role": "user", "content": text})

@@ -1,0 +1,103 @@
+# Homelab asset registry for Loki's maintenance controller.
+#
+# Private but versionable: NO credentials, tokens, or keys may ever be stored
+# here — endpoints and structural metadata only. New assets are added here
+# (plus a runbook module if they need one); no Python source changes required
+# for registration, aliasing, or policy classification.
+#
+# Fields the loader understands:
+#   display_name   human name used in replies
+#   host           machine the asset lives on (commands only run when the
+#                  controller is running on that host)
+#   type           wireless_access_point | docker_service | docker_stack
+#   aliases        phrases the Boss uses for this asset
+#   runbook        module name in maintenance_runbooks/ (omit if none)
+#   stateful       true → high-risk: no automatic repairs, updates need
+#                  approval + backup
+#   update_policy  approval | approval_always (there is no auto tier for
+#                  updates — container image updates ALWAYS need approval)
+
+version: 1
+
+assets:
+  black-boxx:
+    display_name: BLACK-BOXX
+    host: dex247
+    type: wireless_access_point
+    aliases:
+      - BLACK-BOXX
+      - black boxx
+      - blackboxx
+      - black-boxx
+      - my AP
+      - the AP
+      - access point
+      - wifi hotspot
+    runbook: black_boxx_connectivity
+    stateful: false
+    network:
+      wireless_interface: wlp2s0
+      vpn_interface: wg-ap
+      ap_address: 192.168.10.1
+      client_subnet: 192.168.10.0/24
+      routing_mark: 100          # fwmark 0x64 set on wlp2s0 ingress (mangle)
+      routing_table: 100         # default dev wg-ap
+      rule_priority: 100         # ip rule: fwmark 100 lookup 100
+      dhcp_leases_file: /var/lib/misc/dnsmasq.leases
+      hostapd_conf: /etc/hostapd/black-boxx.conf
+      dnsmasq_conf: /etc/dnsmasq.d/black-boxx-ap.conf
+
+  jellyfin:
+    display_name: Jellyfin
+    host: dex247
+    type: docker_service
+    aliases:
+      - jellyfin
+      - jelly
+      - jfin
+      - media server
+      - the media server
+    runbook: jellyfin_health
+    stateful: false
+    update_policy: approval
+    docker:
+      container: jellyfin
+      compose_project: privacyserver
+      compose_file: /home/g2k247/PrivacyServer/docker-compose.yml
+      compose_service: jellyfin
+      image: lscr.io/linuxserver/jellyfin:latest
+    health:
+      local_url: http://127.0.0.1:8096/health
+      public_url: https://jfin.ivn-group.cc   # via nginx-proxy-manager
+    mounts:
+      config: /home/g2k247/PrivacyServer/config/jellyfin
+      metadata: /home/g2k247/jellyfin-metadata
+      media:
+        - /media/nas/Movies
+        - /media/nas/TV Series
+        - /media/nas/Music
+        - /media/nas/Sports
+
+  immich:
+    display_name: Immich
+    host: dex247
+    type: docker_stack
+    aliases:
+      - immich
+      - photos
+      - photo server
+      - the photo server
+    runbook: immich_status
+    stateful: true               # Postgres + uploaded originals: high risk
+    update_policy: approval_always
+    docker:
+      compose_project: immich
+      compose_file: /home/g2k247/immich/docker-compose.yml
+      containers:
+        - immich_server
+        - immich_machine_learning
+        - immich_redis
+        - immich_postgres
+    health:
+      local_url: http://127.0.0.1:2283/api/server/ping
+      public_url: https://immich.ivn-group.cc  # via nginx-proxy-manager
