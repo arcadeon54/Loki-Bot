@@ -163,6 +163,12 @@ except Exception:
     _assistant_tools_available = False
 
 try:
+    import career_ops  # side effect: registers Career-Ops liaison tools
+    _career_ops_available = career_ops.enabled
+except Exception:
+    _career_ops_available = False
+
+try:
     import skill_bridge  # side effect: mirrors skillkit skills into tools.REGISTRY
     _skill_bridge_available = True
 except Exception as _sb_err:
@@ -5179,6 +5185,35 @@ async def on_ready():
         asyncio.create_task(_telegram_iface.start())
     elif not _telegram_available:
         log.warning("telegram_interface not importable — Telegram DISABLED")
+
+    # Career-Ops liaison (bridge on razr) — monitor announces job progress
+    # back to whichever conversation submitted the job.
+    if _career_ops_available:
+        async def _career_send(channel_id: str, text: str,
+                               file_path: str | None = None,
+                               filename: str | None = None):
+            if channel_id.startswith("tg:"):
+                chat_id = int(channel_id[3:])
+                if _telegram_iface is None:
+                    raise RuntimeError("telegram interface offline")
+                if file_path:
+                    await _telegram_iface.send_document(chat_id, file_path,
+                                                        caption=text,
+                                                        filename=filename)
+                else:
+                    await _telegram_iface.send(chat_id, text)
+            else:
+                channel = (bot.get_channel(int(channel_id))
+                           or await bot.fetch_channel(int(channel_id)))
+                if file_path:
+                    await channel.send(text, file=discord.File(
+                        file_path, filename=filename or "attachment"))
+                else:
+                    await channel.send(text)
+
+        career_ops.bind(get_http_session, _career_send)
+        asyncio.create_task(career_ops.monitor_loop())
+        log.info("Career-Ops liaison online — bridge at configured URL")
 
 
 _POSITIVE_REACTION_EMOJIS = {"👍", "😂", "❤️", "🔥", "💯", "😭", "🤣", "👏", "⭐", "🎯"}

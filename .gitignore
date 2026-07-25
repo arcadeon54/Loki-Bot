@@ -11,6 +11,7 @@ ingest_progress.json
 jobsite_pending.json
 relay_aliases.json
 quip_usage.json
+career_ops_state.json
 *.db-shm
 *.db-wal
 *.json.bak
