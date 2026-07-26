@@ -37,8 +37,17 @@ ACTION_TIERS = {
     "retry_joplin_sync":          AUTO,
     "restart_interface_worker":   AUTO,   # a failed Loki interface worker
     "restart_unhealthy_container_once": AUTO,
+    # Lifecycle bookkeeping: changes what Loki WATCHES, never what it runs.
+    # Marking an asset decommissioned/ignored removes alerting; it deletes
+    # nothing, so it needs no approval gate of its own.
+    "mark_asset_lifecycle_state":  AUTO,
+    "suppress_monitoring":         AUTO,
 
     # Approval required — staged as drafts, never run inline.
+    # Removing the exact container/project/unshared images and volumes of an
+    # asset the Boss already decommissioned. Shared resources are excluded at
+    # planning time; this tier covers only the narrow, enumerated removal.
+    "decommission_cleanup":       APPROVAL,
     "container_image_update":     APPROVAL,
     "compose_change":             APPROVAL,
     "immich_update":              APPROVAL,
@@ -85,6 +94,9 @@ _PARAM_SHAPES = {
     "dbident":      re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$"),
     # A single compose service name from the asset's own registry entry.
     "service":      re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"),
+    # A Docker named volume, authorized at runtime from `docker volume`/`docker
+    # ps` output and only ever for a volume proven to have no other user.
+    "volume":       re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"),
 }
 
 _COMMANDS: dict[str, dict] = {
@@ -135,6 +147,40 @@ _COMMANDS: dict[str, dict] = {
     # unhealthy or stopped" sweep. No parameters at all — zero injection surface.
     "docker_ps_status":
         {"argv": ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"]},
+    # ── lifecycle / decommission discovery (all read-only, all param-free) ──
+    # Every one of these dumps the WHOLE container list in a single call, so
+    # discovery never needs a filter built from a name — zero injection
+    # surface, and the same snapshot is reused for sharing analysis.
+    "docker_ps_projects":
+        {"argv": ["docker", "ps", "-a", "--format",
+                  '{{.Names}}\t{{.Label "com.docker.compose.project"}}'
+                  '\t{{.Image}}\t{{.Status}}']},
+    "docker_ps_mounts":
+        {"argv": ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Mounts}}"]},
+    "docker_ps_networks":
+        {"argv": ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Networks}}"]},
+    # Which generated proxy-host configs mention a container. `--` stops the
+    # pattern being read as an option; both parameters are allowlisted
+    # container names, so no shell and no metacharacters are possible.
+    "proxy_conf_grep":
+        {"argv": ["docker", "exec", "{container}", "grep", "-rl", "--",
+                  "{container2}", "/data/nginx/proxy_host"]},
+
+    # ── decommission cleanup (approval-gated by the cleanup workflow) ──────
+    # Deliberately narrow. There is NO prune command, NO `down -v`, NO
+    # `--rmi`, NO `--remove-orphans`, and no network removal at all: compose
+    # drops its own project network, and a shared network is never touched.
+    "compose_down_project":
+        {"argv": ["docker", "compose", "-f", "{compose_file}", "down"],
+         "repair": True},
+    "docker_container_rm":
+        {"argv": ["docker", "rm", "{container}"], "repair": True},
+    "docker_image_rm":
+        {"argv": ["docker", "image", "rm", "{image}"], "repair": True},
+    # Only ever called for a volume proven unshared at both plan and run time.
+    "docker_volume_rm":
+        {"argv": ["docker", "volume", "rm", "{volume}"], "repair": True},
+
     "df_root":
         {"argv": ["df", "-h", "--output=size,avail,pcent", "/"]},
     "mem_info":

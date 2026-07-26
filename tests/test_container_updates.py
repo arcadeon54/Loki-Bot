@@ -587,14 +587,53 @@ class ApplyTests(Base):
         self.assertIn("APP_VERSION=v1.0.0", env)
         self.assertTrue(os.path.isdir(rb["backup_dir"]))
 
+    # The ONLY commands in the whole allowlist permitted to remove anything.
+    # They exist for the approval-gated decommission cleanup of an asset the
+    # Boss has already retired (homelab_lifecycle), and each one names a single
+    # resource that was proven unshared at both plan and run time. Adding a
+    # name here is a deliberate policy decision, not a refactor.
+    DECOMMISSION_CLEANUP_COMMANDS = {
+        "compose_down_project", "docker_container_rm", "docker_image_rm",
+        "docker_volume_rm",
+    }
+
     def test_no_command_can_delete_data(self):
-        """Nothing in the allowlist removes images, volumes, or databases."""
+        """Nothing in the allowlist removes images, volumes, or databases —
+        except the enumerated decommission-cleanup commands."""
         for name in policy.command_names():
+            if name in self.DECOMMISSION_CLEANUP_COMMANDS:
+                continue
             argv = " ".join(policy._COMMANDS[name]["argv"])
             for banned in (" rm", "rmi", "prune", "down", "volume", "DROP",
                            "TRUNCATE", "DELETE", "unlink", "rm -"):
                 self.assertNotIn(banned, argv,
                                  f"command '{name}' must not be able to delete data")
+
+    def test_decommission_cleanup_commands_stay_narrow(self):
+        """Even the removal commands cannot prune, cascade, or take out a
+        volume/image as a side effect of bringing a project down."""
+        # Exact-argument checks. `docker compose -f <file>` is the one place a
+        # bare -f is legitimate: there it SELECTS the single compose file and
+        # is what scopes the teardown to one project. Anywhere else -f means
+        # --force.
+        banned_args = {"prune", "--rmi", "-v", "--volumes", "--remove-orphans",
+                       "--force", "-rf", "--all", "-a"}
+        for name in self.DECOMMISSION_CLEANUP_COMMANDS:
+            argv = policy._COMMANDS[name]["argv"]
+            is_compose = argv[:2] == ["docker", "compose"]
+            if not is_compose:
+                banned = banned_args | {"-f"}
+            else:
+                banned = banned_args
+                self.assertEqual(argv[2], "-f", "compose teardown must be file-scoped")
+            self.assertEqual(banned & set(argv), set(),
+                             f"'{name}' must stay a single-resource removal")
+            self.assertNotIn("prune", " ".join(argv))
+            self.assertTrue(policy._COMMANDS[name].get("repair"),
+                            f"'{name}' must be repair-class so read-only mode blocks it")
+
+    def test_no_prune_command_exists_at_all(self):
+        self.assertEqual([n for n in policy.command_names() if "prune" in n], [])
 
     def test_apply_never_runs_without_going_through_the_gate(self):
         """container_apply_update is registered as a consequential tool, so

@@ -39,6 +39,7 @@ from typing import Optional
 
 import aiohttp
 
+import homelab_lifecycle as lifecycle
 import homelab_maintenance as hm
 import maintenance_policy as policy
 
@@ -188,13 +189,20 @@ def _incident_tag(key: str, display_name: str, incident_id: str) -> str:
 
 # ── Escalation (reuses the hermes_escalation task type as-is) ──────────────
 def _monitor_escalation_bundle(key: str, display_name: str, symptom: str,
-                               checks: list[dict], attempts: list[dict]) -> dict:
+                               checks: list[dict], attempts: list[dict],
+                               subjects: Optional[list[str]] = None,
+                               user_requested: bool = False) -> dict:
     tiers = policy.ACTION_TIERS
     return {
         "format": hm.BUNDLE_FORMAT,
         "asset": key,
         "asset_type": "monitored_service",
         "host": "dex247",
+        # Lifecycle context travels with every bundle so Hermes can never be
+        # asked to reason about an asset that was retired on purpose.
+        "lifecycle": [lifecycle.classify(s) | {"record": None} for s in (subjects or [key])],
+        "boss_intent": ("explicit investigation request" if user_requested
+                        else "automatic monitoring escalation"),
         "symptom": hm.redact(symptom)[:300],
         "runbook": None,
         "checks": [{"name": c["name"], "ok": c["ok"], "detail": hm.redact(c["detail"])[:300]}
@@ -208,11 +216,39 @@ def _monitor_escalation_bundle(key: str, display_name: str, symptom: str,
     }
 
 
+def _escalation_subjects(key: str, checks: list[dict]) -> list[str]:
+    """The container names an escalation would actually be ABOUT. For the
+    container sweep the incident key is 'container-sweep', so the lifecycle
+    gate has to look at the offending containers, not the check name."""
+    names = []
+    for c in checks:
+        if c.get("name") != "managed_containers" or c.get("ok"):
+            continue
+        for part in str(c.get("detail", "")).split(";"):
+            name = part.split(":", 1)[0].strip()
+            if name and name not in names:
+                names.append(name)
+    return names or [key]
+
+
 async def _escalate(incident_id: str, key: str, display_name: str, symptom: str,
                     checks: list[dict]) -> Optional[str]:
     """Hand an incident to Hermes via the existing hermes_escalation task type.
     Returns the Loki task_id, or None if the bridge isn't wired up (the
-    incident still closes as 'gave_up' with the bundle preserved)."""
+    incident still closes as 'gave_up' with the bundle preserved).
+
+    Hermes is billed per job, so the lifecycle gate runs BEFORE submission: an
+    intentionally stopped, ignored, decommissioned or merely unmanaged asset
+    never produces an automatic Hermes job."""
+    subjects = _escalation_subjects(key, checks)
+    blocked = []
+    for subject in subjects:
+        allowed, why = lifecycle.hermes_allowed(subject, user_requested=False)
+        if not allowed:
+            blocked.append(why)
+    if blocked and len(blocked) == len(subjects):
+        log.info("hermes escalation suppressed for %s: %s", key, "; ".join(blocked))
+        return None
     try:
         import task_supervisor as ts
         import homelab_hermes as hh
@@ -222,7 +258,8 @@ async def _escalate(incident_id: str, key: str, display_name: str, symptom: str,
     tt = ts._TYPES.get("hermes_escalation")
     if tt is None or not hh.enabled:
         return None
-    bundle = _monitor_escalation_bundle(key, display_name, symptom, checks, [])
+    bundle = _monitor_escalation_bundle(key, display_name, symptom, checks, [],
+                                        subjects=subjects)
     ctx = tools.ToolContext(user_id=tools.OWNER_USER_ID, user_name="Boss (auto)",
                             channel_id=_boss_channel_id_fn())
     task_id = ts.submit(tt, ctx, {"asset": key, "incident_id": incident_id,
@@ -412,11 +449,14 @@ async def _give_up_and_escalate(incident: dict, result: dict, reason: str):
     display = incident["display_name"]
     checks = result.get("checks", [])
     symptom = f"{display}: {reason}. {hm.redact(str(result.get('diagnosis', '')))[:200]}"
+    subjects = _escalation_subjects(incident["key"], checks)
+    suppressed = all(not lifecycle.hermes_allowed(s)[0] for s in subjects)
     task_id = None
-    try:
-        task_id = await _escalate(incident_id, incident["key"], display, symptom, checks)
-    except Exception:
-        log.exception("escalation submission failed for %s", incident_id)
+    if not suppressed:
+        try:
+            task_id = await _escalate(incident_id, incident["key"], display, symptom, checks)
+        except Exception:
+            log.exception("escalation submission failed for %s", incident_id)
     status = ESCALATED if task_id else GAVE_UP
     _update_incident(incident_id, status=status, closed_at=time.time(), result=status)
     _update_check(incident["key"], cooldown_until=time.time() + COOLDOWN_SECS,
@@ -424,6 +464,11 @@ async def _give_up_and_escalate(incident: dict, result: dict, reason: str):
     if task_id:
         await _notify(f"🆘 Approval needed — {display}: escalated for a closer look "
                       f"(task {task_id[-8:]}). I'll follow up when it reports back."[:1500])
+    elif suppressed:
+        # Intentionally excluded from escalation — say nothing. Alerting about
+        # an asset the Boss retired is exactly the noise this module removes.
+        log.info("incident %s closed without escalation (lifecycle-suppressed)",
+                 incident_id)
     else:
         await _notify(f"🆘 {display}: {reason}. I could not auto-repair this and "
                       f"Hermes isn't reachable right now — needs your hands."[:1500])
@@ -591,28 +636,22 @@ async def _check_docker_host(allow_repairs: bool) -> dict:
                escalate=not healthy)
 
 
-# ── General container sweep (stopped/unhealthy containers not in the registry) ─
-_KNOWN_CONTAINERS = None  # populated lazily from the registry
-
-
-def _known_containers() -> set[str]:
-    global _KNOWN_CONTAINERS
-    if _KNOWN_CONTAINERS is None:
-        names = set()
-        for asset in hm._reg().assets.values():
-            docker = asset.get("docker") or {}
-            if docker.get("container"):
-                names.add(docker["container"])
-            for c in docker.get("containers", []):
-                names.add(c)
-        _KNOWN_CONTAINERS = names
-    return _KNOWN_CONTAINERS
-
-
+# ── General container sweep (lifecycle-aware) ──────────────────────────────
 async def _check_container_sweep(allow_repairs: bool) -> dict:
-    """Detect-only sweep for stopped/unhealthy containers NOT covered by a
-    registered asset. Registered assets already get their own runbook-driven
-    check above; this only catches the rest so nothing silently rots."""
+    """Detect-only sweep over every container on the host.
+
+    A container being stopped is NOT, on its own, a problem — that was the bug
+    that turned a container the Boss had deliberately retired into an incident
+    and then into a billed Hermes job. Before anything can become an incident
+    this consults, in order: the lifecycle/decommission registry, the asset
+    registry, the expected-running policy, and any pending cleanup state
+    (homelab_lifecycle.classify_sweep). Only `managed` + expected-to-be-running
+    survives that filter.
+
+    Everything else is inventory: unmanaged containers are counted quietly,
+    suppressed ones are silent, a decommissioned container that has come BACK
+    is reported once (and never deleted automatically), and a cleanup still
+    waiting for approval gets an occasional low-frequency nudge."""
     ops = hm.Ops(allow_repairs=False)
     checks = []
     rc, out = await ops.run("docker_ps_status")
@@ -620,27 +659,64 @@ async def _check_container_sweep(allow_repairs: bool) -> dict:
         checks.append({"name": "docker_ps", "ok": False, "detail": f"docker ps failed rc={rc}"})
         return _mk(checks, False, "Could not list containers.", escalate=True)
 
-    known = _known_containers()
-    bad = []
-    for line in out.strip().splitlines():
-        if "\t" not in line:
-            continue
-        name, status = line.split("\t", 1)
-        if name in known:
-            continue   # covered by its own registered check
-        is_up = status.startswith("Up")
-        is_unhealthy = "(unhealthy)" in status
-        if not is_up or is_unhealthy:
-            bad.append(f"{name}: {status}")
+    rows = [tuple(line.split("\t", 1)) for line in out.strip().splitlines()
+            if "\t" in line]
+    buckets = lifecycle.classify_sweep(rows)
 
-    checks.append({"name": "unregistered_containers", "ok": not bad,
-                   "detail": "; ".join(bad)[:400] if bad else "none"})
-    healthy = not bad
-    return _mk(checks, healthy,
-               "No unregistered containers in a bad state." if healthy else
-               f"Unregistered container(s) stopped/unhealthy: {'; '.join(bad)[:300]} — "
-               "not covered by a runbook, so no automatic repair; flagging only.",
-               escalate=not healthy)
+    incidents = buckets["incidents"]
+    unmanaged = buckets["unmanaged"]
+    suppressed = buckets["suppressed"]
+
+    # Quiet inventory — reported as a passing check, never as an outage.
+    checks.append({"name": "unmanaged_inventory", "ok": True,
+                   "detail": ("; ".join(f"{e['name']}: {e['status']}" for e in unmanaged)[:400]
+                              or "none")})
+    checks.append({"name": "suppressed_by_lifecycle", "ok": True,
+                   "detail": ("; ".join(f"{e['name']} ({e['state']})" for e in
+                                        suppressed + buckets["pending_cleanup"])[:400]
+                              or "none")})
+    checks.append({"name": "managed_containers", "ok": not incidents,
+                   "detail": ("; ".join(f"{e['name']}: {e['status']}" for e in incidents)[:400]
+                              if incidents else "all managed containers healthy")})
+
+    await _report_reappearances(buckets["reappeared"])
+    await _remind_pending_cleanup(buckets["pending_cleanup"])
+
+    if incidents:
+        detail = "; ".join(f"{e['name']}: {e['status']}" for e in incidents)[:300]
+        return _mk(checks, False,
+                   "Managed container(s) expected to be running are "
+                   f"stopped/unhealthy: {detail}", escalate=True)
+    summary = "All managed containers are healthy."
+    if unmanaged:
+        summary += f" {len(unmanaged)} unmanaged container(s) idle (inventory only)."
+    if suppressed or buckets["pending_cleanup"]:
+        summary += (f" {len(suppressed) + len(buckets['pending_cleanup'])} "
+                    f"intentionally excluded by lifecycle state.")
+    return _mk(checks, True, summary)
+
+
+async def _report_reappearances(entries: list[dict]):
+    """A tombstoned container is running again. Say so exactly once and do
+    nothing else — something recreated it deliberately, and automatically
+    deleting a resurrected service is never the safe move."""
+    for e in entries:
+        if not lifecycle.needs_reappearance_notice(e["name"]):
+            continue
+        lifecycle.mark_reappearance_notified(e["name"])
+        await _notify(
+            f"⚠️ {e['name']} was previously decommissioned but has reappeared "
+            f"({e['status']}). I have not touched it — tell me if it should stay.")
+
+
+async def _remind_pending_cleanup(entries: list[dict]):
+    for e in entries:
+        if not lifecycle.due_for_cleanup_reminder(e["name"]):
+            continue
+        lifecycle.mark_reminder_sent(e["name"])
+        await _notify(f"🧹 Reminder: {e['name']} is decommissioned and its cleanup "
+                      f"is still waiting on your approval. No rush — it raises no "
+                      f"alerts in the meantime.")
 
 
 # ── Dispatch table: key -> (display_name, check_fn) ─────────────────────────

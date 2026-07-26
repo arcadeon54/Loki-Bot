@@ -205,6 +205,14 @@ except Exception as _hm_err:
         f"homelab maintenance unavailable: {_hm_err}")
 
 try:
+    import homelab_lifecycle  # side effect: registers lifecycle/decommission tools
+    _homelab_lifecycle_available = homelab_lifecycle.enabled
+except Exception as _hl_err:
+    _homelab_lifecycle_available = False
+    logging.getLogger("HomelabLifecycle").warning(
+        f"homelab lifecycle registry unavailable: {_hl_err}")
+
+try:
     import homelab_hermes  # side effect: none — homelab_maintenance imports it lazily
     _homelab_hermes_available = True
 except Exception as _hh_err:

@@ -462,8 +462,24 @@ async def run_runbook(asset: dict, allow_repairs: bool) -> tuple[dict, Ops]:
 
 
 # ── Escalation bundle (contract for a future Hermes agent) ─────────────────
+def _lifecycle_context(asset: dict, user_requested: bool) -> dict:
+    """Lifecycle state + the Boss's intent, attached to every escalation bundle
+    so Hermes always knows whether an asset is supposed to be alive at all."""
+    try:
+        import homelab_lifecycle as lifecycle
+    except Exception:
+        return {"lifecycle": [], "boss_intent": "unknown"}
+    subjects = _reg().containers(asset) or [asset["key"]]
+    return {
+        "lifecycle": [lifecycle.classify(s) | {"record": None} for s in subjects],
+        "boss_intent": ("explicit investigation request" if user_requested
+                        else "automatic escalation from a runbook"),
+    }
+
+
 def build_escalation_bundle(asset: dict, symptom: str, result: dict,
-                            ops: Ops, attempts: list[dict]) -> dict:
+                            ops: Ops, attempts: list[dict],
+                            user_requested: bool = False) -> dict:
     tiers = policy.ACTION_TIERS
     service_state = {c["name"]: redact(c["detail"])
                      for c in result.get("checks", [])}
@@ -472,6 +488,7 @@ def build_escalation_bundle(asset: dict, symptom: str, result: dict,
         "asset": asset["key"],
         "asset_type": asset.get("type"),
         "host": asset.get("host"),
+        **_lifecycle_context(asset, user_requested),
         "symptom": redact(symptom)[:300],
         "runbook": result.get("runbook"),
         "checks": [{"name": c["name"], "ok": c["ok"],
@@ -523,13 +540,29 @@ def _hash_diagnosis(d: dict) -> str:
 
 
 async def _escalate_to_hermes(asset: dict, symptom: str, bundle: dict,
-                              incident_id: str, origin_row: dict) -> tuple[str, dict]:
+                              incident_id: str, origin_row: dict,
+                              user_requested: bool = False) -> tuple[str, dict]:
     """Hand an incident to Hermes as a supervised background task, tied to the
     SAME originating requester/channel as origin_row (a task row, or a plain
     dict with requester_id/requester_name/channel_id). Returns
-    ("escalating_to_hermes", {"hermes_task_id": ...}) on success, or
+    ("escalating_to_hermes", {"hermes_task_id": ...}) on success,
+    ("suppressed", {...}) when the asset's lifecycle state forbids it, or
     ("escalated", {}) to signal the caller should fall back to the old
     best-effort hermes_handoff (bridge not wired up)."""
+    try:
+        import homelab_lifecycle as lifecycle
+        subjects = _reg().containers(asset) or [asset["key"]]
+        blocked = []
+        for subject in subjects:
+            allowed, why = lifecycle.hermes_allowed(subject, user_requested)
+            if not allowed:
+                blocked.append(why)
+        if blocked and len(blocked) == len(subjects):
+            log.info("hermes escalation suppressed for %s: %s",
+                     asset["key"], "; ".join(blocked))
+            return "suppressed", {"reason": blocked[0]}
+    except Exception:
+        log.exception("lifecycle gate unavailable — allowing escalation")
     try:
         import task_supervisor as ts
         import homelab_hermes as hh
@@ -592,6 +625,19 @@ async def _hermes_handler(h):
                                  summary="lost contact with the Hermes bridge")
         await h.beat()
 
+        # If the asset was decommissioned while this job was in flight, the
+        # result is audit history, not an operational signal: stop polling,
+        # reopen nothing, and do not announce a diagnosis for something the
+        # Boss already retired.
+        if not _hermes_result_actionable(incident_id):
+            try:
+                await hh.cancel_job(ext)
+            except hh.HermesBridgeError:
+                pass
+            return ts.TaskResult("cancelled",
+                                 summary="asset was intentionally decommissioned "
+                                         "while this ran — result ignored")
+
         inc = get_incident(incident_id) if incident_id else None
         if job.get("escalated") and inc and not inc.get("hermes_escalation_announced"):
             _incident_update(incident_id, hermes_escalation_announced=1)
@@ -649,6 +695,21 @@ async def _hermes_handler(h):
             return ts.TaskResult("paused_quota",
                                  summary="Hermes budget/quota exhausted for today.")
         await asyncio.sleep(hh.POLL_SECS)
+
+
+def _hermes_result_actionable(incident_id: str) -> bool:
+    """False once the incident has been closed as an intentional decommission.
+    Kept as a thin wrapper so the Hermes handler still works if the lifecycle
+    module fails to import."""
+    try:
+        import homelab_lifecycle as lifecycle
+    except Exception:
+        return True
+    try:
+        return lifecycle.hermes_result_actionable(incident_id)
+    except Exception:
+        log.exception("lifecycle actionability check failed")
+        return True
 
 
 async def _hermes_on_cancel(row: dict):
@@ -767,6 +828,12 @@ async def _incident_handler(h):
             fields.update(extra)
             summary = (f"{name}: {result.get('diagnosis', '')} No deterministic fix "
                        f"— handing this to a closer look now. I'll follow up here.")
+        elif status_word == "suppressed":
+            # Intentionally retired/ignored: closing quietly is the correct
+            # outcome, not a failure to escalate.
+            fields["status"] = "closed_intentional_decommission"
+            summary = (f"{name}: {extra.get('reason', 'excluded by lifecycle state')}. "
+                       f"No incident, no escalation.")
         else:
             fields["status"] = "escalated"
             delivery = await hermes_handoff(bundle)
@@ -782,7 +849,7 @@ async def _incident_handler(h):
     _incident_update(incident_id, **fields)
     status = "completed" if fields["status"] in (
         "healthy", "repaired", "awaiting_approval", "escalated",
-        "escalating_to_hermes") else "failed"
+        "escalating_to_hermes", "closed_intentional_decommission") else "failed"
     return ts.TaskResult(status, summary=summary[:780])
 
 
@@ -974,12 +1041,20 @@ async def _tool_hermes_diagnose(args: dict, ctx: ToolContext) -> str:
         " status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
         (incident_id, "", asset["key"], symptom, "diagnosing", now, now))
     _db().commit()
-    bundle = build_escalation_bundle(asset, symptom, result, ops, _attempts_for(asset))
+    # Reaching this tool at all IS the Boss explicitly asking for a closer
+    # look, so the lifecycle gate is told so — an unmanaged or retired asset
+    # can be investigated on request, just never automatically.
+    bundle = build_escalation_bundle(asset, symptom, result, ops, _attempts_for(asset),
+                                     user_requested=True)
     _incident_update(incident_id, bundle_json=json.dumps(bundle))
 
     origin_row = {"requester_id": str(ctx.user_id), "requester_name": ctx.user_name,
                   "channel_id": ctx.channel_id}
-    status_word, extra = await _escalate_to_hermes(asset, symptom, bundle, incident_id, origin_row)
+    status_word, extra = await _escalate_to_hermes(asset, symptom, bundle, incident_id,
+                                                   origin_row, user_requested=True)
+    if status_word == "suppressed":
+        return json.dumps({"ok": False, "error": extra.get("reason", "excluded by "
+                                                           "lifecycle state")})
     if status_word != "escalating_to_hermes":
         return json.dumps({"ok": False, "error": "Hermes escalation task type unavailable"})
     _incident_update(incident_id, status=status_word, **extra)

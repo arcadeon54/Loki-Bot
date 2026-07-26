@@ -1,0 +1,67 @@
+'# note': GENERATED MIRROR of the asset_lifecycle table in homelab_incidents.db. Edit
+  lifecycle state through Loki, not this file.
+version: 1
+generated_at: '2026-07-26T01:38:34Z'
+assets:
+  ivn-site:
+    state: decommission_pending_cleanup
+    aliases:
+    - IVN site
+    - ivn site
+    - ivn-group
+    - the ivn site
+    host: dex247
+    expected_running: false
+    monitoring_suppressed: true
+    marked_at: '2026-07-26T01:38:34Z'
+    source_interface: telegram
+    authorized_role: boss
+    reason: 'Boss: ''For IVN site feel free to obliterate it. I have no plans to resurrect
+      it anytime soon.'''
+    cleanup_status: pending_approval
+    cleanup_scope:
+      container: ivn-site
+      exists: true
+      status: Exited (0) 2 months ago
+      compose_project: ivn-group
+      image: nginx:1.27-alpine
+      compose_file: /home/g2k247/sites/ivn-group/docker-compose.yml
+      compose_working_dir: /home/g2k247/sites/ivn-group
+      compose_service: ivn-site
+      project_siblings: []
+      bind_mounts:
+      - source: /home/g2k247/sites/ivn-group/nginx.conf
+        destination: /etc/nginx/conf.d/default.conf
+        rw: false
+      - source: /home/g2k247/sites/ivn-group/site
+        destination: /usr/share/nginx/html
+        rw: false
+      named_volumes: []
+      networks:
+      - name: nginx-proxy-manager_default
+        members:
+        - nginx-proxy-manager
+        shared: true
+      images:
+      - name: nginx:1.27-alpine
+        used_by: []
+        shared: false
+      config_paths:
+      - /home/g2k247/sites/ivn-group
+      proxy_refs: []
+      dns_refs: []
+      dependent_containers: []
+      shared:
+      - kind: network
+        name: nginx-proxy-manager_default
+        used_by:
+        - nginx-proxy-manager
+      notes: []
+    compose_project: ivn-group
+    compose_file: /home/g2k247/sites/ivn-group/docker-compose.yml
+    proxy_refs: []
+    dns_refs: []
+    prior_incidents: []
+    cleanup_verification: null
+    archive_path: ''
+    tombstone_retained: true
