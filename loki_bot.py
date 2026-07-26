@@ -313,9 +313,7 @@ AUTO_WATCH_CHANNEL_IDS = {
     ).split(",") if x.strip()
 }
 
-# ─── Hell Yeah Films: supported social-link forwarding + dedup ───────────────
-HELL_YEAH_FILMS_CHANNEL_ID = int(os.getenv("HELL_YEAH_FILMS_CHANNEL_ID") or "0")
-HELL_YEAH_FILMS_CHANNEL_NAME = os.getenv("HELL_YEAH_FILMS_CHANNEL_NAME", "hell-yeah-films")
+# ─── Duplicate social-link guard ──────────────────────────────────────────────
 DUPLICATE_LINK_DETECTION_ENABLED = os.getenv("DUPLICATE_LINK_DETECTION_ENABLED", "true").lower() != "false"
 # Days to retain original-link records; 0 (default) = retain indefinitely.
 DUPLICATE_LINK_RETENTION_DAYS = int(os.getenv("DUPLICATE_LINK_RETENTION_DAYS", "0"))
@@ -325,7 +323,7 @@ DUPLICATE_LINK_ESCALATION_WINDOW_DAYS = int(os.getenv("DUPLICATE_LINK_ESCALATION
 DUPLICATE_LINK_WARNING_DELETE_AFTER = int(os.getenv("DUPLICATE_LINK_WARNING_DELETE_AFTER", "20"))
 # Max leftover caption length (after stripping URLs) still eligible for delete-as-duplicate.
 DUPLICATE_LINK_CAPTION_MAX_CHARS = int(os.getenv("DUPLICATE_LINK_CAPTION_MAX_CHARS", "100"))
-# Channels this feature never touches, beyond Hell Yeah Films itself (always excluded).
+# Channels this feature never touches (comma-separated Discord channel IDs).
 DUPLICATE_LINK_EXCLUDED_CHANNEL_IDS = {
     int(x) for x in os.getenv("DUPLICATE_LINK_EXCLUDED_CHANNEL_IDS", "").split(",") if x.strip()
 }
@@ -2094,6 +2092,12 @@ llm       = LLMHandler()
 voice_h   = VoiceHandler()
 claude_cc = ClaudeCodeHandler(CLAUDE_BIN, CLAUDE_WORKSPACE, CLAUDE_TIMEOUT)
 social_link_dedup.ensure_schema(memory.conn)
+log.info(
+    f"Duplicate-link guard: enabled={DUPLICATE_LINK_DETECTION_ENABLED} "
+    f"retention_days={DUPLICATE_LINK_RETENTION_DAYS or 'indefinite'} "
+    f"escalation_window_days={DUPLICATE_LINK_ESCALATION_WINDOW_DAYS} "
+    f"excluded_channels={len(DUPLICATE_LINK_EXCLUDED_CHANNEL_IDS)}"
+)
 mood_tracker = MoodTracker()
 
 # Member directory cache: { guild_id: (directory_string, timestamp) }
@@ -3208,23 +3212,6 @@ def _normalize_url(url: str) -> str:
     return urlunparse(("https", host, path, "", query, ""))
 
 
-def _check_duplicate_url(url: str, guild_id: str) -> dict | None:
-    """Check if a URL was already downloaded in this guild within the last 48 hours.
-    Returns the row dict if duplicate, else None."""
-    normalized = _normalize_url(url)
-    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=48)).isoformat()
-    cursor = memory.conn.cursor()
-    cursor.execute(
-        "SELECT channel_id, user_id, timestamp FROM downloaded_urls "
-        "WHERE url = ? AND guild_id = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT 1",
-        (normalized, guild_id, cutoff),
-    )
-    row = cursor.fetchone()
-    if row:
-        return {"channel_id": row[0], "user_id": row[1], "timestamp": row[2]}
-    return None
-
-
 def _record_downloaded_url(url: str, guild_id: str, channel_id: str, user_id: str):
     """Record a successfully downloaded URL."""
     normalized = _normalize_url(url)
@@ -3237,42 +3224,18 @@ def _record_downloaded_url(url: str, guild_id: str, channel_id: str, user_id: st
     memory.conn.commit()
 
 
-# ─── Hell Yeah Films: supported social-link forwarding + dedup ───────────────
-
-def _hell_yeah_films_channel():
-    """Resolve the Hell Yeah Films channel: ID first, name fallback across guilds."""
-    if HELL_YEAH_FILMS_CHANNEL_ID:
-        ch = bot.get_channel(HELL_YEAH_FILMS_CHANNEL_ID)
-        if ch is not None:
-            return ch
-    for g in bot.guilds:
-        ch = discord.utils.get(g.text_channels, name=HELL_YEAH_FILMS_CHANNEL_NAME)
-        if ch is not None:
-            return ch
-    return None
-
+# ─── Duplicate social-link guard (cross-channel) ──────────────────────────────
+# Repair note: the previous implementation only ever recorded a URL as "seen"
+# inside run_download(), which itself only fires for DOWNLOAD_CHANNEL_ID,
+# AUTO_WATCH_CHANNEL_IDS, or an explicit "save/post/download this" trigger.
+# A link shared casually in an ordinary channel was never recorded, so the
+# duplicate check always came back empty for the common case. This version
+# records every supported-platform link the moment it's posted, regardless of
+# whether a download is triggered, and checks all links in a message (not
+# just the first).
 
 def _is_excluded_channel(message: discord.Message) -> bool:
-    cid = message.channel.id
-    if cid == HELL_YEAH_FILMS_CHANNEL_ID:
-        return True
-    if cid in DUPLICATE_LINK_EXCLUDED_CHANNEL_IDS:
-        return True
-    ch = _hell_yeah_films_channel()
-    if ch is not None and cid == ch.id:
-        return True
-    return False
-
-
-async def _forward_social_link(url: str, author: discord.Member | discord.User) -> None:
-    channel = _hell_yeah_films_channel()
-    if channel is None:
-        log.warning("Hell Yeah Films channel not configured/found — skipping forward")
-        return
-    try:
-        await channel.send(f"🎬 {author.display_name} shared: {url}")
-    except Exception as e:
-        log.error(f"Failed to forward link to Hell Yeah Films: {e}")
+    return message.channel.id in DUPLICATE_LINK_EXCLUDED_CHANNEL_IDS
 
 
 async def _compose_duplicate_warning(message: discord.Message, level: int) -> str:
@@ -3303,10 +3266,38 @@ async def _compose_duplicate_warning(message: discord.Message, level: int) -> st
     return social_link_dedup.pick_fallback_warning(level)
 
 
-async def _handle_social_link_dedup(message: discord.Message) -> bool:
-    """Detect supported social-media links, forward new ones to Hell Yeah Films,
-    and suppress/delete/warn on duplicates. Returns True if this function fully
-    handled the message and the rest of on_message should be skipped."""
+def _claim_links(links: list[tuple[str, str]], guild_id: str, message_id: str,
+                  channel_id: str, user_id: str, now_iso: str) -> tuple[list[str], bool]:
+    """Atomically claim/check every supported link found in a message.
+    Returns (newly_claimed_urls, any_duplicate_found)."""
+    new_links: list[str] = []
+    dupe_hit = False
+    for raw_url, platform in links:
+        clean_url = social_link_dedup.strip_wrapping(raw_url)
+        link_hash = social_link_dedup.canonical_hash(clean_url, platform)
+        result = social_link_dedup.claim_or_record_duplicate(
+            memory.conn,
+            guild_id=guild_id,
+            link_hash=link_hash,
+            platform=platform,
+            message_id=message_id,
+            channel_id=channel_id,
+            user_id=user_id,
+            now_iso=now_iso,
+        )
+        if result.is_new:
+            new_links.append(clean_url)
+        else:
+            dupe_hit = True
+    return new_links, dupe_hit
+
+
+async def _handle_duplicate_link_guard(message: discord.Message) -> bool:
+    """Detect duplicate supported social-media links across all channels in
+    the guild. The first occurrence is left untouched. A later duplicate is
+    deleted when safe and gets a single playful warning — never forwarded
+    anywhere. Returns True if this function fully handled the message and
+    the rest of on_message should be skipped."""
     if not DUPLICATE_LINK_DETECTION_ENABLED or message.guild is None:
         return False
     if message.author.bot:
@@ -3320,35 +3311,12 @@ async def _handle_social_link_dedup(message: discord.Message) -> bool:
 
     guild_id = str(message.guild.id)
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    new_links: list[str] = []
-    dupe_hit = False
-
-    for raw_url, platform in links:
-        clean_url = social_link_dedup.strip_wrapping(raw_url)
-        link_hash = social_link_dedup.canonical_hash(clean_url, platform)
-        result = social_link_dedup.claim_or_record_duplicate(
-            memory.conn,
-            guild_id=guild_id,
-            link_hash=link_hash,
-            platform=platform,
-            message_id=str(message.id),
-            channel_id=str(message.channel.id),
-            user_id=str(message.author.id),
-            now_iso=now_iso,
-        )
-        if result.is_new:
-            new_links.append(clean_url)
-        else:
-            dupe_hit = True
+    new_links, dupe_hit = _claim_links(
+        links, guild_id, str(message.id), str(message.channel.id), str(message.author.id), now_iso
+    )
 
     if not dupe_hit:
-        for url in new_links:
-            asyncio.create_task(_forward_social_link(url, message.author))
-        return False
-
-    # At least one duplicate. Forward any genuinely new links found alongside it (mixed content).
-    for url in new_links:
-        asyncio.create_task(_forward_social_link(url, message.author))
+        return False  # first occurrence — leave it alone, let on_message continue normally
 
     level = social_link_dedup.bump_user_warning_level(
         memory.conn, guild_id=guild_id, user_id=str(message.author.id),
@@ -3356,7 +3324,7 @@ async def _handle_social_link_dedup(message: discord.Message) -> bool:
     )
 
     raw_urls = [raw for raw, _ in links]
-    mixed_content = bool(new_links)
+    mixed_content = bool(new_links)  # some links in this message were genuinely new
     short_caption = social_link_dedup.is_primarily_links(
         message.content or "", raw_urls, DUPLICATE_LINK_CAPTION_MAX_CHARS
     )
@@ -3367,11 +3335,11 @@ async def _handle_social_link_dedup(message: discord.Message) -> bool:
             await message.delete()
         except discord.Forbidden:
             log.warning(
-                f"Missing permission to delete duplicate-link message in "
-                f"guild={guild_id} channel={message.channel.id} — suppressing forward only"
+                f"Duplicate-link guard: missing Manage Messages permission to delete in "
+                f"guild={guild_id} channel={message.channel.id} — suppressing only"
             )
         except Exception as e:
-            log.warning(f"Failed to delete duplicate-link message: {e}")
+            log.warning(f"Duplicate-link guard: failed to delete duplicate message: {e}")
 
     warning_text = await _compose_duplicate_warning(message, level)
     try:
@@ -3380,14 +3348,14 @@ async def _handle_social_link_dedup(message: discord.Message) -> bool:
             delete_after=DUPLICATE_LINK_WARNING_DELETE_AFTER or None,
         )
     except Exception as e:
-        log.error(f"Failed to send duplicate-link warning: {e}")
+        log.error(f"Duplicate-link guard: failed to send warning: {e}")
 
     return True
 
 
-async def _handle_social_link_edit(before: discord.Message, after: discord.Message) -> None:
+async def _handle_duplicate_link_guard_edit(before: discord.Message, after: discord.Message) -> None:
     """An edited message may introduce a new supported link that wasn't there
-    before — process only the newly-introduced links, once."""
+    before — check only the newly-introduced links, once."""
     if not DUPLICATE_LINK_DETECTION_ENABLED or after.guild is None:
         return
     if after.author.bot:
@@ -3395,7 +3363,10 @@ async def _handle_social_link_edit(before: discord.Message, after: discord.Messa
     if _is_excluded_channel(after):
         return
 
-    before_links = {social_link_dedup.strip_wrapping(u) for u, _ in social_link_dedup.extract_supported_links(before.content or "")}
+    before_links = {
+        social_link_dedup.strip_wrapping(u)
+        for u, _ in social_link_dedup.extract_supported_links(before.content or "")
+    }
     after_links = social_link_dedup.extract_supported_links(after.content or "")
     new_in_edit = [(u, p) for u, p in after_links if social_link_dedup.strip_wrapping(u) not in before_links]
     if not new_in_edit:
@@ -3403,60 +3374,25 @@ async def _handle_social_link_edit(before: discord.Message, after: discord.Messa
 
     guild_id = str(after.guild.id)
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    forwarded: list[str] = []
-    dupe_hit = False
+    _new_links, dupe_hit = _claim_links(
+        new_in_edit, guild_id, str(after.id), str(after.channel.id), str(after.author.id), now_iso
+    )
 
-    for raw_url, platform in new_in_edit:
-        clean_url = social_link_dedup.strip_wrapping(raw_url)
-        link_hash = social_link_dedup.canonical_hash(clean_url, platform)
-        result = social_link_dedup.claim_or_record_duplicate(
-            memory.conn,
-            guild_id=guild_id,
-            link_hash=link_hash,
-            platform=platform,
-            message_id=str(after.id),
-            channel_id=str(after.channel.id),
-            user_id=str(after.author.id),
-            now_iso=now_iso,
+    if not dupe_hit:
+        return  # newly-introduced link(s) were all first occurrences
+
+    level = social_link_dedup.bump_user_warning_level(
+        memory.conn, guild_id=guild_id, user_id=str(after.author.id),
+        now_iso=now_iso, window_days=DUPLICATE_LINK_ESCALATION_WINDOW_DAYS,
+    )
+    warning_text = await _compose_duplicate_warning(after, level)
+    try:
+        await after.channel.send(
+            f"{after.author.mention} {warning_text}",
+            delete_after=DUPLICATE_LINK_WARNING_DELETE_AFTER or None,
         )
-        if result.is_new:
-            forwarded.append(clean_url)
-        else:
-            dupe_hit = True
-
-    for url in forwarded:
-        asyncio.create_task(_forward_social_link(url, after.author))
-
-    if dupe_hit:
-        level = social_link_dedup.bump_user_warning_level(
-            memory.conn, guild_id=guild_id, user_id=str(after.author.id),
-            now_iso=now_iso, window_days=DUPLICATE_LINK_ESCALATION_WINDOW_DAYS,
-        )
-        warning_text = await _compose_duplicate_warning(after, level)
-        try:
-            await after.channel.send(
-                f"{after.author.mention} {warning_text}",
-                delete_after=DUPLICATE_LINK_WARNING_DELETE_AFTER or None,
-            )
-        except Exception as e:
-            log.error(f"Failed to send duplicate-link warning (edit path): {e}")
-
-
-async def _warn_duplicate_poster(message: discord.Message, dupe: dict):
-    """Tag the user and warn them about posting a duplicate link. Let Loki craft the message."""
-    orig_channel = f"<#{dupe['channel_id']}>"
-    user_mention = message.author.mention
-    prompt_msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": (
-            f"[SYSTEM: {message.author.display_name} just posted a link that was already "
-            f"downloaded and posted in {orig_channel}. Their duplicate message has been deleted. "
-            f"Write a short (1-2 sentence) quip calling them out for the double-post. "
-            f"Be playful but make it clear the dupe was removed. Don't include the link itself.]"
-        )},
-    ]
-    warning_text = await llm.chat(prompt_msgs)
-    await message.channel.send(f"{user_mention} {warning_text}")
+    except Exception as e:
+        log.error(f"Duplicate-link guard (edit path): failed to send warning: {e}")
 
 
 async def run_movie_download(url: str, requester: str, trigger_message: discord.Message | None = None):
@@ -5878,21 +5814,10 @@ async def on_message(message: discord.Message):
         interjection_state[cid] = {"last_interjection": 0, "msgs_since_last": 0}
     interjection_state[cid]["msgs_since_last"] += 1
 
-    # ── Hell Yeah Films: supported social-link forwarding + dedup ──────────
-    if await _handle_social_link_dedup(message):
-        return
-
     # ── Duplicate URL check (across all channels) ──────────────────────────
+    if await _handle_duplicate_link_guard(message):
+        return
     _msg_urls = URL_RE.findall(message.content)
-    if _msg_urls and not _is_gif_url(_msg_urls[0]) and message.guild:
-        _dupe = _check_duplicate_url(_msg_urls[0], str(message.guild.id))
-        if _dupe:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            asyncio.create_task(_warn_duplicate_poster(message, _dupe))
-            return
 
     # ── Downloads channel — any URL posted here triggers auto-download ────
     if message.channel.id == DOWNLOAD_CHANNEL_ID:
@@ -6569,7 +6494,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         return
     if before.content == after.content:
         return
-    await _handle_social_link_edit(before, after)
+    await _handle_duplicate_link_guard_edit(before, after)
 
 
 # ─── Slash Commands ───────────────────────────────────────────────────────────
