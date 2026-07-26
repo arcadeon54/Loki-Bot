@@ -363,12 +363,21 @@ def suppressed_names() -> set[str]:
 
 
 # ── Sweep classification ───────────────────────────────────────────────────
-def classify_sweep(rows: list[tuple[str, str]]) -> dict:
+def classify_sweep(rows: list[tuple[str, str]],
+                   covered_elsewhere: Optional[set] = None) -> dict:
     """Sort one `docker ps -a` snapshot into the buckets the sweep may act on.
 
-    `rows` is [(container_name, status_string)]. Returns buckets keyed by what
-    the sweep is allowed to DO with them, not by what they are — so the caller
-    cannot accidentally treat inventory as an outage."""
+    `rows` is [(container_name, status_string)]. `covered_elsewhere` names the
+    containers that already have their own runbook-driven monitor check, so the
+    sweep defers to that rather than double-reporting them. A registry asset
+    with NO dedicated check is deliberately not in that set — it is managed and
+    expected to run, so the sweep is the only thing that would notice it
+    stopping.
+
+    Returns buckets keyed by what the sweep is allowed to DO with them, not by
+    what they are, so the caller cannot accidentally treat inventory as an
+    outage."""
+    covered = covered_elsewhere or set()
     incidents, unmanaged, suppressed, reappeared, pending_cleanup = [], [], [], [], []
     for name, status in rows:
         is_up = status.startswith("Up")
@@ -394,10 +403,8 @@ def classify_sweep(rows: list[tuple[str, str]]) -> dict:
         if c["state"] in NO_INCIDENT_STATES:
             (unmanaged if c["state"] == UNMANAGED else suppressed).append(entry)
             continue
-        # managed: an asset-registry container has its own runbook-driven
-        # check, so the sweep defers to that rather than double-reporting.
-        if c["source"] == "asset_registry":
-            continue
+        if name in covered:
+            continue   # its own runbook-driven check owns this one
         ok, _why = incident_allowed(name)
         (incidents if ok else suppressed).append(entry)
     return {"incidents": incidents, "unmanaged": unmanaged,

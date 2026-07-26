@@ -637,6 +637,20 @@ async def _check_docker_host(allow_repairs: bool) -> dict:
 
 
 # ── General container sweep (lifecycle-aware) ──────────────────────────────
+def _covered_elsewhere() -> set[str]:
+    """Containers of registry assets that have their OWN entry in MONITORS —
+    the sweep leaves those to their runbook-driven check. A registry asset with
+    no MONITORS entry (Immich, today) is deliberately NOT excluded: it is
+    managed and expected to run, so the sweep is the only thing that would
+    notice it stopping."""
+    names = set()
+    for key in MONITORS:
+        asset = hm._reg().get(key)
+        if asset is not None:
+            names.update(hm._reg().containers(asset))
+    return names
+
+
 async def _check_container_sweep(allow_repairs: bool) -> dict:
     """Detect-only sweep over every container on the host.
 
@@ -661,7 +675,7 @@ async def _check_container_sweep(allow_repairs: bool) -> dict:
 
     rows = [tuple(line.split("\t", 1)) for line in out.strip().splitlines()
             if "\t" in line]
-    buckets = lifecycle.classify_sweep(rows)
+    buckets = lifecycle.classify_sweep(rows, covered_elsewhere=_covered_elsewhere())
 
     incidents = buckets["incidents"]
     unmanaged = buckets["unmanaged"]

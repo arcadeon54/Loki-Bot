@@ -311,6 +311,28 @@ class TestSweep(LifecycleTestCase):
         self.assertTrue(lc.incident_allowed("worker")[0])
         self.assertTrue(lc.hermes_allowed("worker")[0])
 
+    def test_registry_asset_with_its_own_check_is_not_double_reported(self):
+        # jellyfin has a MONITORS entry, so the sweep defers to that check.
+        install_ops(MockOps(containers=[
+            ("jellyfin", "privacyserver", "lscr.io/jellyfin:latest",
+             "Exited (0) 1 hour ago", "", "npm_default")]))
+        result = run(mon._check_container_sweep(False))
+        self.assertTrue(result["healthy"])
+        self.assertIn("jellyfin", mon._covered_elsewhere())
+
+    def test_registry_asset_without_its_own_check_is_still_swept(self):
+        # immich is in the asset registry but has no MONITORS entry — the
+        # sweep is the only thing that would notice it stopping.
+        self.assertNotIn("immich_server", mon._covered_elsewhere())
+        install_ops(MockOps(containers=[
+            ("immich_server", "immich", "ghcr.io/immich:1",
+             "Exited (1) 3 minutes ago", "", "npm_default")]))
+        result = run(mon._check_container_sweep(False))
+        self.assertFalse(result["healthy"])
+        self.assertTrue(result["escalate"])
+        self.assertIn("immich_server", result["diagnosis"])
+        self.assertTrue(lc.incident_allowed("immich_server")[0])
+
     def test_ignored_and_expected_stopped_never_alert(self):
         install_ops(MockOps())
         for state in (lc.IGNORED, lc.EXPECTED_STOPPED):
