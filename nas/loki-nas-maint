@@ -379,11 +379,35 @@ def act_tracearr_restart_forensics():
                     "output": redact((entry.get("Output") or "").strip())[:300]})
     # Container-scoped docker events over a bounded window. Read-only: this
     # only reads the daemon's event journal, it never acts on the container.
+    #
+    # KNOWN LIMITATION — read before trusting an empty `events` list.
+    # `docker events --since` is served from an IN-MEMORY ring buffer (~256
+    # entries), not a persisted log. Every healthchecked container emits three
+    # exec_* events per probe, so on a host with several 10-30s healthchecks
+    # the buffer turns over in MINUTES. Asking for 48h returns only the last
+    # few minutes, and lifecycle events (die/start/restart) age out long before
+    # a caller sees them. Measured 2026-07-27 on dex247: 254 events for a
+    # requested 48h window, 100% of them exec_*, zero lifecycle events across
+    # 33 containers.
+    #
+    # Therefore an empty `events` list is NOT evidence that no restart
+    # happened. Use events_raw_count / events_raw_first_ts below to see how far
+    # back the buffer actually reached, and treat State.FinishedAt +
+    # RestartCount as the authoritative restart evidence instead.
     events = []
     ev_error = None
+    # Instrumentation: an empty `events` list is ambiguous on its own — it can
+    # mean the daemon's event ring buffer is too shallow to reach a restart, or
+    # that the container filter matched nothing at all. These counters tell the
+    # two apart without another round trip.
+    raw_count = 0
+    exec_excluded = 0
+    raw_first = raw_last = None
     try:
-        raw_ev = docker("events", "--since", "12h", "--until", "0s",
-                        "--filter", f"container={app['Names']}",
+        # Scope by container ID, not name: a name filter PREFIX-matches, so
+        # "tracearr" would also sweep in tracearr-db and tracearr-redis.
+        raw_ev = docker("events", "--since", "48h", "--until", "0s",
+                        "--filter", f"container={data.get('Id') or ''}",
                         "--filter", "type=container",
                         "--format", "{{json .}}", timeout=40)
         for line in raw_ev.splitlines():
@@ -394,9 +418,20 @@ def act_tracearr_restart_forensics():
                 e = json.loads(line)
             except ValueError:
                 continue
+            raw_count += 1
+            ts = e.get("time")
+            if ts is not None:
+                raw_first = ts if raw_first is None else min(raw_first, ts)
+                raw_last = ts if raw_last is None else max(raw_last, ts)
+            action = e.get("Action") or ""
+            # Healthcheck probes fire every 30s and would otherwise crowd the
+            # lifecycle events we actually need out of the window.
+            if action.startswith("exec_"):
+                exec_excluded += 1
+                continue
             attrs = (e.get("Actor") or {}).get("Attributes") or {}
             events.append({
-                "action": e.get("Action"),
+                "action": action,
                 "time": e.get("time"),
                 "time_nano": e.get("timeNano"),
                 "exit_code": attrs.get("exitCode"),
@@ -437,11 +472,20 @@ def act_tracearr_restart_forensics():
             "failing_streak": health.get("FailingStreak"),
             "log": log,
         },
-        "events": events[-40:],
+        "events": events[-60:],
+        "events_window": "48h, lifecycle only (exec_* healthcheck probes excluded)",
+        "events_raw_count": raw_count,
+        "events_exec_excluded": exec_excluded,
+        "events_raw_first_ts": raw_first,
+        "events_raw_last_ts": raw_last,
         "events_error": ev_error,
         "note": ("RestartCount increments only for restart-policy restarts "
                  "after the process exits; a manual `docker restart` does not "
-                 "increment it."),
+                 "increment it. An EMPTY events list proves nothing: the "
+                 "daemon's event ring buffer (~256 entries) is exhausted by "
+                 "healthcheck exec_* probes within minutes, so lifecycle "
+                 "events age out. Compare events_raw_first_ts against the "
+                 "requested window before drawing any conclusion."),
     }
 
 

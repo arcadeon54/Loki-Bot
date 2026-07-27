@@ -525,3 +525,68 @@ class DispatcherRedaction(unittest.TestCase):
         keep = self.mod.parse_labels(raw)
         self.assertIn("com.docker.compose.project", keep)
         self.assertNotIn("com.acme.db_password", keep)
+
+
+class EmptyEventsAreNotEvidence(unittest.TestCase):
+    """The docker event ring buffer cannot reach a restart on these hosts."""
+
+    def _f(self, events, restart_count=276):
+        return {"events": events, "restart_count": restart_count,
+                "restart_policy": "unless-stopped",
+                "state": {"started_at": "2026-07-27T20:51:54.744283Z",
+                          "finished_at": "2026-07-27T20:51:53.378794Z",
+                          "exit_code": 0, "error": "", "oom_killed": False},
+                "healthcheck": {"status": "healthy", "failing_streak": 0}}
+
+    def test_empty_events_carry_an_explicit_caveat(self):
+        out = nm.classify_restarts(self._f([]))
+        self.assertFalse(out["events_usable"])
+        self.assertIn("not evidence of stability", out["events_caveat"])
+
+    def test_empty_events_do_not_imply_stability(self):
+        out = nm.classify_restarts(self._f([]))
+        self.assertEqual(out["classification"], "confirmed_application_exit")
+        self.assertIn("ring buffer", out["reason"])
+
+    def test_sub_ten_second_gap_is_reported_as_policy_signature(self):
+        out = nm.classify_restarts(self._f([]))
+        self.assertAlmostEqual(out["restart_gap_seconds"], 1.365489, places=3)
+        self.assertIn("signature of the restart policy", out["reason"])
+
+    def test_gap_is_none_when_timestamps_are_missing(self):
+        f = self._f([])
+        f["state"]["finished_at"] = None
+        self.assertIsNone(nm.classify_restarts(f)["restart_gap_seconds"])
+
+    def test_usable_events_clear_the_caveat(self):
+        out = nm.classify_restarts(self._f([{"action": "die", "exit_code": "0"},
+                                            {"action": "start"}]))
+        self.assertTrue(out["events_usable"])
+        self.assertIsNone(out["events_caveat"])
+
+
+class PreparedHealthcheckFix(unittest.TestCase):
+    """The start_period defect is recorded but must never auto-apply."""
+
+    def setUp(self):
+        self.fix = (homelab_assets.load(force=True).get("tracearr")
+                    ["pending_fixes"]["healthcheck_start_period"])
+
+    def test_fix_is_prepared_not_applied(self):
+        self.assertEqual(self.fix["status"], "prepared_awaiting_approval")
+        self.assertIn("approval", self.fix["blocked_on"].lower())
+
+    def test_fix_records_observed_and_proposed_values(self):
+        self.assertEqual(self.fix["observed"]["start_period"], "5s")
+        self.assertEqual(self.fix["proposed"]["start_period"], "8m")
+
+    def test_fix_is_not_applied_by_loki(self):
+        self.assertEqual(self.fix["applied_by"], "manual_boss_edit_after_approval")
+
+    def test_fix_does_not_claim_to_cause_the_restarts(self):
+        self.assertIn("does not itself", self.fix["problem"].lower())
+
+    def test_no_dispatcher_action_can_edit_compose(self):
+        for action in nm.ACTIONS:
+            self.assertFalse(any(v in action for v in
+                                 ("edit", "write", "apply", "set", "compose")))

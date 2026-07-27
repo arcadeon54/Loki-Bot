@@ -243,6 +243,24 @@ async def _tool_tracearr_diagnose(args: dict, ctx: ToolContext) -> str:
     return json.dumps(report)
 
 
+def _restart_gap_seconds(state: dict):
+    """Seconds between the process exiting and being started again.
+
+    A sub-10s gap means the restart policy reacted immediately; a scheduler or
+    a human issuing `docker restart` produces a very different shape."""
+    import datetime
+    fin, sta = state.get("finished_at"), state.get("started_at")
+    if not fin or not sta:
+        return None
+    try:
+        f = datetime.datetime.fromisoformat(fin.replace("Z", "+00:00"))
+        s_ = datetime.datetime.fromisoformat(sta.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    delta = (s_ - f).total_seconds()
+    return delta if delta >= 0 else None
+
+
 def classify_restarts(forensics: dict) -> dict:
     """Classify restart churn from dispatcher forensics.
 
@@ -277,10 +295,21 @@ def classify_restarts(forensics: dict) -> dict:
                     "incrementing, so the process exits and the restart "
                     "policy brings it back")
     elif (forensics.get("restart_count") or 0) > 0 and not events:
-        cls, why = ("confirmed_application_exit",
-                    "RestartCount is incrementing, which only happens when "
-                    "the restart policy restarts an exited process; the event "
-                    "journal did not cover the window")
+        # docker events cannot help here: the daemon's ring buffer is exhausted
+        # by healthcheck exec_* probes within minutes, so lifecycle events are
+        # gone long before anyone asks. RestartCount plus the FinishedAt →
+        # StartedAt gap is the authoritative evidence instead.
+        gap = _restart_gap_seconds(state)
+        why = ("RestartCount is incrementing, which only happens when the "
+               "restart policy restarts a process that exited on its own; a "
+               "manual `docker restart` does not increment it")
+        if gap is not None and gap < 10:
+            why += (f"; the container restarted {gap:.1f}s after exiting, the "
+                    f"signature of the restart policy reacting immediately "
+                    f"rather than an external or scheduled command")
+        why += ("; the docker event journal could not corroborate this — its "
+                "ring buffer only reached back minutes, not to any restart")
+        cls = "confirmed_application_exit"
     else:
         cls, why = ("unresolved", "no event pattern matched")
     return {"classification": cls, "reason": why,
@@ -296,6 +325,12 @@ def classify_restarts(forensics: dict) -> dict:
             "healthcheck_status": hc.get("status"),
             "healthcheck_failing_streak": hc.get("failing_streak"),
             "event_actions": actions[-12:],
+            "restart_gap_seconds": _restart_gap_seconds(state),
+            "events_usable": bool(events),
+            "events_caveat": (None if events else
+                              "docker event ring buffer did not reach any "
+                              "restart; an empty list is not evidence of "
+                              "stability"),
             # A clean exit code is NOT evidence of health; it only means the
             # process chose to stop rather than crashing loudly.
             "clean_exit_is_not_healthy": True,

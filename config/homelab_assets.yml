@@ -266,6 +266,39 @@ assets:
       registry_tag_style: strip_v
       # Updates on the NAS are Watchtower's job. Loki has no update verb here.
       applied_by: watchtower-on-nas
+    # ── PREPARED, NOT APPLIED ────────────────────────────────────────────
+    # Approval-gated configuration fixes. Nothing here is executed by Loki;
+    # this is a durable record of a proven defect plus the exact intended
+    # change, so the eventual edit is reviewed rather than improvised.
+    pending_fixes:
+      healthcheck_start_period:
+        status: prepared_awaiting_approval
+        severity: medium
+        discovered: '2026-07-27'
+        # Observed on the running container via docker inspect.
+        observed:
+          start_period: 5s
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          test: wget --spider http://127.0.0.1:3000/health
+        problem: >
+          start_period is 5s but the application needs roughly 6 minutes to
+          reach READY (TimescaleDB checks, queue init, Plex SSE connect). After
+          every restart the container is therefore reported unhealthy for
+          minutes even though it is booting normally. This does not itself
+          cause restarts — Docker never restarts on unhealthy and no autoheal
+          container exists on the NAS — but it masks real health signal and
+          would defeat any depends_on: condition: service_healthy gating.
+        proposed:
+          start_period: 8m       # covers observed ~6m boot with headroom
+        file: /volume2/tracearr/docker-compose.yml
+        service: tracearr
+        # Editing compose on the NAS is OUTSIDE the dispatcher's read-only
+        # contract. This needs an explicit approved change by the Boss, not a
+        # new dispatcher verb.
+        applied_by: manual_boss_edit_after_approval
+        blocked_on: Boss approval; do not modify compose unprompted
     health:
       # Container listens on 3000; published to the NAS host as 3001.
       local_url: http://127.0.0.1:3001/health
