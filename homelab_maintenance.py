@@ -447,6 +447,16 @@ def _runbooks():
 
 
 async def run_runbook(asset: dict, allow_repairs: bool) -> tuple[dict, Ops]:
+    # Executor first: for a remote-executor asset "has no runbook" is true but
+    # useless — it reads like a gap to improvise around rather than a pointer
+    # to the tools that actually serve this asset.
+    if not homelab_assets.Registry.is_local(asset):
+        raise policy.PolicyError(
+            f"asset '{asset['key']}' is served by the "
+            f"'{homelab_assets.Registry.executor(asset)}' executor, not a local "
+            f"shell. Use the registered read-only tools for it (nas_status, "
+            f"tracearr_status, tracearr_diagnose, tracearr_update_check) — do "
+            f"not fall back to manual docker instructions.")
     name = asset.get("runbook")
     fn = _runbooks().get(name)
     if fn is None:
@@ -883,11 +893,13 @@ UNMANAGED_HOSTS = {
             "SSH is off in its UGREEN UI and no credential is installed, so "
             "there is no executor path to it from dex247"),
 }
+# The NAS itself and Tracearr are now REGISTERED assets served by the
+# nas_dispatcher executor, so they resolve normally and never reach this map.
+# What remains are NAS-hosted services with no registered tooling of their own.
 UNMANAGED_ASSETS = {
-    "tracearr": "nas", "plex": "nas", "ivn plex": "nas", "jellyseerr": "nas",
+    "plex": "nas", "ivn plex": "nas", "jellyseerr": "nas",
     "home assistant": "nas", "ha": "nas", "watchtower": "nas",
-    "ugreen": "nas", "ugreen nas": "nas", "unimatrix": "nas",
-    "unimatrix 001": "nas", "nas": "nas", "192 168 1 63": "nas",
+    "192 168 1 63": "nas",
 }
 
 

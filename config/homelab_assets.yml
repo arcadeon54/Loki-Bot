@@ -202,3 +202,80 @@ assets:
       # A schema migration that has already run cannot be undone by pulling the
       # old image back. When one has run, rollback is refused, not attempted.
       migration_makes_rollback_unsafe: true
+
+  # ── UGREEN NAS (remote executor) ────────────────────────────────────────
+  # Reached ONLY through the restricted dispatcher on the NAS: six literal
+  # read-only actions behind an enumerated sudoers allowlist. No docker-group
+  # membership, no wildcard docker sudo, no arbitrary command path. Facts below
+  # were discovered live on 2026-07-27; nothing here is inferred.
+  ugreen-nas:
+    display_name: UGREEN NAS
+    host: nas
+    executor: nas_dispatcher
+    type: nas_appliance
+    aliases:
+      - nas
+      - the nas
+      - ugreen
+      - ugreen nas
+      - unimatrix
+      - unimatrix-001
+    stateful: true
+    update_policy: approval_always
+    address: 192.168.1.63          # from existing ssh config; no credential here
+    ssh_alias: nas-maint           # ~/.ssh/config entry, dedicated key
+    dispatcher: /usr/local/sbin/loki-nas-maint
+    hostname: Unimatrix0001
+
+  tracearr:
+    display_name: Tracearr
+    host: nas
+    executor: nas_dispatcher
+    type: docker_stack
+    aliases:
+      - tracearr
+      - trace arr
+      - plex tracker
+      - plex stats
+      # Dependency phrasings resolve to the stack so a "Tracearr Redis" report
+      # runs the real dependency check instead of falling through to chat.
+      - tracearr redis
+      - tracearr db
+      - tracearr database
+      - tracearr postgres
+    stateful: true                 # TimescaleDB history + Redis queues
+    update_policy: approval_always
+    docker:
+      compose_project: tracearr
+      compose_file: /volume2/tracearr/docker-compose.yml
+      compose_service: tracearr
+      container: tracearr
+      image: ghcr.io/connorgallopo/tracearr
+      network: tracearr_tracearr-network
+      container_ip: 172.19.0.4
+      restart_policy: unless-stopped
+    version: v1.4.27
+    # Digest actually running as of discovery; an update must change this.
+    image_digest: sha256:4802c793336ec2393de8db1088b0c8aa170c8b8b0aa7bba33a56a599c5d72544
+    health:
+      # Container listens on 3000; published to the NAS host as 3001.
+      local_url: http://127.0.0.1:3001/health
+      public_url: https://tracearr.ivn-group.cc
+      container_port: 3000
+    # Both dependencies share tracearr_tracearr-network with the app. A
+    # Tracearr incident must check these, not the UGOS host redis on :6379.
+    dependencies:
+      redis:
+        container: tracearr-redis
+        compose_service: redis
+        image: redis:8-alpine
+        container_ip: 172.19.0.3
+        network_aliases: [redis, tracearr-redis]
+        health_field: redis        # key in Tracearr's /health payload
+      postgres:
+        container: tracearr-db
+        compose_service: timescale
+        image: timescale/timescaledb-ha:pg18.1-ts2.25.0
+        container_ip: 172.19.0.2
+        network_aliases: [timescale, tracearr-db]
+        health_field: db

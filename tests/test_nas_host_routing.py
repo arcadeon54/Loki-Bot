@@ -86,26 +86,35 @@ class NasIsNotAdvertisedAsOperable(unittest.TestCase):
 class NasAssetsResolveToTheRealBlocker(unittest.TestCase):
     """Tracearr and friends must produce an accurate answer, not a guess."""
 
-    NAS_NAMES = ["Tracearr", "tracearr", "nas", "NAS", "UGREEN",
-                 "UGREEN NAS", "Unimatrix", "192.168.1.63", "Plex",
-                 "Jellyseerr", "Watchtower"]
+    # NAS-hosted services that still have NO registered tooling. The NAS
+    # itself and Tracearr were promoted to real assets in Pass 2 and are
+    # covered by tests/test_nas_tracearr.py instead.
+    UNTOOLED_NAS_NAMES = ["Plex", "Jellyseerr", "Watchtower", "192.168.1.63"]
 
     def test_nas_hosted_names_report_the_unmanaged_host(self):
-        for name in self.NAS_NAMES:
+        for name in self.UNTOOLED_NAS_NAMES:
             with self.subTest(name=name):
                 asset, err = hm._resolve_or_error(name)
                 self.assertIsNone(asset, f"{name} must not resolve to a runbook")
                 self.assertIn("UGREEN NAS", err)
                 self.assertIn("not a managed host", err)
 
-    def test_phrases_containing_a_nas_asset_still_hit_the_blocker(self):
+    def test_phrases_containing_an_untooled_nas_asset_hit_the_blocker(self):
         """The Boss types sentences, not registry keys."""
-        for phrase in ("Tracearr Redis", "the NAS Plex server",
-                       "Tracearr redis backend"):
+        for phrase in ("the NAS Plex server", "jellyseerr on the nas"):
             with self.subTest(phrase=phrase):
                 asset, err = hm._resolve_or_error(phrase)
                 self.assertIsNone(asset)
                 self.assertIn("not a managed host", err)
+
+    def test_promoted_assets_now_resolve_instead_of_blocking(self):
+        """Pass 2 gave the NAS and Tracearr real executors and tools."""
+        for name, key in (("Tracearr", "tracearr"), ("Tracearr Redis", "tracearr"),
+                          ("nas", "ugreen-nas"), ("UGREEN NAS", "ugreen-nas")):
+            with self.subTest(name=name):
+                asset, err = hm._resolve_or_error(name)
+                self.assertIsNotNone(asset, err)
+                self.assertEqual(asset["key"], key)
 
     def test_registered_assets_win_over_unmanaged_matching(self):
         """Containment matching must never steal a real registered asset."""
@@ -116,11 +125,11 @@ class NasAssetsResolveToTheRealBlocker(unittest.TestCase):
 
     def test_nas_names_do_not_fall_through_to_unknown_asset(self):
         """The old path said 'unknown asset', which reads as 'try harder'."""
-        _, err = hm._resolve_or_error("Tracearr")
+        _, err = hm._resolve_or_error("Plex")
         self.assertNotIn("unknown asset", err)
 
     def test_manual_instruction_fallback_is_explicitly_blocked(self):
-        for name in ("Tracearr", "bogus-thing"):
+        for name in ("Plex", "bogus-thing"):
             with self.subTest(name=name):
                 _, err = hm._resolve_or_error(name)
                 self.assertIn("manual", err.lower())
@@ -140,10 +149,13 @@ class NasAssetsResolveToTheRealBlocker(unittest.TestCase):
                 asset, err = hm._resolve_or_error(name)
                 self.assertIsNotNone(asset, err)
 
-    def test_no_registered_asset_claims_a_non_dex247_host(self):
-        """The controller refuses remote action; nothing should promise it."""
+    def test_local_assets_all_live_on_dex247(self):
+        """Locally executed assets must be on this host; remote-executor
+        assets (the NAS, Tracearr) are exempt and covered separately."""
         reg = homelab_assets.load()
         for key, asset in reg.assets.items():
+            if not homelab_assets.Registry.is_local(asset):
+                continue
             with self.subTest(asset=key):
                 self.assertEqual(asset.get("host"), "dex247")
 

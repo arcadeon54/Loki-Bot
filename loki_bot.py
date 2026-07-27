@@ -206,6 +206,14 @@ except Exception as _hm_err:
         f"homelab maintenance unavailable: {_hm_err}")
 
 try:
+    import nas_maint  # side effect: registers nas_* / tracearr_* read-only tools
+    _nas_maint_available = nas_maint.enabled
+except Exception as _nas_err:
+    _nas_maint_available = False
+    logging.getLogger("NasMaint").warning(
+        f"NAS maintenance unavailable: {_nas_err}")
+
+try:
     import homelab_lifecycle  # side effect: registers lifecycle/decommission tools
     _homelab_lifecycle_available = homelab_lifecycle.enabled
 except Exception as _hl_err:

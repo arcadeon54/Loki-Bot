@@ -48,7 +48,10 @@ ROB = tools.ToolContext(user_id=CREW_ID, user_name="Rob", channel_id="tg:2")
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run(), not get_event_loop(): any sibling test file that used
+    # asyncio.run() before this one leaves no current loop in the thread, and
+    # get_event_loop() then raises instead of running the coroutine.
+    return asyncio.run(coro)
 
 
 # ── Mocked Docker ───────────────────────────────────────────────────────────

@@ -1,0 +1,16 @@
+# Loki NAS maintenance — the ONLY privileged capability granted to unimatrix_001.
+#
+# Each of the six actions is enumerated explicitly rather than using a trailing
+# wildcard. The dispatcher validates its own argv, but enumerating here means a
+# bug in that validation still cannot yield arbitrary arguments: sudo itself
+# refuses anything not literally listed below.
+#
+# There is deliberately no entry permitting docker, a shell, or any path other
+# than the dispatcher.
+
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint host_status
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint container_inventory
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_status
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_dependencies
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_recent_logs
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_update_check

@@ -27,7 +27,12 @@ REGISTRY_PATH = os.getenv(
                  "config", "homelab_assets.yml"))
 
 VALID_TYPES = {"wireless_access_point", "docker_service", "docker_stack",
-               "internal_service"}
+               "internal_service", "nas_appliance"}
+
+# Assets reached through something other than a local shell. The maintenance
+# controller runs local commands only, so anything declaring an executor is
+# served by that executor's own tools and never by a local runbook.
+LOCAL_EXECUTOR = "local"
 
 _IFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -103,6 +108,15 @@ class Registry:
     def on_this_host(self, asset: dict) -> bool:
         return socket.gethostname() == asset.get("host")
 
+    @staticmethod
+    def executor(asset: dict) -> str:
+        """Which executor owns this asset. Absent means the local shell."""
+        return str((asset or {}).get("executor") or LOCAL_EXECUTOR)
+
+    @classmethod
+    def is_local(cls, asset: dict) -> bool:
+        return cls.executor(asset) == LOCAL_EXECUTOR
+
     # ── policy inputs ─────────────────────────────────────────────────────
     def allowed_values(self) -> dict[str, set]:
         """Every parameter value a shell command may carry, derived strictly
@@ -111,6 +125,11 @@ class Registry:
                 "path": set(), "image": set(), "num": set(), "unit": set(),
                 "probe_ip": {"1.1.1.1", "9.9.9.9"}}
         for asset in self.assets.values():
+            # Only locally executed assets may contribute values to the local
+            # shell allowlist. A NAS container name must never become a legal
+            # parameter for a command running on dex247.
+            if not self.is_local(asset):
+                continue
             net = asset.get("network") or {}
             for f in ("wireless_interface", "vpn_interface"):
                 if net.get(f):

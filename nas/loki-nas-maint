@@ -1,0 +1,396 @@
+#!/usr/bin/python3
+"""
+loki-nas-maint — restricted read-only maintenance dispatcher for the UGREEN NAS.
+
+Installed root-owned at /usr/local/sbin/loki-nas-maint and reachable only via a
+single narrowly scoped sudoers rule. Loki calls it over SSH; it is the ONLY
+privileged entry point the NAS exposes to dex247.
+
+Contract:
+  - argv is exactly one token, matched against a fixed action table. There is
+    no path, container name, image, format string, Docker argument or shell
+    fragment a caller can influence. Targets are discovered internally.
+  - Only four read-only Docker verbs are ever executed: ps, inspect, logs
+    (bounded), stats --no-stream. No restart/stop/pull/exec/recreate exists in
+    this file, so no input can reach one.
+  - Output is JSON on stdout. Environment variable VALUES are never emitted —
+    only their names. Labels are allowlisted. Log lines pass a redactor.
+
+Exit codes: 0 ok · 2 unknown/malformed action · 3 discovery failed · 4 docker error
+"""
+
+import json
+import re
+import subprocess
+import sys
+
+DOCKER = "/usr/bin/docker"
+TIMEOUT = 25
+LOG_TAIL = "80"          # fixed bound; not caller-influenced
+MAX_LOG_CHARS = 6000
+
+# Labels safe to echo verbatim. Anything else is dropped rather than guessed at,
+# because vendor labels routinely carry connection strings and tokens.
+SAFE_LABELS = (
+    "com.docker.compose.project",
+    "com.docker.compose.service",
+    "com.docker.compose.project.config_files",
+    "com.centurylinklabs.watchtower.enable",
+    "org.opencontainers.image.title",
+    "org.opencontainers.image.version",
+    "org.opencontainers.image.revision",
+    "org.opencontainers.image.source",
+)
+
+# Redaction applied to every log line and any free-text field.
+_SECRET_PATTERNS = [
+    # key=value / key: value for anything credential-shaped
+    (re.compile(r"(?i)\b(pass(?:word|wd)?|secret|token|api[_-]?key|auth|"
+                r"bearer|session|cookie|private[_-]?key)\b\s*[=:]\s*\S+"),
+     r"\1=<REDACTED>"),
+    # "Authorization: Bearer <token>" / bare "Bearer <token>"
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer <REDACTED>"),
+    # credentials embedded in a URL: scheme://user:pass@host
+    (re.compile(r"\b([a-z][a-z0-9+.-]*://)[^:/\s@]+:[^@\s]+@"), r"\1<REDACTED>@"),
+    # bare long tokens (JWT-ish / hex / base64 blobs)
+    (re.compile(r"\b[A-Za-z0-9_-]{32,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b"),
+     "<REDACTED-JWT>"),
+    # Bare hex blobs, but NOT content-addressable digests (sha256:… , @sha256:…)
+    # or git revisions — those are public provenance and are exactly what an
+    # update check needs to compare.
+    (re.compile(r"(?<![:@])\b[0-9a-f]{40,}\b"), "<REDACTED-HEX>"),
+]
+
+
+def redact(text):
+    if not isinstance(text, str):
+        return text
+    for pat, repl in _SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+
+def fail(code, message):
+    print(json.dumps({"ok": False, "error": message}))
+    sys.exit(code)
+
+
+def docker(*args, timeout=TIMEOUT):
+    """Run a fixed docker argv. Never a shell, never caller-supplied strings."""
+    try:
+        p = subprocess.run([DOCKER, *args], capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        fail(4, "docker command timed out")
+    except OSError as e:
+        fail(4, f"cannot execute docker: {e.__class__.__name__}")
+    if p.returncode != 0:
+        fail(4, f"docker {args[0]} failed: {redact(p.stderr.strip())[:200]}")
+    return p.stdout
+
+
+# ── discovery ──────────────────────────────────────────────────────────────
+def ps_all():
+    """Every container (running + stopped) as dicts, from a fixed format."""
+    out = docker("ps", "--all", "--no-trunc", "--format", "{{json .}}")
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
+
+
+def parse_labels(raw):
+    """docker ps gives labels as k=v,k=v. Keep only the allowlist."""
+    keep = {}
+    for part in (raw or "").split(","):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        if k in SAFE_LABELS:
+            keep[k] = redact(v)
+    return keep
+
+
+def inspect(cid):
+    """Narrowly scoped inspect: one discovered id, whitelisted fields only."""
+    raw = docker("inspect", cid)
+    try:
+        data = json.loads(raw)[0]
+    except (ValueError, IndexError, KeyError):
+        fail(4, "could not parse docker inspect output")
+    state = data.get("State") or {}
+    health = (state.get("Health") or {}).get("Status")
+    cfg = data.get("Config") or {}
+    net = (data.get("NetworkSettings") or {}).get("Networks") or {}
+    networks = {}
+    for name, n in net.items():
+        networks[name] = {"ip": (n or {}).get("IPAddress") or None,
+                          "aliases": [a for a in ((n or {}).get("Aliases") or [])]}
+    labels = {k: redact(v) for k, v in (cfg.get("Labels") or {}).items()
+              if k in SAFE_LABELS}
+    return {
+        "name": (data.get("Name") or "").lstrip("/"),
+        "id_short": (data.get("Id") or "")[:12],
+        "image": redact(cfg.get("Image") or ""),
+        # Content-addressable id of the image actually running. Kept verbatim:
+        # it is a valid docker reference, so later actions resolve the image by
+        # THIS rather than by the redacted display string.
+        "image_id": data.get("Image") or "",
+        "image_digest": (data.get("Image") or "")[:19],
+        "created": data.get("Created"),
+        "state": state.get("Status"),
+        "running": bool(state.get("Running")),
+        "started_at": state.get("StartedAt"),
+        "restart_count": data.get("RestartCount"),
+        "health": health,
+        "exit_code": state.get("ExitCode"),
+        "oom_killed": state.get("OOMKilled"),
+        "restart_policy": ((data.get("HostConfig") or {}).get("RestartPolicy")
+                           or {}).get("Name"),
+        # NAMES ONLY — values are secrets by default.
+        "env_var_names": sorted({e.split("=", 1)[0]
+                                 for e in (cfg.get("Env") or []) if "=" in e}),
+        "labels": labels,
+        "networks": networks,
+    }
+
+
+def find_tracearr(rows):
+    """Identify Tracearr without trusting any caller input.
+
+    Evidence, in order: compose service/project label, image reference, the
+    published 3001 port, then container name. First match wins."""
+    for row in rows:
+        labels = parse_labels(row.get("Labels"))
+        hay = " ".join([
+            labels.get("com.docker.compose.service", ""),
+            labels.get("com.docker.compose.project", ""),
+            labels.get("org.opencontainers.image.title", ""),
+            row.get("Image", ""), row.get("Names", ""),
+        ]).lower()
+        if "tracearr" in hay:
+            return row
+    for row in rows:
+        if ":3001->" in (row.get("Ports") or ""):
+            return row
+    return None
+
+
+def project_of(row):
+    return parse_labels(row.get("Labels")).get("com.docker.compose.project")
+
+
+def siblings(rows, project):
+    if not project:
+        return []
+    return [r for r in rows if project_of(r) == project]
+
+
+def classify(row):
+    """Role of a container from its image + compose service name."""
+    labels = parse_labels(row.get("Labels"))
+    svc = labels.get("com.docker.compose.service", "").lower()
+    image = (row.get("Image") or "").lower()
+    blob = f"{svc} {image}"
+    if "redis" in blob or "valkey" in blob:
+        return "redis"
+    if "timescale" in blob or "postgres" in blob or "pgvector" in blob:
+        return "postgres"
+    if "tracearr" in blob:
+        return "tracearr"
+    return "other"
+
+
+def tracearr_or_die(rows):
+    row = find_tracearr(rows)
+    if row is None:
+        fail(3, "Tracearr container not found by label, image, port or name")
+    return row
+
+
+def stack(rows):
+    """The Tracearr container plus its compose siblings, classified."""
+    app = tracearr_or_die(rows)
+    project = project_of(app)
+    members = siblings(rows, project) or [app]
+    found = {"tracearr": None, "redis": None, "postgres": None, "other": []}
+    for r in members:
+        role = classify(r)
+        if role == "other":
+            found["other"].append(r)
+        elif found[role] is None:
+            found[role] = r
+    if found["tracearr"] is None:
+        found["tracearr"] = app
+    return project, found
+
+
+# ── actions ────────────────────────────────────────────────────────────────
+def act_host_status():
+    def read(path):
+        try:
+            with open(path) as f:
+                return f.read()
+        except OSError:
+            return ""
+    mem = {}
+    for line in read("/proc/meminfo").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            if k in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
+                mem[k] = v.strip()
+    df = subprocess.run(["/bin/df", "-h", "/", "/volume1", "/volume2"],
+                        capture_output=True, text=True, timeout=15)
+    disks = []
+    for line in df.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 6:
+            disks.append({"fs": parts[0][:40], "size": parts[1], "used": parts[2],
+                          "avail": parts[3], "use_pct": parts[4], "mount": parts[5]})
+    rows = ps_all()
+    return {"uptime_seconds": int(float((read("/proc/uptime") or "0").split()[0] or 0)),
+            "memory": mem, "disks": disks,
+            "containers_total": len(rows),
+            "containers_running": sum(1 for r in rows
+                                      if (r.get("State") or "") == "running")}
+
+
+def act_container_inventory():
+    out = []
+    for r in ps_all():
+        labels = parse_labels(r.get("Labels"))
+        out.append({"name": r.get("Names"), "state": r.get("State"),
+                    "status": redact(r.get("Status") or ""),
+                    "image": redact(r.get("Image") or ""),
+                    "compose_project": labels.get("com.docker.compose.project"),
+                    "compose_service": labels.get("com.docker.compose.service")})
+    out.sort(key=lambda c: (c["compose_project"] or "~", c["name"] or ""))
+    return {"containers": out, "count": len(out)}
+
+
+def act_tracearr_status():
+    rows = ps_all()
+    project, found = stack(rows)
+    app = inspect(found["tracearr"]["ID"])
+    stats = _stats([found["tracearr"]["ID"]])
+    return {"compose_project": project, "tracearr": app,
+            "resource_usage": stats}
+
+
+def act_tracearr_dependencies():
+    rows = ps_all()
+    project, found = stack(rows)
+    result = {"compose_project": project, "dependencies": {}}
+    for role in ("tracearr", "redis", "postgres"):
+        row = found.get(role)
+        result["dependencies"][role] = inspect(row["ID"]) if row else None
+    # Network relationship: which networks the app shares with each dependency.
+    app_nets = set((result["dependencies"]["tracearr"] or {}).get("networks", {}))
+    shared = {}
+    for role in ("redis", "postgres"):
+        dep = result["dependencies"][role]
+        shared[role] = sorted(app_nets & set((dep or {}).get("networks", {})))
+    result["shared_networks"] = shared
+    result["other_stack_members"] = [r.get("Names") for r in found["other"]]
+    return result
+
+
+def act_tracearr_recent_logs():
+    rows = ps_all()
+    _, found = stack(rows)
+    logs = {}
+    for role in ("tracearr", "redis", "postgres"):
+        row = found.get(role)
+        if not row:
+            logs[role] = None
+            continue
+        out = docker("logs", "--tail", LOG_TAIL, "--timestamps", row["ID"])
+        lines = [redact(ln) for ln in out.splitlines()]
+        blob = "\n".join(lines)[-MAX_LOG_CHARS:]
+        logs[role] = {"container": row.get("Names"),
+                      "lines_returned": len(lines),
+                      "tail": blob}
+    return {"logs": logs, "tail_limit": int(LOG_TAIL)}
+
+
+def act_tracearr_update_check():
+    """Local image provenance only. This dispatcher never contacts a registry
+    and never pulls; a real version comparison is the caller's job."""
+    rows = ps_all()
+    project, found = stack(rows)
+    out = {"compose_project": project, "images": {}}
+    for role in ("tracearr", "redis", "postgres"):
+        row = found.get(role)
+        if not row:
+            out["images"][role] = None
+            continue
+        d = inspect(row["ID"])
+        # Resolve by image id, never by the redacted display string.
+        raw = docker("image", "inspect", d["image_id"])
+        try:
+            img = json.loads(raw)[0]
+        except (ValueError, IndexError):
+            img = {}
+        out["images"][role] = {
+            "container": d["name"],
+            "image": d["image"],
+            "image_created": img.get("Created"),
+            "repo_digests": [rd[:60] for rd in (img.get("RepoDigests") or [])],
+            "container_started": d["started_at"],
+            "watchtower_enabled":
+                d["labels"].get("com.centurylinklabs.watchtower.enable"),
+        }
+    out["note"] = ("local image metadata only — no registry query, no pull. "
+                   "Watchtower on the NAS performs actual updates.")
+    return out
+
+
+def _stats(ids):
+    """docker stats --no-stream over discovered ids only."""
+    out = docker("stats", "--no-stream", "--format", "{{json .}}", *ids)
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            s = json.loads(line)
+        except ValueError:
+            continue
+        rows.append({"name": s.get("Name"), "cpu_pct": s.get("CPUPerc"),
+                     "mem_usage": s.get("MemUsage"), "mem_pct": s.get("MemPerc"),
+                     "pids": s.get("PIDs")})
+    return rows
+
+
+ACTIONS = {
+    "host_status": act_host_status,
+    "container_inventory": act_container_inventory,
+    "tracearr_status": act_tracearr_status,
+    "tracearr_dependencies": act_tracearr_dependencies,
+    "tracearr_recent_logs": act_tracearr_recent_logs,
+    "tracearr_update_check": act_tracearr_update_check,
+}
+
+
+def main():
+    argv = sys.argv[1:]
+    if len(argv) != 1:
+        fail(2, f"exactly one action required; known: {sorted(ACTIONS)}")
+    action = argv[0]
+    # Strict token: no paths, flags, separators or shell metacharacters survive.
+    if not re.fullmatch(r"[a-z][a-z0-9_]{2,39}", action) or action not in ACTIONS:
+        fail(2, f"unknown action; known: {sorted(ACTIONS)}")
+    payload = ACTIONS[action]()
+    print(json.dumps({"ok": True, "action": action, "data": payload},
+                     default=str))
+
+
+if __name__ == "__main__":
+    main()
