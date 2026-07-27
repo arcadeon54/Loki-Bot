@@ -145,6 +145,7 @@ class DispatcherActionAllowlist(unittest.TestCase):
         self.assertEqual(sorted(nm.ACTIONS), sorted([
             "container_inventory", "host_status", "tracearr_dependencies",
             "tracearr_recent_logs", "tracearr_restart_forensics",
+            "tracearr_exit_window_logs",
             "tracearr_status", "tracearr_update_check"]))
 
     def test_no_state_changing_verb_is_reachable(self):
@@ -590,3 +591,58 @@ class PreparedHealthcheckFix(unittest.TestCase):
         for action in nm.ACTIONS:
             self.assertFalse(any(v in action for v in
                                  ("edit", "write", "apply", "set", "compose")))
+
+
+class ExitWindowLogAction(unittest.TestCase):
+    def test_action_is_in_the_allowlist(self):
+        self.assertIn("tracearr_exit_window_logs", nm.ACTIONS)
+
+    def test_action_takes_no_arguments(self):
+        for bad in ("tracearr_exit_window_logs x", "tracearr_exit_window_logs;id"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(nm.NasError):
+                    run(nm.run_action(bad))
+
+    def test_dispatcher_source_invokes_no_state_changing_docker_verb(self):
+        """Stronger than a name check: the artifact itself must not contain a
+        docker call that could change state. (`tracearr_restart_forensics` is
+        a read-only *name* containing 'restart', so names prove nothing.)"""
+        import os as _os
+        path = _os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))), "nas", "loki-nas-maint")
+        src = open(path).read()
+        for verb in ("restart", "stop", "kill", "pull", "rm", "create",
+                     "exec", "run", "update", "commit", "push"):
+            for call in (f'docker("{verb}"', f"docker('{verb}'",
+                         f'docker_try("{verb}"', f"docker_try('{verb}'"):
+                self.assertNotIn(call, src, f"dispatcher can invoke: {call}")
+
+    def test_dispatcher_only_invokes_readonly_verbs(self):
+        import os as _os, re as _re
+        path = _os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))), "nas", "loki-nas-maint")
+        src = open(path).read()
+        verbs = set(_re.findall(r'docker(?:_try)?\(\s*"([a-z]+)"', src))
+        self.assertTrue(verbs <= {"ps", "inspect", "logs", "stats", "events",
+                                  "image"}, f"unexpected docker verbs: {verbs}")
+
+
+class RestartChurnFinding(unittest.TestCase):
+    def setUp(self):
+        self.f = (homelab_assets.load(force=True).get("tracearr")
+                  ["known_issues"]["restart_churn"])
+
+    def test_classified_as_application_bug(self):
+        self.assertEqual(self.f["classification"], "application_bug")
+        self.assertEqual(self.f["confidence"], "high")
+
+    def test_no_automatic_repair(self):
+        self.assertIn("none", self.f["automatic_repair"])
+
+    def test_healthcheck_is_explicitly_excluded_as_cause(self):
+        joined = " ".join(self.f["not_caused_by"]).lower()
+        self.assertIn("healthcheck", joined)
+        self.assertIn("watchtower", joined)
+
+    def test_upstream_fix_not_claimed(self):
+        self.assertFalse(self.f["upstream_fix_available"])

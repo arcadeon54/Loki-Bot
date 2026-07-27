@@ -15,3 +15,4 @@ unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_depen
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_recent_logs
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_update_check
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_restart_forensics
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_exit_window_logs

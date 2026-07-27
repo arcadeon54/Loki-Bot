@@ -21,6 +21,7 @@ Contract:
 Exit codes: 0 ok · 2 unknown/malformed action · 3 discovery failed · 4 docker error
 """
 
+import datetime
 import json
 import re
 import subprocess
@@ -30,6 +31,17 @@ DOCKER = "/usr/bin/docker"
 TIMEOUT = 25
 LOG_TAIL = "80"          # fixed bound; not caller-influenced
 MAX_LOG_CHARS = 6000
+
+# Bounded exit-window log query. All fixed: no caller influences any of these.
+PRE_EXIT_SECONDS = 480       # 8 minutes of context before the exit
+POST_START_SECONDS = 240     # 4 minutes after the restart
+PRE_LINE_CAP = 160           # lines kept immediately BEFORE the exit
+POST_LINE_CAP = 60           # lines kept immediately AFTER the restart
+LINE_CHAR_CAP = 400
+# Descending tail depths tried when reading the exit window. Fixed list; a
+# caller cannot influence it. Deepest first so we reach as far back as the log
+# allows, falling back when a corrupted region blocks a deeper read.
+TAIL_LADDER = (20000, 10000, 4000, 1500, 400, 100)
 
 # Labels safe to echo verbatim. Anything else is dropped rather than guessed at,
 # because vendor labels routinely carry connection strings and tokens.
@@ -75,6 +87,21 @@ def redact(text):
 def fail(code, message):
     print(json.dumps({"ok": False, "error": message}))
     sys.exit(code)
+
+
+def docker_try(*args, timeout=TIMEOUT):
+    """Like docker(), but returns (ok, stdout, stderr) instead of exiting.
+
+    Needed where a failure is expected and recoverable — notably reading logs
+    from a json-file that has a corrupted region."""
+    try:
+        p = subprocess.run([DOCKER, *args], capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "", "timeout"
+    except OSError as e:
+        return False, "", e.__class__.__name__
+    return p.returncode == 0, p.stdout, redact(p.stderr.strip())[:300]
 
 
 def docker(*args, timeout=TIMEOUT):
@@ -489,6 +516,120 @@ def act_tracearr_restart_forensics():
     }
 
 
+def act_tracearr_exit_window_logs():
+    """Persisted logs bracketing the LAST container exit.
+
+    docker logs is written to disk by the json-file driver and survives
+    restarts, so unlike the event ring buffer it can still answer what the
+    application was doing when it exited. The window is derived internally
+    from State.FinishedAt/StartedAt — a caller supplies nothing.
+    """
+    rows = ps_all()
+    _project, found = stack(rows)
+    app = found["tracearr"]
+    raw = docker("inspect", app["ID"])
+    try:
+        data = json.loads(raw)[0]
+    except (ValueError, IndexError):
+        fail(4, "could not parse docker inspect output")
+    state = data.get("State") or {}
+    fin, sta = state.get("FinishedAt"), state.get("StartedAt")
+    if not fin or fin.startswith("0001-01-01"):
+        fail(3, "container has no recorded FinishedAt — it has never exited")
+
+    def _parse(ts):
+        # RFC3339 with variable fractional digits; trim to microseconds.
+        t = (ts or "").replace("Z", "+00:00")
+        if "." in t:
+            head, rest = t.split(".", 1)
+            frac = "".join(c for c in rest if c.isdigit())[:6]
+            tz = rest[len(frac):] if not rest[len(frac):].isdigit() else "+00:00"
+            t = f"{head}.{frac.ljust(6, '0')}{tz or '+00:00'}"
+        return datetime.datetime.fromisoformat(t)
+
+    try:
+        f_dt = _parse(fin)
+        s_dt = _parse(sta) if sta else f_dt
+    except ValueError:
+        fail(3, "could not parse container timestamps")
+
+    since = (f_dt - datetime.timedelta(seconds=PRE_EXIT_SECONDS))
+    until = (s_dt + datetime.timedelta(seconds=POST_START_SECONDS))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+    # This container's json-file log has a CORRUPTED region: a --since/--until
+    # query makes the daemon scan forward from an offset and it dies with
+    #   Error grabbing logs: invalid character '\x00' looking for beginning of value
+    # Reading BACKWARD with --tail avoids that region entirely, so take a tail
+    # and filter to the window here. Walk a descending ladder so a corruption
+    # that sits inside a deep tail degrades to a shallower one instead of
+    # failing outright.
+    out, used_tail, corruption, last_err = "", None, False, ""
+    for cap in TAIL_LADDER:
+        ok, text, err = docker_try("logs", "--timestamps", "--tail", str(cap),
+                                   app["ID"], timeout=60)
+        if ok:
+            out, used_tail = text, cap
+            break
+        last_err = err
+        if "\\x00" in err or "invalid character" in err:
+            corruption = True
+        continue
+    if used_tail is None:
+        fail(4, f"could not read logs at any tail depth {list(TAIL_LADDER)}: "
+                f"{last_err}")
+
+    pre, post = [], []
+    for line in out.splitlines():
+        line = redact(line.rstrip())[:LINE_CHAR_CAP]
+        if not line:
+            continue
+        stamp = line.split(" ", 1)[0]
+        try:
+            when = _parse(stamp)
+        except (ValueError, IndexError):
+            # Unstamped continuation line: attribute it to the side we are on.
+            (post if post else pre).append(line)
+            continue
+        (pre if when <= f_dt else post).append(line)
+    # Only keep pre-exit lines inside the window, and record whether the tail
+    # reached far enough back to cover it.
+    window_reached = False
+    if pre:
+        try:
+            oldest = _parse(pre[0].split(" ", 1)[0])
+            window_reached = oldest <= since
+        except (ValueError, IndexError):
+            window_reached = False
+    truncated = len(pre) > PRE_LINE_CAP or len(post) > POST_LINE_CAP
+    return {
+        "container": app.get("Names"),
+        "window_since": since.astimezone(datetime.timezone.utc).strftime(fmt),
+        "window_until": until.astimezone(datetime.timezone.utc).strftime(fmt),
+        "finished_at": fin,
+        "started_at": sta,
+        "restart_count": data.get("RestartCount"),
+        # Lines closest to the exit are the interesting ones, so keep the TAIL
+        # of the pre-exit side and the HEAD of the post-start side.
+        "pre_exit_lines": pre[-PRE_LINE_CAP:],
+        "post_start_lines": post[:POST_LINE_CAP],
+        "pre_exit_total": len(pre),
+        "post_start_total": len(post),
+        "truncated": truncated,
+        "tail_depth_used": used_tail,
+        # True when a deeper read was rejected by the NUL-corrupted region.
+        "log_corruption_detected": corruption,
+        # Did the tail actually reach back past the start of the window? If
+        # false, the pre-exit context is incomplete and must not be read as
+        # "nothing happened before the exit".
+        "window_reached": window_reached,
+        "note": ("persisted json-file logs read BACKWARD via --tail, because a "
+                 "--since/--until scan hits a corrupted (NUL) region in this "
+                 "container's json-file log. Window derived internally from "
+                 "State.FinishedAt/StartedAt."),
+    }
+
+
 def _stats(ids):
     """docker stats --no-stream over discovered ids only."""
     out = docker("stats", "--no-stream", "--format", "{{json .}}", *ids)
@@ -515,6 +656,7 @@ ACTIONS = {
     "tracearr_recent_logs": act_tracearr_recent_logs,
     "tracearr_update_check": act_tracearr_update_check,
     "tracearr_restart_forensics": act_tracearr_restart_forensics,
+    "tracearr_exit_window_logs": act_tracearr_exit_window_logs,
 }
 
 

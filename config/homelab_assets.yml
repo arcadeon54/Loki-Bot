@@ -266,6 +266,40 @@ assets:
       registry_tag_style: strip_v
       # Updates on the NAS are Watchtower's job. Loki has no update verb here.
       applied_by: watchtower-on-nas
+    known_issues:
+      restart_churn:
+        status: root_cause_identified
+        classification: application_bug
+        confidence: high
+        evidence_from: persisted container logs, exit window 2026-07-27T20:47:53Z..20:51:53Z
+        # Proven chain, in order, from one captured exit:
+        #   20:50:44  app enters maintenance mode, drains every queue
+        #   20:50:59  queues re-initialise (recovering, no exit yet)
+        #   20:51:46  [Backup] worker starts; startup version check runs
+        #   20:51:51  level-50 DrizzleQueryError reading the backup schedule
+        #             settings rows on a terminated Postgres connection
+        #   20:51:53  process exits 0; policy restarts it 1.4s later
+        failing_query_params:
+          - backupScheduleType
+          - backupScheduleTime
+          - backupScheduleDayOfWeek
+          - backupScheduleDayOfMonth
+          - backupRetentionCount
+        exit_code: 0            # a failed startup query reporting success
+        signals_seen: none      # no SIGTERM/SIGINT in the window
+        note: >
+          The backup SCHEDULER's settings read fails — no backup job runs. The
+          app's own maintenance-mode cycle appears to cycle the database
+          connection, and the subsequent settings query is not retried or
+          guarded, so an unhandled rejection terminates the process. Exit code
+          0 is itself part of the defect.
+        not_caused_by:
+          - healthcheck start_period (Docker never restarts on unhealthy here)
+          - Redis or PostgreSQL outage (both stable, 0 restarts)
+          - Watchtower, compose recreation, external docker restart
+        upstream_fix_available: false   # v1.4.28..v1.5.0 notes do not mention it
+        automatic_repair: none — upstream defect, not a local misconfiguration
+
     # ── PREPARED, NOT APPLIED ────────────────────────────────────────────
     # Approval-gated configuration fixes. Nothing here is executed by Loki;
     # this is a durable record of a proven defect plus the exact intended

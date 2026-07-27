@@ -45,6 +45,7 @@ ACTIONS = (
     "tracearr_recent_logs",
     "tracearr_update_check",
     "tracearr_restart_forensics",
+    "tracearr_exit_window_logs",
 )
 
 DEFAULT_TIMEOUT = 45
