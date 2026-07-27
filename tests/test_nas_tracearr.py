@@ -646,3 +646,61 @@ class RestartChurnFinding(unittest.TestCase):
 
     def test_upstream_fix_not_claimed(self):
         self.assertFalse(self.f["upstream_fix_available"])
+
+
+class ErrorExtractionRedaction(unittest.TestCase):
+    """SQL parameter values must never leave the NAS."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "nas", "loki-nas-maint")
+        spec = importlib.util.spec_from_loader("dispatcher2", None)
+        cls.mod = importlib.util.module_from_spec(spec)
+        exec(open(path).read().split("def act_tracearr_exit_window_logs")[0],
+             cls.mod.__dict__)
+
+    def test_sql_parameter_values_are_stripped(self):
+        msg = ('Failed query: select "name" from "settings" where "name" '
+               'in ($1, $2)\nparams: apiToken,dbPassword: Connection terminated')
+        sql, reason = self.mod._strip_sql_params(msg)
+        for leaked in ("apiToken", "dbPassword"):
+            self.assertNotIn(leaked, sql)
+            self.assertNotIn(leaked, reason)
+        self.assertIn("2 value(s) REDACTED", sql)
+
+    def test_postgres_reason_is_separated_from_sql(self):
+        msg = ('Failed query: select 1\nparams: a: connect EHOSTUNREACH '
+               '172.19.0.2:5432')
+        sql, reason = self.mod._strip_sql_params(msg)
+        self.assertEqual(reason, "connect EHOSTUNREACH 172.19.0.2:5432")
+        self.assertNotIn("EHOSTUNREACH", sql)
+
+    def test_errors_are_anchored_on_the_exit_not_the_tail_start(self):
+        import datetime
+
+        def parse(ts):
+            return datetime.datetime.fromisoformat(
+                ts.replace("Z", "+00:00").replace(".000000", ""))
+
+        lines = [f'2026-07-27T{h}:00:00Z {{"level":50,"err":'
+                 f'{{"type":"OLD{h}","message":"m"}}}}' for h in
+                 ("11", "12", "13", "19", "20")]
+        lines.append('2026-07-27T20:51:51Z {"level":50,"err":'
+                     '{"type":"NEAREXIT","message":"boom"}}')
+        picked = self.mod._extract_errors(
+            lines, parse("2026-07-27T20:51:53Z"), parse)
+        types = [e["error_type"] for e in picked]
+        self.assertIn("NEAREXIT", types, "exit-adjacent error was dropped")
+        self.assertNotIn("OLD11", types, "oldest tail error should not win")
+
+    def test_error_output_is_bounded(self):
+        lines = [f'2026-07-27T20:00:{i:02d}Z {{"level":50,"err":'
+                 f'{{"type":"E","message":"{"x" * 5000}"}}}}' for i in range(30)]
+        picked = self.mod._extract_errors(lines)
+        self.assertLessEqual(len(picked), self.mod.MAX_ERROR_OBJECTS)
+        for e in picked:
+            self.assertLessEqual(len(e["error_message"]),
+                                 self.mod.ERROR_LINE_CHAR_CAP)
+            self.assertTrue(e["line_truncated"])

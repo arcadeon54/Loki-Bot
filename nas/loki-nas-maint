@@ -37,7 +37,14 @@ PRE_EXIT_SECONDS = 480       # 8 minutes of context before the exit
 POST_START_SECONDS = 240     # 4 minutes after the restart
 PRE_LINE_CAP = 160           # lines kept immediately BEFORE the exit
 POST_LINE_CAP = 60           # lines kept immediately AFTER the restart
-LINE_CHAR_CAP = 400
+LINE_CHAR_CAP = 400          # ordinary log lines stay tight
+# Error-level lines only: enough to carry a complete Drizzle/PostgreSQL error
+# object. Bounded, and capped in count by MAX_ERROR_OBJECTS so total output
+# cannot grow with log volume.
+ERROR_LINE_CHAR_CAP = 2000
+SQL_CONTEXT_CAP = 600
+ERROR_REASON_CAP = 300
+MAX_ERROR_OBJECTS = 5
 # Descending tail depths tried when reading the exit window. Fixed list; a
 # caller cannot influence it. Deepest first so we reach as far back as the log
 # allows, falling back when a corrupted region blocks a deeper read.
@@ -516,6 +523,83 @@ def act_tracearr_restart_forensics():
     }
 
 
+def _strip_sql_params(message):
+    """Split a Drizzle 'Failed query' message into SQL, params and cause.
+
+    Returns (sql_redacted, postgres_reason). The bound parameter VALUES are
+    dropped entirely and never returned — only their count — because a failing
+    query can just as easily be carrying a token or a password as a setting
+    name."""
+    if not isinstance(message, str):
+        return "", ""
+    sql, reason = "", ""
+    body = message
+    if "Failed query:" in body:
+        body = body.split("Failed query:", 1)[1]
+    if "params:" in body:
+        sql, rest = body.split("params:", 1)
+        # Everything after the parameter list, past the final ": ", is the
+        # driver's cause string (e.g. "Connection terminated due to ...").
+        params, _, tail = rest.partition(": ")
+        n = len([p for p in params.split(",") if p.strip()])
+        sql = f"{sql.strip()}  [params: {n} value(s) REDACTED]"
+        reason = tail.strip()
+    else:
+        sql = body.strip()
+    return redact(sql)[:SQL_CONTEXT_CAP], redact(reason)[:ERROR_REASON_CAP]
+
+
+def _extract_errors(raw_lines, boundary=None, parse=None):
+    """Structured error objects from error-level JSON log lines.
+
+    Only these lines get the larger character budget; ordinary request-log
+    lines stay at the normal cap so total output remains bounded.
+
+    Selection is anchored on the EXIT, not on the start of the tail: the tail
+    spans many hours, and the errors that explain a specific exit are the ones
+    immediately before it. Taking the first N found returns the oldest errors
+    in the tail, which is almost never what a caller wants.
+    """
+    found = []
+    for line in raw_lines:
+        if '"level":50' not in line and '"err"' not in line:
+            continue
+        payload = line.split(" ", 1)[-1]
+        brace = payload.find("{")
+        if brace < 0:
+            continue
+        try:
+            rec = json.loads(payload[brace:])
+        except ValueError:
+            continue
+        err = rec.get("err") or {}
+        if not err:
+            continue
+        message = err.get("message") or ""
+        sql, reason = _strip_sql_params(message)
+        found.append({
+            "timestamp": line.split(" ", 1)[0],
+            "error_type": redact(str(err.get("type") or ""))[:120],
+            "error_message": redact(message)[:ERROR_LINE_CHAR_CAP],
+            "postgres_reason": reason,
+            "query_context_redacted": sql,
+            "line_truncated": len(message) > ERROR_LINE_CHAR_CAP,
+        })
+    if boundary is None or parse is None:
+        return found[-MAX_ERROR_OBJECTS:]
+    # Anchor on the exit: the last errors before it, plus a couple after the
+    # restart to show whether the same fault recurs immediately.
+    before, after = [], []
+    for e in found:
+        try:
+            when = parse(e["timestamp"])
+        except (ValueError, IndexError):
+            continue
+        (before if when <= boundary else after).append(e)
+    picked = before[-(MAX_ERROR_OBJECTS - 2):] + after[:2]
+    return picked or found[-MAX_ERROR_OBJECTS:]
+
+
 def act_tracearr_exit_window_logs():
     """Persisted logs bracketing the LAST container exit.
 
@@ -579,6 +663,7 @@ def act_tracearr_exit_window_logs():
         fail(4, f"could not read logs at any tail depth {list(TAIL_LADDER)}: "
                 f"{last_err}")
 
+    raw_lines = [redact(l.rstrip()) for l in out.splitlines() if l.strip()]
     pre, post = [], []
     for line in out.splitlines():
         line = redact(line.rstrip())[:LINE_CHAR_CAP]
@@ -619,6 +704,10 @@ def act_tracearr_exit_window_logs():
         "tail_depth_used": used_tail,
         # True when a deeper read was rejected by the NUL-corrupted region.
         "log_corruption_detected": corruption,
+        # Structured errors get a larger per-line budget than ordinary lines;
+        # SQL parameter VALUES are never included.
+        "errors": _extract_errors(raw_lines, f_dt, _parse),
+        "errors_anchored_on": "exit boundary (finished_at)",
         # Did the tail actually reach back past the start of the window? If
         # false, the pre-exit context is incomplete and must not be read as
         # "nothing happened before the exit".
