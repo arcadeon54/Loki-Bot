@@ -874,13 +874,48 @@ def _boss_only(ctx: ToolContext) -> str:
         "homelab maintenance is Boss-only"
 
 
+# Assets that exist in the homelab but live on a host this controller cannot
+# reach. They are NOT registry entries (no runbook can run against them), but
+# naming them explicitly turns "unknown asset" into an accurate answer instead
+# of a guess. Keep in sync with skillkit config/hosts.json `enabled: false`.
+UNMANAGED_HOSTS = {
+    "nas": ("the UGREEN NAS (192.168.1.63)",
+            "SSH is off in its UGREEN UI and no credential is installed, so "
+            "there is no executor path to it from dex247"),
+}
+UNMANAGED_ASSETS = {
+    "tracearr": "nas", "plex": "nas", "ivn plex": "nas", "jellyseerr": "nas",
+    "home assistant": "nas", "ha": "nas", "watchtower": "nas",
+    "ugreen": "nas", "ugreen nas": "nas", "unimatrix": "nas",
+    "unimatrix 001": "nas", "nas": "nas", "192 168 1 63": "nas",
+}
+
+
 def _resolve_or_error(name: str):
     asset = _reg().resolve(str(name or ""))
-    if asset is None:
-        known = ", ".join(sorted(a.get("display_name", k)
-                                 for k, a in _reg().assets.items()))
-        return None, f"unknown asset — I know: {known}"
-    return asset, ""
+    if asset is not None:
+        return asset, ""
+    # Exact alias first, then containment so phrases the Boss actually types
+    # ("Tracearr Redis", "the NAS Plex server") still land on the real blocker
+    # rather than the generic unknown-asset reply.
+    norm = homelab_assets._norm(str(name or ""))
+    host_key = UNMANAGED_ASSETS.get(norm)
+    if not host_key and norm:
+        for alias, hk in UNMANAGED_ASSETS.items():
+            if re.search(rf"(?:^| ){re.escape(alias)}(?:$| )", norm):
+                host_key = hk
+                break
+    if host_key:
+        where, why = UNMANAGED_HOSTS[host_key]
+        return None, (
+            f"'{name}' runs on {where}, which is not a managed host: {why}. "
+            f"I cannot run diagnostics against it, and I must NOT substitute "
+            f"manual docker/ssh instructions for the Boss to run by hand. "
+            f"Report this blocker and stop.")
+    known = ", ".join(sorted(a.get("display_name", k)
+                             for k, a in _reg().assets.items()))
+    return None, (f"unknown asset — I know: {known}. Do not improvise manual "
+                  f"docker/ssh steps for an asset I do not manage.")
 
 
 async def _tool_diagnose(args: dict, ctx: ToolContext) -> str:
