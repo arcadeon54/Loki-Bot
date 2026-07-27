@@ -141,10 +141,11 @@ class RemoteExecutorGuard(unittest.TestCase):
 
 
 class DispatcherActionAllowlist(unittest.TestCase):
-    def test_only_the_six_actions_exist(self):
+    def test_action_table_is_exactly_the_allowlist(self):
         self.assertEqual(sorted(nm.ACTIONS), sorted([
             "container_inventory", "host_status", "tracearr_dependencies",
-            "tracearr_recent_logs", "tracearr_status", "tracearr_update_check"]))
+            "tracearr_recent_logs", "tracearr_restart_forensics",
+            "tracearr_status", "tracearr_update_check"]))
 
     def test_no_state_changing_verb_is_reachable(self):
         for bad in ("restart", "stop", "pull", "recreate", "exec", "docker",
@@ -228,11 +229,17 @@ class ToolBehaviour(unittest.TestCase):
                    "images": {"tracearr": {"container": "tracearr",
                                            "image": "ghcr.io/x/tracearr@sha256:4802c793336ec2393de8db1088b0c8aa170c8b8b0aa7bba33a56a599c5d72544"}},
                    "note": "local image metadata only"}
-        with self._patch({"tracearr_update_check": payload}):
+        async def no_upstream(asset):
+            return {"release_source": None, "latest_stable_version": None,
+                    "latest_stable_digest": None,
+                    "upstream_check_status": "unavailable",
+                    "update_available": None, "notes": []}
+        with self._patch({"tracearr_update_check": payload}), \
+             mock.patch.object(nm, "_upstream_for", no_upstream):
             out = json.loads(run(nm._tool_tracearr_update_check({}, boss_ctx())))
         self.assertTrue(out["ok"])
-        self.assertTrue(out["digest_matches_registry"])
-        self.assertEqual(out["update_policy"], "approval_always")
+        self.assertTrue(out["deployment_matches_configuration"])
+        self.assertEqual(out["approval_policy"], "approval_always")
         self.assertIn("approved plan", out["next_step"])
 
     def test_tools_are_boss_only(self):
@@ -278,3 +285,243 @@ class ToolRegistration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Correction pass: honest update status + restart classification ─────────
+def _upstream(status="verified", latest="v1.5.0", digest="sha256:2b6aca8d",
+              update=None, notes=None):
+    return {"release_source": "github:connorgallopo/Tracearr",
+            "latest_stable_version": latest if status == "verified" else None,
+            "latest_stable_digest": digest if status == "verified" else None,
+            "upstream_check_status": status,
+            "update_available": update,
+            "notes": list(notes or [])}
+
+
+PINNED = "sha256:4802c793336ec2393de8db1088b0c8aa170c8b8b0aa7bba33a56a599c5d72544"
+UPDATE_PAYLOAD = {
+    "compose_project": "tracearr",
+    "images": {"tracearr": {"container": "tracearr",
+                            "image": f"ghcr.io/connorgallopo/tracearr@{PINNED}"},
+               "redis": {"container": "tracearr-redis", "image": "redis:8-alpine"}},
+    "note": "local image metadata only",
+}
+
+
+class HonestUpdateStatus(unittest.TestCase):
+    def _run(self, upstream):
+        async def fake_action(action, timeout=None):
+            return UPDATE_PAYLOAD
+        async def fake_upstream(asset):
+            return upstream
+        with mock.patch.object(nm, "run_action", fake_action), \
+             mock.patch.object(nm, "_upstream_for", fake_upstream):
+            return json.loads(run(nm._tool_tracearr_update_check({}, boss_ctx())))
+
+    def test_all_required_fields_are_present(self):
+        out = self._run(_upstream(update=True))
+        for field in ("installed_version", "configured_image", "configured_digest",
+                      "running_digest", "deployment_matches_configuration",
+                      "latest_stable_version", "latest_stable_digest",
+                      "upstream_check_status", "update_available",
+                      "release_source", "approval_policy", "confidence", "notes"):
+            self.assertIn(field, out, field)
+
+    def test_digest_matches_but_upstream_unavailable(self):
+        out = self._run(_upstream(status="unavailable", update=None))
+        self.assertTrue(out["deployment_matches_configuration"])
+        self.assertEqual(out["upstream_check_status"], "unavailable")
+        self.assertIsNone(out["update_available"])
+        self.assertEqual(out["confidence"], "low")
+        self.assertIn("could not yet verify", out["summary"])
+
+    def test_no_false_up_to_date_claim_when_upstream_unknown(self):
+        out = self._run(_upstream(status="unavailable"))
+        low = out["summary"].lower()
+        self.assertNotIn("up to date", low)
+        self.assertNotIn("latest", low.replace("newest stable upstream", ""))
+
+    def test_verified_and_current(self):
+        out = self._run(_upstream(latest="v1.4.27", update=False))
+        self.assertEqual(out["upstream_check_status"], "verified")
+        self.assertFalse(out["update_available"])
+        self.assertEqual(out["confidence"], "high")
+        self.assertIn("latest verified stable release", out["summary"])
+
+    def test_verified_and_update_available(self):
+        out = self._run(_upstream(latest="v1.5.0", update=True))
+        self.assertTrue(out["update_available"])
+        self.assertIn("v1.5.0", out["summary"])
+        self.assertIn("update is available", out["summary"])
+        self.assertNotIn("up to date", out["summary"].lower())
+
+    def test_deployment_match_alone_never_sets_update_available(self):
+        """The exact bug this pass fixes."""
+        out = self._run(_upstream(status="unavailable"))
+        self.assertTrue(out["deployment_matches_configuration"])
+        self.assertIsNot(out["update_available"], False)
+
+    def test_drifted_deployment_lowers_confidence(self):
+        payload = json.loads(json.dumps(UPDATE_PAYLOAD))
+        payload["images"]["tracearr"]["image"] = "ghcr.io/x/tracearr@sha256:dead"
+        async def fake_action(action, timeout=None):
+            return payload
+        async def fake_upstream(asset):
+            return _upstream(update=False)
+        with mock.patch.object(nm, "run_action", fake_action), \
+             mock.patch.object(nm, "_upstream_for", fake_upstream):
+            out = json.loads(run(nm._tool_tracearr_update_check({}, boss_ctx())))
+        self.assertFalse(out["deployment_matches_configuration"])
+        self.assertEqual(out["confidence"], "low")
+        self.assertTrue(any("drifted" in n for n in out["notes"]))
+
+
+class UpstreamReleaseSelection(unittest.TestCase):
+    class _Resp:
+        def __init__(self, payload, status=200, headers=None):
+            self._p, self.status = payload, status
+            self.headers = headers or {}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def json(self): return self._p
+
+    def test_prereleases_are_ignored(self):
+        releases = [
+            {"tag_name": "v1.5.0-beta.7", "prerelease": True, "draft": False},
+            {"tag_name": "v1.5.0", "prerelease": False, "draft": False},
+            {"tag_name": "v1.4.31", "prerelease": False, "draft": False},
+        ]
+        session = mock.MagicMock()
+        session.get = lambda url, **kw: self._Resp(releases)
+        tag, ver = run(nm._latest_stable_release(session,
+                                                 "github:connorgallopo/Tracearr"))
+        self.assertEqual(tag, "v1.5.0")
+        self.assertEqual(ver, (1, 5, 0))
+
+    def test_drafts_are_ignored(self):
+        releases = [{"tag_name": "v9.9.9", "prerelease": False, "draft": True},
+                    {"tag_name": "v1.5.0", "prerelease": False, "draft": False}]
+        session = mock.MagicMock()
+        session.get = lambda url, **kw: self._Resp(releases)
+        tag, _ = run(nm._latest_stable_release(session, "github:x/y"))
+        self.assertEqual(tag, "v1.5.0")
+
+    def test_prerelease_tags_do_not_parse_as_stable(self):
+        self.assertIsNone(nm._parse_stable("v1.5.0-beta.7"))
+        self.assertIsNone(nm._parse_stable("nightly"))
+        self.assertEqual(nm._parse_stable("v1.4.27"), (1, 4, 27))
+
+    def test_registry_tag_strips_the_v_prefix(self):
+        self.assertEqual(nm._registry_tag("v1.5.0", "strip_v"), "1.5.0")
+        self.assertEqual(nm._registry_tag("1.5.0", "strip_v"), "1.5.0")
+        self.assertEqual(nm._registry_tag("v1.5.0", ""), "v1.5.0")
+
+    def test_upstream_failure_degrades_to_unavailable(self):
+        async def boom(asset, session):
+            raise nm.NasError("github unreachable")
+        asset = homelab_assets.load().get("tracearr")
+        session = mock.MagicMock()
+        session.get = mock.MagicMock(side_effect=OSError("no network"))
+        out = run(nm.check_upstream(asset, session))
+        self.assertEqual(out["upstream_check_status"], "unavailable")
+        self.assertIsNone(out["update_available"])
+        self.assertTrue(out["notes"])
+
+
+class RestartClassification(unittest.TestCase):
+    def _f(self, events, restart_count=273, **state):
+        st = {"started_at": "2026-07-27T07:02:29Z",
+              "finished_at": "2026-07-27T07:02:27Z", "exit_code": 0,
+              "error": "", "oom_killed": False}
+        st.update(state)
+        return {"events": events, "restart_count": restart_count,
+                "restart_policy": "unless-stopped", "state": st,
+                "healthcheck": {"status": "healthy", "failing_streak": 0}}
+
+    def test_die_start_pairs_are_an_application_exit(self):
+        out = nm.classify_restarts(self._f(
+            [{"action": "die", "exit_code": "0"}, {"action": "start"}]))
+        self.assertEqual(out["classification"], "confirmed_application_exit")
+
+    def test_explicit_restart_action_is_external(self):
+        out = nm.classify_restarts(self._f([{"action": "restart"}]))
+        self.assertEqual(out["classification"], "confirmed_external_restart")
+
+    def test_unhealthy_events_are_a_healthcheck_action(self):
+        f = self._f([{"action": "health_status: unhealthy"}])
+        f["healthcheck"]["failing_streak"] = 3
+        out = nm.classify_restarts(f)
+        self.assertEqual(out["classification"], "confirmed_healthcheck_action")
+
+    def test_restart_count_without_events_still_implies_process_exit(self):
+        out = nm.classify_restarts(self._f([]))
+        self.assertEqual(out["classification"], "confirmed_application_exit")
+        self.assertIn("RestartCount", out["reason"])
+
+    def test_no_evidence_is_unresolved_not_a_guess(self):
+        out = nm.classify_restarts(self._f([], restart_count=0))
+        self.assertEqual(out["classification"], "unresolved")
+
+    def test_missing_forensics_is_unresolved(self):
+        self.assertEqual(nm.classify_restarts({})["classification"], "unresolved")
+
+    def test_clean_exit_is_not_treated_as_healthy(self):
+        out = nm.classify_restarts(self._f([{"action": "die", "exit_code": "0"},
+                                            {"action": "start"}]))
+        self.assertEqual(out["last_exit_code"], 0)
+        self.assertTrue(out["clean_exit_is_not_healthy"])
+
+    def test_no_automatic_repair_is_ever_offered(self):
+        for events in ([], [{"action": "die"}, {"action": "start"}],
+                       [{"action": "restart"}]):
+            with self.subTest(events=events):
+                out = nm.classify_restarts(self._f(events))
+                self.assertIn("none", out["automatic_repair"])
+
+
+class DependencyHealthDoesNotMaskAppChurn(unittest.TestCase):
+    def test_healthy_dependencies_do_not_imply_a_healthy_app(self):
+        async def fake(action, timeout=None):
+            if action == "tracearr_dependencies":
+                return DEPS_OK
+            raise nm.NasError("forensics not installed")
+        with mock.patch.object(nm, "run_action", fake):
+            out = json.loads(run(nm._tool_tracearr_diagnose({}, boss_ctx())))
+        self.assertTrue(out["dependencies_healthy"])
+        self.assertFalse(out["app_healthy"])
+        self.assertIn("NOT stable", out["verdict"])
+        self.assertEqual(out["restart_evidence"]["classification"], "unresolved")
+
+
+class DispatcherRedaction(unittest.TestCase):
+    """The dispatcher is the last line before data leaves the NAS."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "nas", "loki-nas-maint")
+        spec = importlib.util.spec_from_loader("dispatcher", None)
+        cls.mod = importlib.util.module_from_spec(spec)
+        exec(open(path).read().split("def find_tracearr")[0], cls.mod.__dict__)
+
+    def test_credentials_are_redacted(self):
+        for raw, must_not in [
+            ("DATABASE_URL=postgres://user:hunter2@db:5432/t", "hunter2"),
+            ("password=swordfish", "swordfish"),
+            ("api_key: abcdef123456", "abcdef123456"),
+            ("Authorization: Bearer aaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaaaaaa"),
+        ]:
+            with self.subTest(raw=raw):
+                self.assertNotIn(must_not, self.mod.redact(raw))
+
+    def test_image_digests_survive_redaction(self):
+        ref = "ghcr.io/connorgallopo/tracearr@sha256:" + "4" * 64
+        self.assertEqual(self.mod.redact(ref), ref)
+
+    def test_only_allowlisted_labels_are_emitted(self):
+        raw = ("com.docker.compose.project=tracearr,"
+               "com.acme.db_password=hunter2")
+        keep = self.mod.parse_labels(raw)
+        self.assertIn("com.docker.compose.project", keep)
+        self.assertNotIn("com.acme.db_password", keep)

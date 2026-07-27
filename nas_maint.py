@@ -3,10 +3,10 @@ nas_maint.py — Loki's client for the restricted UGREEN NAS dispatcher.
 
 The NAS is NOT operable by a general shell. Everything here goes through one
 root-owned dispatcher on the NAS (/usr/local/sbin/loki-nas-maint) that accepts
-exactly six literal read-only actions, reached over a dedicated SSH key via the
+a fixed set of literal read-only actions, reached over a dedicated SSH key via the
 `nas-maint` alias. This module can therefore only ever read: there is no verb
 in the dispatcher that restarts, stops, pulls or recreates anything, and the
-sudoers rule on the NAS enumerates the six actions literally rather than using
+sudoers rule on the NAS enumerates those actions literally rather than using
 a wildcard.
 
 Security notes that belong with the code, not just the docs:
@@ -24,6 +24,7 @@ name that the registry does not already declare.
 
 import asyncio
 import json
+import re
 import logging
 
 import homelab_assets
@@ -35,7 +36,7 @@ SSH_ALIAS = "nas-maint"
 DISPATCHER = "/usr/local/sbin/loki-nas-maint"
 
 # Mirrors the dispatcher's own table. A caller can never supply an action that
-# is not one of these literals, and the NAS sudoers rule enumerates the same six.
+# is not one of these literals, and the NAS sudoers rule enumerates the same set.
 ACTIONS = (
     "host_status",
     "container_inventory",
@@ -43,6 +44,7 @@ ACTIONS = (
     "tracearr_dependencies",
     "tracearr_recent_logs",
     "tracearr_update_check",
+    "tracearr_restart_forensics",
 )
 
 DEFAULT_TIMEOUT = 45
@@ -229,11 +231,191 @@ async def _tool_tracearr_diagnose(args: dict, ctx: ToolContext) -> str:
                          "Dependency problem: " + ", ".join(unhealthy))
     rc = app.get("restart_count") or 0
     if rc > RESTART_ALERT_THRESHOLD:
+        # Healthy dependencies must never be allowed to imply a healthy app.
         report["open_finding"] = (
             f"Tracearr restart_count={rc} with Redis and PostgreSQL both stable. "
             f"The churn is app-side, not a dependency outage. Cause unproven — "
             f"no automatic repair is configured.")
+        report["app_healthy"] = False
+        report["verdict"] += (f" Tracearr itself is NOT stable, though: it has "
+                              f"restarted {rc} times.")
+        report["restart_evidence"] = await _restart_evidence()
     return json.dumps(report)
+
+
+def classify_restarts(forensics: dict) -> dict:
+    """Classify restart churn from dispatcher forensics.
+
+    RestartCount only increments for restart-POLICY restarts, i.e. after the
+    process exited; `docker restart` does not bump it. Docker event actions
+    disambiguate the rest: an external restart emits `restart`, a policy
+    restart emits `die` then `start`, and a healthcheck emits health_status
+    events. Anything we cannot place stays `unresolved` — never guessed.
+    """
+    if not forensics:
+        return {"classification": "unresolved",
+                "reason": "no forensics available"}
+    events = forensics.get("events") or []
+    actions = [e.get("action") or "" for e in events]
+    hc = forensics.get("healthcheck") or {}
+    state = forensics.get("state") or {}
+    exit_codes = {e.get("exit_code") for e in events
+                  if (e.get("action") or "") == "die"}
+    signals = {e.get("signal") for e in events if e.get("signal")}
+
+    if any(a.startswith("restart") for a in actions):
+        cls, why = ("confirmed_external_restart",
+                    "docker recorded a `restart` action, which only an "
+                    "explicit restart command emits")
+    elif any(a == "health_status: unhealthy" for a in actions) and \
+            (hc.get("failing_streak") or 0) > 0:
+        cls, why = ("confirmed_healthcheck_action",
+                    "unhealthy health_status events precede the restarts")
+    elif "die" in actions and "start" in actions:
+        cls, why = ("confirmed_application_exit",
+                    "docker recorded die→start pairs and RestartCount is "
+                    "incrementing, so the process exits and the restart "
+                    "policy brings it back")
+    elif (forensics.get("restart_count") or 0) > 0 and not events:
+        cls, why = ("confirmed_application_exit",
+                    "RestartCount is incrementing, which only happens when "
+                    "the restart policy restarts an exited process; the event "
+                    "journal did not cover the window")
+    else:
+        cls, why = ("unresolved", "no event pattern matched")
+    return {"classification": cls, "reason": why,
+            "restart_count": forensics.get("restart_count"),
+            "restart_policy": forensics.get("restart_policy"),
+            "last_started_at": state.get("started_at"),
+            "last_finished_at": state.get("finished_at"),
+            "last_exit_code": state.get("exit_code"),
+            "last_error": state.get("error") or None,
+            "oom_killed": state.get("oom_killed"),
+            "die_exit_codes": sorted(c for c in exit_codes if c is not None),
+            "signals_seen": sorted(signals),
+            "healthcheck_status": hc.get("status"),
+            "healthcheck_failing_streak": hc.get("failing_streak"),
+            "event_actions": actions[-12:],
+            # A clean exit code is NOT evidence of health; it only means the
+            # process chose to stop rather than crashing loudly.
+            "clean_exit_is_not_healthy": True,
+            "automatic_repair": "none — cause must be proven first",
+            }
+
+
+async def _restart_evidence() -> dict:
+    """Best-effort forensics. Degrades to a note if the action is missing."""
+    try:
+        data = await run_action("tracearr_restart_forensics", timeout=60)
+    except NasError as e:
+        return {"classification": "unresolved",
+                "reason": f"forensics unavailable: {e}"}
+    return classify_restarts(data)
+
+
+# ── upstream release verification ──────────────────────────────────────────
+# A digest that matches the CONFIGURED pin proves only that what is running is
+# what was configured. Whether that pin is the newest stable release is a
+# separate question with a separate answer, and it is allowed to be "unknown".
+_SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+
+def _parse_stable(tag: str):
+    """Version tuple for a STABLE tag, or None for prereleases/junk.
+
+    'v1.5.0' -> (1,5,0);  'v1.5.0-beta.7' -> None (prerelease, never a target).
+    """
+    m = _SEMVER.match((tag or "").strip())
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def _registry_tag(version: str, style: str) -> str:
+    return version[1:] if style == "strip_v" and version.startswith("v") else version
+
+
+async def _http_json(session, url: str, headers: dict, timeout: int = 12):
+    async with session.get(url, headers=headers, timeout=timeout) as r:
+        if r.status != 200:
+            raise NasError(f"{url.split('/')[2]} returned HTTP {r.status}")
+        return await r.json()
+
+
+async def _latest_stable_release(session, release_source: str) -> tuple[str, tuple]:
+    """Newest NON-prerelease release from the configured upstream feed."""
+    if not release_source.startswith("github:"):
+        raise NasError(f"unsupported release source {release_source!r}")
+    repo = release_source.split(":", 1)[1]
+    url = f"https://api.github.com/repos/{repo}/releases?per_page=30"
+    data = await _http_json(session, url,
+                            {"Accept": "application/vnd.github+json"})
+    best, best_v = None, None
+    for rel in data:
+        if rel.get("prerelease") or rel.get("draft"):
+            continue
+        v = _parse_stable(rel.get("tag_name") or "")
+        if v and (best_v is None or v > best_v):
+            best, best_v = rel.get("tag_name"), v
+    if best is None:
+        raise NasError("no stable (non-prerelease) release found upstream")
+    return best, best_v
+
+
+async def _registry_digest(session, repo: str, tag: str) -> str:
+    """Resolve a tag to its content digest WITHOUT pulling the image."""
+    host, path = repo.split("/", 1)
+    tok_url = f"https://{host}/token?scope=repository:{path}:pull&service={host}"
+    tok = (await _http_json(session, tok_url, {})).get("token", "")
+    if not tok:
+        raise NasError(f"{host} did not issue an anonymous pull token")
+    accept = ("application/vnd.oci.image.index.v1+json,"
+              "application/vnd.docker.distribution.manifest.list.v2+json,"
+              "application/vnd.oci.image.manifest.v1+json,"
+              "application/vnd.docker.distribution.manifest.v2+json")
+    url = f"https://{host}/v2/{path}/manifests/{tag}"
+    async with session.head(url, headers={"Authorization": f"Bearer {tok}",
+                                          "Accept": accept}, timeout=12) as r:
+        if r.status != 200:
+            raise NasError(f"{host} has no manifest for tag {tag!r} "
+                           f"(HTTP {r.status})")
+        digest = r.headers.get("Docker-Content-Digest", "")
+    if not digest:
+        raise NasError(f"{host} returned no content digest for {tag!r}")
+    return digest
+
+
+async def check_upstream(asset: dict, session) -> dict:
+    """Verified upstream status, or an honest 'unavailable'. Never guesses."""
+    spec = asset.get("updates") or {}
+    source = spec.get("release_source") or ""
+    repo = spec.get("registry_repo") or ""
+    out = {"release_source": source or None,
+           "latest_stable_version": None, "latest_stable_digest": None,
+           "upstream_check_status": "unavailable", "update_available": None,
+           "notes": []}
+    if not source or not repo:
+        out["notes"].append("no release_source/registry_repo configured for "
+                            "this asset, so upstream cannot be verified")
+        return out
+    try:
+        latest, latest_v = await _latest_stable_release(session, source)
+        tag = _registry_tag(latest, spec.get("registry_tag_style") or "")
+        digest = await _registry_digest(session, repo, tag)
+    except NasError as e:
+        out["notes"].append(f"upstream check failed: {e}")
+        return out
+    except Exception as e:
+        out["notes"].append(f"upstream check failed: {e.__class__.__name__}")
+        return out
+    installed_v = _parse_stable(asset.get("version") or "")
+    out.update({"latest_stable_version": latest,
+                "latest_stable_digest": digest,
+                "upstream_check_status": "verified"})
+    if installed_v is None:
+        out["notes"].append("installed version is not a parseable stable "
+                            "semver, so no comparison was made")
+        return out
+    out["update_available"] = latest_v > installed_v
+    return out
 
 
 async def _tool_tracearr_update_check(args: dict, ctx: ToolContext) -> str:
@@ -246,20 +428,78 @@ async def _tool_tracearr_update_check(args: dict, ctx: ToolContext) -> str:
         return json.dumps({"ok": False, "error": str(e)})
     asset = _tracearr_asset()
     running = (data.get("images") or {}).get("tracearr") or {}
-    pinned = asset.get("image_digest") or ""
-    out = {"ok": True, "compose_project": data.get("compose_project"),
-           "images": data.get("images"),
-           "registered_version": asset.get("version"),
-           "registered_digest": pinned[:26],
-           "digest_matches_registry": bool(pinned and pinned in
-                                           (running.get("image") or "")),
-           "update_policy": asset.get("update_policy"),
-           "note": data.get("note")}
+    configured_digest = asset.get("image_digest") or ""
+    running_ref = running.get("image") or ""
+    running_digest = ""
+    if "@" in running_ref:
+        running_digest = running_ref.split("@", 1)[1]
+    deployment_ok = bool(configured_digest and running_digest
+                         and configured_digest == running_digest)
+
+    upstream = await _upstream_for(asset)
+
+    out = {"ok": True,
+           "compose_project": data.get("compose_project"),
+           "installed_version": asset.get("version"),
+           "configured_image": (asset.get("docker") or {}).get("image"),
+           "configured_digest": configured_digest,
+           "running_digest": running_digest,
+           # DEPLOYMENT consistency only. Says nothing about being current.
+           "deployment_matches_configuration": deployment_ok,
+           "latest_stable_version": upstream["latest_stable_version"],
+           "latest_stable_digest": upstream["latest_stable_digest"],
+           "upstream_check_status": upstream["upstream_check_status"],
+           "update_available": upstream["update_available"],
+           "release_source": upstream["release_source"],
+           "approval_policy": asset.get("update_policy"),
+           "dependencies": {k: v for k, v in (data.get("images") or {}).items()
+                            if k != "tracearr"},
+           "notes": list(upstream["notes"])}
+
+    verified = upstream["upstream_check_status"] == "verified"
+    out["confidence"] = "high" if verified else "low"
+    if not deployment_ok:
+        out["confidence"] = "low"
+        out["notes"].append(
+            "the running digest does NOT match the configured pin — the "
+            "deployment drifted from its configuration")
+
+    # The one sentence Loki is allowed to say, precomputed so the wording
+    # cannot drift into an unearned "up to date".
+    ver = asset.get("version")
+    if not verified:
+        out["summary"] = (
+            f"Tracearr is running the configured {ver} image, and the digest "
+            f"matches its pin. I could not yet verify whether that is the "
+            f"newest stable upstream release.")
+    elif upstream["update_available"]:
+        out["summary"] = (
+            f"Tracearr is running {ver}, but {upstream['latest_stable_version']} "
+            f"is the latest verified stable release — an update is available.")
+    else:
+        out["summary"] = (
+            f"Tracearr is running {ver} and that is the latest verified "
+            f"stable release.")
+
     out["next_step"] = (
         "Updates on the NAS are performed by Watchtower there, not by Loki. "
         "Loki has no update or restart verb for this asset: the dispatcher "
         "exposes read-only actions only. Any change needs an approved plan.")
     return json.dumps(out)
+
+
+async def _upstream_for(asset: dict) -> dict:
+    """Upstream check with its own session, so a network fault degrades to
+    'unavailable' instead of failing the whole status call."""
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            return await check_upstream(asset, session)
+    except Exception as e:
+        return {"release_source": (asset.get("updates") or {}).get("release_source"),
+                "latest_stable_version": None, "latest_stable_digest": None,
+                "upstream_check_status": "unavailable", "update_available": None,
+                "notes": [f"upstream check could not run: {e.__class__.__name__}"]}
 
 
 def _register_tools():

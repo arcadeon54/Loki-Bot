@@ -10,9 +10,11 @@ Contract:
   - argv is exactly one token, matched against a fixed action table. There is
     no path, container name, image, format string, Docker argument or shell
     fragment a caller can influence. Targets are discovered internally.
-  - Only four read-only Docker verbs are ever executed: ps, inspect, logs
-    (bounded), stats --no-stream. No restart/stop/pull/exec/recreate exists in
-    this file, so no input can reach one.
+  - Only five read-only Docker verbs are ever executed: ps, inspect, logs
+    (bounded), stats --no-stream, and events over a bounded past window
+    (`--until 0s`, so it reads the journal and exits rather than streaming).
+    No restart/stop/pull/exec/recreate exists in this file, so no input can
+    reach one.
   - Output is JSON on stdout. Environment variable VALUES are never emitted —
     only their names. Labels are allowlisted. Log lines pass a redactor.
 
@@ -351,6 +353,98 @@ def act_tracearr_update_check():
     return out
 
 
+def act_tracearr_restart_forensics():
+    """Read-only evidence for WHY the app container keeps restarting.
+
+    Distinguishes an application exit (docker records die→start and bumps
+    RestartCount) from an external `docker restart`, a healthcheck action, or
+    an internal maintenance cycle that never exits the process."""
+    rows = ps_all()
+    project, found = stack(rows)
+    app = found["tracearr"]
+    raw = docker("inspect", app["ID"])
+    try:
+        data = json.loads(raw)[0]
+    except (ValueError, IndexError):
+        fail(4, "could not parse docker inspect output")
+    state = data.get("State") or {}
+    health = state.get("Health") or {}
+    cfg = data.get("Config") or {}
+    hc = cfg.get("Healthcheck") or {}
+    # Healthcheck probe history: exit codes and bounded, redacted output.
+    log = []
+    for entry in (health.get("Log") or [])[-6:]:
+        log.append({"start": entry.get("Start"), "end": entry.get("End"),
+                    "exit_code": entry.get("ExitCode"),
+                    "output": redact((entry.get("Output") or "").strip())[:300]})
+    # Container-scoped docker events over a bounded window. Read-only: this
+    # only reads the daemon's event journal, it never acts on the container.
+    events = []
+    ev_error = None
+    try:
+        raw_ev = docker("events", "--since", "12h", "--until", "0s",
+                        "--filter", f"container={app['Names']}",
+                        "--filter", "type=container",
+                        "--format", "{{json .}}", timeout=40)
+        for line in raw_ev.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            attrs = (e.get("Actor") or {}).get("Attributes") or {}
+            events.append({
+                "action": e.get("Action"),
+                "time": e.get("time"),
+                "time_nano": e.get("timeNano"),
+                "exit_code": attrs.get("exitCode"),
+                "signal": attrs.get("signal"),
+            })
+    except SystemExit:
+        raise
+    except Exception as e:                      # events unsupported / no journal
+        ev_error = e.__class__.__name__
+    return {
+        "compose_project": project,
+        "container": app.get("Names"),
+        "container_id": (data.get("Id") or "")[:12],
+        "container_created": data.get("Created"),
+        "state": {
+            "status": state.get("Status"),
+            "running": state.get("Running"),
+            "restarting": state.get("Restarting"),
+            "started_at": state.get("StartedAt"),
+            "finished_at": state.get("FinishedAt"),
+            "exit_code": state.get("ExitCode"),
+            "error": redact(state.get("Error") or ""),
+            "oom_killed": state.get("OOMKilled"),
+            "pid": state.get("Pid"),
+        },
+        "restart_count": data.get("RestartCount"),
+        "restart_policy": ((data.get("HostConfig") or {}).get("RestartPolicy")
+                           or {}).get("Name"),
+        "healthcheck": {
+            # The probe command is config, not a secret, but redact anyway in
+            # case a URL with credentials was baked into it.
+            "test": [redact(str(t)) for t in (hc.get("Test") or [])],
+            "interval_ns": hc.get("Interval"),
+            "timeout_ns": hc.get("Timeout"),
+            "retries": hc.get("Retries"),
+            "start_period_ns": hc.get("StartPeriod"),
+            "status": health.get("Status"),
+            "failing_streak": health.get("FailingStreak"),
+            "log": log,
+        },
+        "events": events[-40:],
+        "events_error": ev_error,
+        "note": ("RestartCount increments only for restart-policy restarts "
+                 "after the process exits; a manual `docker restart` does not "
+                 "increment it."),
+    }
+
+
 def _stats(ids):
     """docker stats --no-stream over discovered ids only."""
     out = docker("stats", "--no-stream", "--format", "{{json .}}", *ids)
@@ -376,6 +470,7 @@ ACTIONS = {
     "tracearr_dependencies": act_tracearr_dependencies,
     "tracearr_recent_logs": act_tracearr_recent_logs,
     "tracearr_update_check": act_tracearr_update_check,
+    "tracearr_restart_forensics": act_tracearr_restart_forensics,
 }
 
 
