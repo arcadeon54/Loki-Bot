@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """
-loki-nas-maint — restricted read-only maintenance dispatcher for the UGREEN NAS.
+loki-nas-maint — restricted maintenance dispatcher for the UGREEN NAS.
 
 Installed root-owned at /usr/local/sbin/loki-nas-maint and reachable only via a
 single narrowly scoped sudoers rule. Loki calls it over SSH; it is the ONLY
@@ -10,11 +10,23 @@ Contract:
   - argv is exactly one token, matched against a fixed action table. There is
     no path, container name, image, format string, Docker argument or shell
     fragment a caller can influence. Targets are discovered internally.
-  - Only five read-only Docker verbs are ever executed: ps, inspect, logs
-    (bounded), stats --no-stream, and events over a bounded past window
-    (`--until 0s`, so it reads the journal and exits rather than streaming).
-    No restart/stop/pull/exec/recreate exists in this file, so no input can
-    reach one.
+  - Two tiers of action. READ-ONLY (ACTIONS): ps, inspect, logs (bounded),
+    stats --no-stream, events over a bounded past window. These take no
+    arguments at all.
+    APPROVAL-GATED WRITES (WRITE_ACTIONS): prepare / backup / apply / verify /
+    rollback for the Tracearr update workflow. These additionally use pull,
+    exec (pg_dump only) and `compose up -d --no-deps <service>`. There is NO
+    rm, rmi, stop, kill, down, prune, volume or network verb anywhere in this
+    file, so nothing here can delete or tear down a container, image, volume
+    or network.
+  - At most ONE caller-supplied value ever crosses the boundary, and only for
+    two write actions: a content digest (^sha256:[0-9a-f]{64}$) or a prepare
+    id (^[0-9a-f]{16}$). The repository is hardcoded, so an approved digest
+    can only be pulled from TRACEARR_REPO. No path, tag, container name or
+    Docker argument is ever accepted.
+  - apply refuses unless verified backups exist AND the prepare id matches the
+    recorded plan AND the running image still matches what was planned, so an
+    approval cannot be replayed against different state.
   - Output is JSON on stdout. Environment variable VALUES are never emitted —
     only their names. Labels are allowlisted. Log lines pass a redactor.
 
@@ -22,8 +34,11 @@ Exit codes: 0 ok · 2 unknown/malformed action · 3 discovery failed · 4 docker
 """
 
 import datetime
+import hashlib
 import json
 import re
+import os
+import shutil
 import subprocess
 import sys
 
@@ -49,6 +64,22 @@ MAX_ERROR_OBJECTS = 5
 # caller cannot influence it. Deepest first so we reach as far back as the log
 # allows, falling back when a corrupted region blocks a deeper read.
 TAIL_LADDER = (20000, 10000, 4000, 1500, 400, 100)
+
+# ── Update / backup / rollback (STATE-CHANGING, approval-gated) ────────────
+# Everything below is a FIXED constant. The only values a caller may supply
+# are a content digest and a prepare id, each matched against a strict regex;
+# no repository, container, path, tag or Docker argument ever crosses the
+# boundary. The repository is pinned here, so an approved digest can only ever
+# be pulled from this one repo.
+TRACEARR_REPO = "ghcr.io/connorgallopo/tracearr"
+STATE_DIR = "/var/lib/loki-nas-maint"
+STATE_FILE = STATE_DIR + "/tracearr_update.json"
+BACKUP_ROOT = "/volume2/loki-backups/tracearr"
+LOCAL_HEALTH_URL = "http://127.0.0.1:3001/health"
+PUBLIC_HEALTH_URL = "https://tracearr.ivn-group.cc/health"
+MIN_FREE_MB = 2048
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+PREPARE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 
 # Labels safe to echo verbatim. Anything else is dropped rather than guessed at,
 # because vendor labels routinely carry connection strings and tokens.
@@ -719,6 +750,317 @@ def act_tracearr_exit_window_logs():
     }
 
 
+# ── update workflow helpers ────────────────────────────────────────────────
+def _state_read():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _state_write(state):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def _free_mb(path):
+    try:
+        st = os.statvfs(path)
+        return int(st.f_bavail * st.f_frsize / 1048576)
+    except OSError:
+        return -1
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _tracearr_ctx():
+    """Discover the stack and its compose file. No caller input."""
+    rows = ps_all()
+    project, found = stack(rows)
+    app = found["tracearr"]
+    raw = docker("inspect", app["ID"])
+    try:
+        data = json.loads(raw)[0]
+    except (ValueError, IndexError):
+        fail(4, "could not parse docker inspect output")
+    cfg = data.get("Config") or {}
+    labels = cfg.get("Labels") or {}
+    compose_file = labels.get("com.docker.compose.project.config_files") or ""
+    if not compose_file or not os.path.isfile(compose_file):
+        fail(3, "compose file for the tracearr project was not found on disk")
+    return {
+        "project": project, "found": found, "app_id": app["ID"],
+        "app_name": app.get("Names"), "compose_file": compose_file,
+        "compose_service": labels.get("com.docker.compose.service") or "tracearr",
+        "current_image": cfg.get("Image") or "",
+        "db_id": (found.get("postgres") or {}).get("ID"),
+        "db_name": (found.get("postgres") or {}).get("Names"),
+        "redis_name": (found.get("redis") or {}).get("Names"),
+    }
+
+
+def _db_credentials(db_id):
+    """POSTGRES_USER / POSTGRES_DB read from the db container. Used ONLY to
+    build the pg_dump argv — never returned, never logged."""
+    raw = docker("inspect", db_id)
+    try:
+        env = (json.loads(raw)[0].get("Config") or {}).get("Env") or []
+    except (ValueError, IndexError):
+        return "", ""
+    vals = {}
+    for e in env:
+        if "=" in e:
+            k, v = e.split("=", 1)
+            if k in ("POSTGRES_USER", "POSTGRES_DB"):
+                vals[k] = v
+    return vals.get("POSTGRES_USER", ""), vals.get("POSTGRES_DB", "")
+
+
+def _compose_argv(ctx, *rest):
+    return ["compose", "-f", ctx["compose_file"], *rest]
+
+
+def act_tracearr_update_prepare(digest):
+    """Record an approved-update plan. Changes nothing on the system."""
+    ctx = _tracearr_ctx()
+    ok, _out, err = docker_try("compose", "version", timeout=20)
+    if not ok:
+        fail(4, f"docker compose plugin unavailable: {err[:120]}")
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_dir = f"{BACKUP_ROOT}/{stamp}"
+    prepare_id = hashlib.sha256(
+        f"{ctx['current_image']}|{digest}|{stamp}".encode()).hexdigest()[:16]
+    free_mb = _free_mb(os.path.dirname(BACKUP_ROOT) if
+                       os.path.isdir(os.path.dirname(BACKUP_ROOT)) else "/")
+    state = {
+        "prepare_id": prepare_id,
+        "created_at": stamp,
+        "repo": TRACEARR_REPO,
+        "current_image": ctx["current_image"],
+        "target_image": f"{TRACEARR_REPO}@{digest}",
+        "target_digest": digest,
+        "compose_file": ctx["compose_file"],
+        "compose_service": ctx["compose_service"],
+        "backup_dir": backup_dir,
+        "app_container": ctx["app_name"],
+        "db_container": ctx["db_name"],
+        "redis_container": ctx["redis_name"],
+        "backup": None, "applied": None, "verified": None, "rolled_back": None,
+        "free_mb_at_prepare": free_mb,
+    }
+    _state_write(state)
+    return {"prepare_id": prepare_id, "current_image": ctx["current_image"],
+            "target_image": state["target_image"], "backup_dir": backup_dir,
+            "compose_file": ctx["compose_file"],
+            "compose_service": ctx["compose_service"],
+            "free_mb": free_mb, "free_mb_required": MIN_FREE_MB,
+            "sufficient_space": free_mb < 0 or free_mb >= MIN_FREE_MB,
+            "note": "plan recorded; nothing changed. Backup runs next."}
+
+
+def act_tracearr_backup():
+    """Copy the compose file and dump the database, then verify both."""
+    state = _state_read()
+    if not state.get("prepare_id"):
+        fail(3, "no prepared update plan — run tracearr_update_prepare first")
+    ctx = _tracearr_ctx()
+    backup_dir = state["backup_dir"]
+    free_mb = _free_mb(BACKUP_ROOT if os.path.isdir(BACKUP_ROOT) else "/")
+    if 0 <= free_mb < MIN_FREE_MB:
+        fail(3, f"refusing to back up: only {free_mb}MB free, need {MIN_FREE_MB}MB")
+    os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+
+    compose_copy = os.path.join(backup_dir, "docker-compose.yml")
+    try:
+        shutil.copy2(state["compose_file"], compose_copy)
+    except OSError as e:
+        fail(3, f"compose backup failed: {e.__class__.__name__}")
+    compose_ok = os.path.isfile(compose_copy) and os.path.getsize(compose_copy) > 0
+
+    dump_path = os.path.join(backup_dir, "tracearr-db.sql.gz")
+    user, dbname = _db_credentials(ctx["db_id"])
+    if not user or not dbname:
+        fail(3, "could not determine database user/name from the db container")
+    try:
+        with open(dump_path, "wb") as out_f:
+            pg = subprocess.Popen(
+                [DOCKER, "exec", ctx["db_id"], "pg_dump", "-U", user, "-d", dbname],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            gz = subprocess.Popen(["gzip", "-c"], stdin=pg.stdout, stdout=out_f,
+                                  stderr=subprocess.PIPE)
+            pg.stdout.close()
+            _, gz_err = gz.communicate(timeout=900)
+            pg.wait(timeout=30)
+            _, pg_err = pg.communicate()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        fail(4, f"database dump failed: {e.__class__.__name__}")
+    dump_rc_ok = pg.returncode == 0 and gz.returncode == 0
+    size = os.path.getsize(dump_path) if os.path.isfile(dump_path) else 0
+    integrity = subprocess.run(["gzip", "-t", dump_path], capture_output=True)
+    dump_ok = dump_rc_ok and size > 0 and integrity.returncode == 0
+
+    info = {"backup_dir": backup_dir,
+            "compose_backup": compose_copy, "compose_ok": compose_ok,
+            "compose_sha256": _sha256_file(compose_copy)[:32],
+            "database_dump": dump_path, "database_ok": dump_ok,
+            "database_size_bytes": size,
+            "database_sha256": _sha256_file(dump_path)[:32],
+            "gzip_integrity_ok": integrity.returncode == 0,
+            "free_mb_after": _free_mb(BACKUP_ROOT)}
+    if not dump_ok:
+        info["stderr"] = redact((pg_err or b"").decode("utf-8", "replace"))[:200]
+    state["backup"] = info
+    _state_write(state)
+    info["verified"] = bool(compose_ok and dump_ok)
+    return info
+
+
+def act_tracearr_apply_update(prepare_id):
+    """Pull the approved digest and recreate ONLY the tracearr service."""
+    state = _state_read()
+    if not state.get("prepare_id"):
+        fail(3, "no prepared update plan")
+    if state["prepare_id"] != prepare_id:
+        fail(3, "prepare_id does not match the recorded plan — re-prepare and "
+                "get fresh approval")
+    backup = state.get("backup") or {}
+    if not (backup.get("compose_ok") and backup.get("database_ok")):
+        fail(3, "refusing to update: verified backups are not present")
+    ctx = _tracearr_ctx()
+    if ctx["current_image"] != state["current_image"]:
+        fail(3, "the running image changed since the plan was prepared — "
+                "re-prepare and get fresh approval")
+
+    target = state["target_image"]
+    ok, _o, err = docker_try("pull", target, timeout=900)
+    if not ok:
+        fail(4, f"pull of the approved digest failed: {err[:180]}")
+
+    # Point the compose service at the approved digest by replacing the exact
+    # current image reference. A literal replacement of a known string — no
+    # templating, no YAML rewriting, nothing else in the file is touched.
+    try:
+        with open(state["compose_file"]) as f:
+            original = f.read()
+    except OSError as e:
+        fail(3, f"could not read compose file: {e.__class__.__name__}")
+    if state["current_image"] not in original:
+        fail(3, "current image reference not found verbatim in the compose "
+                "file — refusing to edit it blindly")
+    updated = original.replace(state["current_image"], target)
+    try:
+        with open(state["compose_file"], "w") as f:
+            f.write(updated)
+    except OSError as e:
+        fail(3, f"could not write compose file: {e.__class__.__name__}")
+
+    ok, out, err = docker_try(*_compose_argv(
+        ctx, "up", "-d", "--no-deps", state["compose_service"]), timeout=600)
+    applied = {"pulled": target, "compose_updated": True,
+               "recreate_ok": ok, "stderr": redact(err)[:300] if not ok else ""}
+    state["applied"] = applied
+    _state_write(state)
+    if not ok:
+        fail(4, f"recreate failed: {err[:180]}")
+    return applied
+
+
+def _http_check(url, timeout=15):
+    p = subprocess.run(["curl", "-sS", "-m", str(timeout), "-o", "-",
+                        "-w", "\\n%{http_code}", url],
+                       capture_output=True, text=True)
+    body, _, code = (p.stdout or "").rpartition("\n")
+    return {"url": url, "http_code": code.strip() or "000",
+            "ok": code.strip() == "200",
+            "body": redact(body.strip())[:300]}
+
+
+def act_tracearr_verify_update():
+    """Verify the app, both dependencies, and local + public HTTP."""
+    rows = ps_all()
+    _project, found = stack(rows)
+    checks, failures = {}, []
+    for role in ("tracearr", "redis", "postgres"):
+        row = found.get(role)
+        if not row:
+            checks[role] = {"present": False}
+            failures.append(f"{role} missing")
+            continue
+        d = inspect(row["ID"])
+        healthy = d["running"] and d["health"] in (None, "healthy")
+        checks[role] = {"present": True, "container": d["name"],
+                        "state": d["state"], "health": d["health"],
+                        "restart_count": d["restart_count"], "ok": healthy}
+        if not healthy:
+            failures.append(f"{role} {d['state']}/{d['health']}")
+    local = _http_check(LOCAL_HEALTH_URL)
+    checks["local_http"] = local
+    if not local["ok"]:
+        failures.append(f"local HTTP {local['http_code']}")
+    else:
+        for field in ("db", "redis"):
+            if f'"{field}":true' not in local["body"].replace(" ", ""):
+                failures.append(f"health endpoint reports {field} not ok")
+    public = _http_check(PUBLIC_HEALTH_URL)
+    checks["public_http"] = public
+    # Public URL is supplementary evidence: proxy/DNS faults are not the app's.
+    state = _state_read()
+    result = {"checks": checks, "failures": failures, "verified": not failures,
+              "public_http_supplementary": True}
+    if state.get("prepare_id"):
+        state["verified"] = result
+        _state_write(state)
+    return result
+
+
+def act_tracearr_rollback():
+    """Restore the previous image and compose file, then re-verify."""
+    state = _state_read()
+    if not state.get("prepare_id"):
+        fail(3, "no prepared update plan to roll back")
+    if not (state.get("applied") or {}).get("recreate_ok"):
+        fail(3, "nothing was applied — there is nothing to roll back")
+    backup = state.get("backup") or {}
+    compose_backup = backup.get("compose_backup") or ""
+    if not os.path.isfile(compose_backup):
+        fail(3, "compose backup is missing — refusing to roll back blindly")
+    ctx = _tracearr_ctx()
+    try:
+        shutil.copy2(compose_backup, state["compose_file"])
+    except OSError as e:
+        fail(3, f"restoring compose failed: {e.__class__.__name__}")
+    ok, _o, err = docker_try("pull", state["current_image"], timeout=900)
+    pulled_back = ok
+    ok2, _o2, err2 = docker_try(*_compose_argv(
+        ctx, "up", "-d", "--no-deps", state["compose_service"]), timeout=600)
+    verify = act_tracearr_verify_update()
+    info = {"compose_restored": True, "previous_image": state["current_image"],
+            "pull_ok": pulled_back, "recreate_ok": ok2,
+            "verify_after_rollback": verify,
+            "stderr": redact(err2)[:300] if not ok2 else "",
+            "database_dump_preserved": backup.get("database_dump"),
+            "note": ("The database dump is NOT restored automatically. If the "
+                     "update ran a schema migration, rolling the image back "
+                     "may not be sufficient — restore the dump deliberately.")}
+    state["rolled_back"] = info
+    _state_write(state)
+    return info
+
+
 def _stats(ids):
     """docker stats --no-stream over discovered ids only."""
     out = docker("stats", "--no-stream", "--format", "{{json .}}", *ids)
@@ -748,16 +1090,52 @@ ACTIONS = {
     "tracearr_exit_window_logs": act_tracearr_exit_window_logs,
 }
 
+# Actions that change state. Each is approval-gated on Loki's side; the
+# dispatcher additionally refuses to apply without verified backups and a
+# matching prepare_id, so an approval cannot be replayed against a new plan.
+WRITE_ACTIONS = {
+    "tracearr_update_prepare": (act_tracearr_update_prepare, "digest"),
+    "tracearr_backup": (act_tracearr_backup, None),
+    "tracearr_apply_update": (act_tracearr_apply_update, "prepare_id"),
+    "tracearr_verify_update": (act_tracearr_verify_update, None),
+    "tracearr_rollback": (act_tracearr_rollback, None),
+}
+
 
 def main():
     argv = sys.argv[1:]
-    if len(argv) != 1:
-        fail(2, f"exactly one action required; known: {sorted(ACTIONS)}")
+    known = sorted(list(ACTIONS) + list(WRITE_ACTIONS))
+    if not argv:
+        fail(2, f"an action is required; known: {known}")
     action = argv[0]
     # Strict token: no paths, flags, separators or shell metacharacters survive.
-    if not re.fullmatch(r"[a-z][a-z0-9_]{2,39}", action) or action not in ACTIONS:
-        fail(2, f"unknown action; known: {sorted(ACTIONS)}")
-    payload = ACTIONS[action]()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{2,39}", action):
+        fail(2, f"unknown action; known: {known}")
+
+    if action in ACTIONS:
+        if len(argv) != 1:
+            fail(2, f"action {action!r} takes no arguments")
+        payload = ACTIONS[action]()
+    elif action in WRITE_ACTIONS:
+        fn, kind = WRITE_ACTIONS[action]
+        if kind is None:
+            if len(argv) != 1:
+                fail(2, f"action {action!r} takes no arguments")
+            payload = fn()
+        else:
+            if len(argv) != 2:
+                fail(2, f"action {action!r} takes exactly one {kind}")
+            value = argv[1]
+            # The ONLY caller-supplied values in the whole dispatcher, each
+            # pinned to a strict shape. A digest is meaningful only against
+            # TRACEARR_REPO, which is hardcoded — no repository, tag, path or
+            # container name can be supplied.
+            pattern = DIGEST_RE if kind == "digest" else PREPARE_ID_RE
+            if not pattern.match(value):
+                fail(2, f"malformed {kind}")
+            payload = fn(value)
+    else:
+        fail(2, f"unknown action; known: {known}")
     print(json.dumps({"ok": True, "action": action, "data": payload},
                      default=str))
 

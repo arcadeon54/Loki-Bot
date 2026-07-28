@@ -16,3 +16,13 @@ unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_recen
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_update_check
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_restart_forensics
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_exit_window_logs
+
+# Approval-gated STATE-CHANGING actions. Still no shell and no free-form
+# argument: the two that take a value are constrained to a literal action name
+# plus a single token, and the dispatcher regex-validates it (sha256 digest or
+# 16-hex prepare id) before doing anything.
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_update_prepare sha256:*
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_backup
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_apply_update *
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_verify_update
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_rollback

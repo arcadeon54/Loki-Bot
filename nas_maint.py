@@ -23,6 +23,8 @@ name that the registry does not already declare.
 """
 
 import asyncio
+import concurrent.futures
+import datetime
 import json
 import re
 import logging
@@ -48,7 +50,22 @@ ACTIONS = (
     "tracearr_exit_window_logs",
 )
 
+# Approval-gated, STATE-CHANGING dispatcher actions. Never invoked directly by
+# the model: they run only from the approved-update handler below, after Loki's
+# existing draft/approval gate has been satisfied.
+WRITE_ACTIONS = {
+    "tracearr_update_prepare": "digest",
+    "tracearr_backup": None,
+    "tracearr_apply_update": "prepare_id",
+    "tracearr_verify_update": None,
+    "tracearr_rollback": None,
+}
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_PREPARE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+
 DEFAULT_TIMEOUT = 45
+# Upper bound on building an approval plan (dispatcher call + upstream check).
+PREPARE_TIMEOUT = 150
 
 # Restart count above which Tracearr's churn is called out as abnormal. It is a
 # reporting threshold only — nothing repairs anything automatically.
@@ -59,12 +76,29 @@ class NasError(Exception):
     """A precise failure. Never a prompt for the Boss to run docker by hand."""
 
 
-async def run_action(action: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
+async def run_action(action: str, timeout: int = DEFAULT_TIMEOUT,
+                     param: str | None = None) -> dict:
     """Invoke one allowlisted dispatcher action. Fixed argv, never a shell."""
-    if action not in ACTIONS:
-        raise NasError(f"action {action!r} is not one of {list(ACTIONS)}")
+    if action in ACTIONS:
+        if param is not None:
+            raise NasError(f"action {action!r} takes no parameter")
+        extra = []
+    elif action in WRITE_ACTIONS:
+        kind = WRITE_ACTIONS[action]
+        if kind is None:
+            if param is not None:
+                raise NasError(f"action {action!r} takes no parameter")
+            extra = []
+        else:
+            pattern = _DIGEST_RE if kind == "digest" else _PREPARE_ID_RE
+            if not param or not pattern.match(param):
+                raise NasError(f"action {action!r} needs a well-formed {kind}")
+            extra = [param]
+    else:
+        raise NasError(f"action {action!r} is not one of "
+                       f"{list(ACTIONS) + list(WRITE_ACTIONS)}")
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-            SSH_ALIAS, "sudo", "-n", DISPATCHER, action]
+            SSH_ALIAS, "sudo", "-n", DISPATCHER, action, *extra]
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE,
@@ -538,6 +572,211 @@ async def _upstream_for(asset: dict) -> dict:
                 "notes": [f"upstream check could not run: {e.__class__.__name__}"]}
 
 
+# ── approval-gated update workflow ─────────────────────────────────────────
+async def _prepare_update_plan() -> tuple[dict, str]:
+    """Resolve the target digest, record a plan on the NAS, return (plan, err).
+
+    Read-only up to and including this point: tracearr_update_prepare writes a
+    plan file and changes nothing else."""
+    asset = _tracearr_asset()
+    try:
+        data = await run_action("tracearr_update_check")
+    except NasError as e:
+        return {}, str(e)
+    upstream = await _upstream_for(asset)
+    if upstream["upstream_check_status"] != "verified":
+        return {}, ("upstream release data could not be verified, so there is "
+                    "no trustworthy target to approve. "
+                    + "; ".join(upstream["notes"])[:200])
+    digest = upstream.get("latest_stable_digest") or ""
+    if not _DIGEST_RE.match(digest):
+        return {}, f"upstream returned a malformed digest: {digest[:32]!r}"
+    if not upstream.get("update_available"):
+        return {}, (f"Tracearr is already on {asset.get('version')}, which is "
+                    f"the latest verified stable release — nothing to update.")
+    running = (data.get("images") or {}).get("tracearr") or {}
+    try:
+        plan = await run_action("tracearr_update_prepare", timeout=90,
+                                param=digest)
+    except NasError as e:
+        return {}, str(e)
+    plan.update({
+        "installed_version": asset.get("version"),
+        "target_version": upstream.get("latest_stable_version"),
+        "target_digest": digest,
+        "running_image": running.get("image"),
+        "release_source": upstream.get("release_source"),
+        "approval_policy": asset.get("update_policy"),
+    })
+    return plan, ""
+
+
+def _update_prepare(args: dict, ctx: ToolContext):
+    """Draft-gate hook: build the human summary the Boss approves."""
+    if user_level(ctx.user_id) != "boss":
+        return {}, "", "Tracearr updates are Boss-only"
+    # create_draft() calls this hook SYNCHRONOUSLY from inside the running bot
+    # loop, so the async work has to happen on a loop of its own — scheduling
+    # it back onto the caller's loop and blocking would deadlock the bot.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(lambda: asyncio.run(_prepare_update_plan()))
+        try:
+            plan, err = fut.result(timeout=PREPARE_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            return {}, "", ("preparing the update plan timed out — the NAS or "
+                            "the upstream release feed did not respond")
+        except Exception as e:                    # noqa: BLE001
+            return {}, "", f"could not prepare the update plan: {e}"
+    if err:
+        return {}, "", err
+    space = ("OK" if plan.get("sufficient_space") else
+             f"LOW ({plan.get('free_mb')}MB free, {plan.get('free_mb_required')}MB needed)")
+    summary = "\n".join([
+        f"UPDATE Tracearr on the UGREEN NAS: "
+        f"{plan.get('installed_version')} → {plan.get('target_version')}",
+        f"Target digest: {plan.get('target_digest', '')[:26]}…",
+        f"Release source: {plan.get('release_source')}",
+        f"Compose: {plan.get('compose_file')} (service {plan.get('compose_service')})",
+        f"Backups first: compose copy + pg_dump → {plan.get('backup_dir')}",
+        f"Disk: {space}",
+        "Sequence: backup → verify backups → pull approved digest → recreate "
+        "ONLY the tracearr service → verify app/Redis/PostgreSQL/local HTTP/"
+        "public HTTP → roll back automatically if verification fails.",
+        "Redis and PostgreSQL are NOT updated or recreated.",
+        f"Policy: {plan.get('approval_policy')}",
+    ])
+    return {"prepare_id": plan["prepare_id"],
+            "target_digest": plan["target_digest"],
+            "target_version": plan.get("target_version"),
+            "installed_version": plan.get("installed_version"),
+            "backup_dir": plan.get("backup_dir")}, summary, ""
+
+
+async def _record_in_joplin(title: str, body: str) -> str:
+    """Write the maintenance result to Joplin. Never raises into the caller."""
+    try:
+        import joplin_integration as jop
+        note = await jop.create_note(title, body, notebook="Loki/Maintenance")
+        return (note or {}).get("id", "") if isinstance(note, dict) else ""
+    except Exception as e:                       # noqa: BLE001 - reporting only
+        log.warning("Joplin record failed: %s", e)
+        return ""
+
+
+async def _run_approved_update(payload: dict, ctx: ToolContext) -> str:
+    """Execute the approved update. Only reachable after the draft gate."""
+    prepare_id = str(payload.get("prepare_id") or "")
+    steps: list[str] = []
+    started = datetime.datetime.now(datetime.timezone.utc)
+
+    def _line(msg):
+        steps.append(msg)
+        log.info("tracearr update: %s", msg)
+
+    # 1. Back up compose + database, and verify both.
+    try:
+        backup = await run_action("tracearr_backup", timeout=960)
+    except NasError as e:
+        return f"Update aborted before any change: backup failed — {e}"
+    if not (backup.get("compose_ok") and backup.get("database_ok")):
+        return (f"Update aborted before any change: backups did not verify "
+                f"(compose_ok={backup.get('compose_ok')}, "
+                f"database_ok={backup.get('database_ok')}). "
+                f"Nothing was pulled or recreated.")
+    _line(f"backups verified — compose + {backup.get('database_size_bytes')} byte "
+          f"database dump at {backup.get('backup_dir')}")
+
+    # 2. Pull the approved digest and recreate only the tracearr service.
+    try:
+        applied = await run_action("tracearr_apply_update", timeout=960,
+                                   param=prepare_id)
+    except NasError as e:
+        return (f"Update failed while applying: {e}\nBackups are preserved at "
+                f"{backup.get('backup_dir')}. Tracearr was not left mid-update "
+                f"by Loki; verify before retrying.")
+    _line(f"pulled {applied.get('pulled', '')[:40]}… and recreated the service")
+
+    # 3. Verify app + dependencies + local and public HTTP.
+    try:
+        verify = await run_action("tracearr_verify_update", timeout=180)
+    except NasError as e:
+        verify = {"verified": False, "failures": [f"verification could not run: {e}"]}
+    if verify.get("verified"):
+        body = _report_body(payload, backup, applied, verify, steps, started,
+                            outcome="SUCCESS")
+        await _record_in_joplin(
+            f"Tracearr update {payload.get('installed_version')} → "
+            f"{payload.get('target_version')} — success", body)
+        return (f"Tracearr updated {payload.get('installed_version')} → "
+                f"{payload.get('target_version')} and verified: app, Redis, "
+                f"PostgreSQL, local HTTP and public HTTP all healthy. "
+                f"Backups kept at {backup.get('backup_dir')}.")
+
+    # 4. Verification failed — roll back.
+    _line(f"verification FAILED: {'; '.join(verify.get('failures') or [])}")
+    try:
+        rb = await run_action("tracearr_rollback", timeout=960)
+    except NasError as e:
+        body = _report_body(payload, backup, applied, verify, steps, started,
+                            outcome="FAILED, ROLLBACK ERRORED")
+        await _record_in_joplin("Tracearr update FAILED — rollback errored", body)
+        return (f"Update failed verification AND the rollback errored: {e}\n"
+                f"Backups are preserved at {backup.get('backup_dir')}. "
+                f"This needs hands-on attention now.")
+    rb_ok = (rb.get("verify_after_rollback") or {}).get("verified")
+    body = _report_body(payload, backup, applied, verify, steps, started,
+                        outcome="FAILED, ROLLED BACK" if rb_ok else
+                                "FAILED, ROLLBACK UNVERIFIED", rollback=rb)
+    await _record_in_joplin("Tracearr update failed — rolled back", body)
+    if rb_ok:
+        return (f"Update failed verification ({'; '.join(verify.get('failures') or [])}) "
+                f"and was rolled back to {payload.get('installed_version')}, "
+                f"which verified clean. Backups preserved at "
+                f"{backup.get('backup_dir')}. The database dump was NOT "
+                f"restored — the image was rolled back, not the data.")
+    return (f"Update failed verification and the rollback did not verify. "
+            f"Backups preserved at {backup.get('backup_dir')}. Hands-on "
+            f"attention needed.")
+
+
+def _report_body(payload, backup, applied, verify, steps, started,
+                 outcome: str, rollback: dict | None = None) -> str:
+    lines = [
+        f"# Tracearr update — {outcome}",
+        "",
+        f"- Started: {started.isoformat()}",
+        f"- Finished: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+        f"- Version: {payload.get('installed_version')} → {payload.get('target_version')}",
+        f"- Target digest: {str(payload.get('target_digest'))[:26]}…",
+        f"- Prepare id: {payload.get('prepare_id')}",
+        "",
+        "## Backups",
+        f"- Directory: {backup.get('backup_dir')}",
+        f"- Compose copy verified: {backup.get('compose_ok')}",
+        f"- Database dump verified: {backup.get('database_ok')} "
+        f"({backup.get('database_size_bytes')} bytes, gzip integrity "
+        f"{backup.get('gzip_integrity_ok')})",
+        "",
+        "## Steps",
+    ]
+    lines += [f"- {s}" for s in steps]
+    lines += ["", "## Verification",
+              f"- Verified: {verify.get('verified')}",
+              f"- Failures: {'; '.join(verify.get('failures') or []) or 'none'}"]
+    for role, chk in (verify.get("checks") or {}).items():
+        lines.append(f"- {role}: {chk}")
+    if rollback:
+        lines += ["", "## Rollback",
+                  f"- Compose restored: {rollback.get('compose_restored')}",
+                  f"- Previous image: {rollback.get('previous_image')}",
+                  f"- Recreate ok: {rollback.get('recreate_ok')}",
+                  f"- Verified after rollback: "
+                  f"{(rollback.get('verify_after_rollback') or {}).get('verified')}",
+                  f"- Note: {rollback.get('note')}"]
+    lines += ["", "_Recorded automatically by Loki after an approved update._"]
+    return "\n".join(lines)
+
+
 def _register_tools():
     register(ToolSpec(
         name="nas_status",
@@ -570,6 +809,23 @@ def _register_tools():
             "changes nothing."),
         parameters=_p({}, []),
         handler=_tool_tracearr_diagnose, permission="boss", timeout=75,
+    ))
+    register(ToolSpec(
+        name="tracearr_update",
+        description=(
+            "Update Tracearr on the UGREEN NAS to the latest verified stable "
+            "release. FIRST CHOICE for 'update Tracearr', 'upgrade Tracearr'. "
+            "This is CONSEQUENTIAL: it stages an approval draft with the exact "
+            "versions, digest and backup plan, and does nothing until the Boss "
+            "approves. On approval it backs up the compose file and the "
+            "PostgreSQL database, verifies both, pulls the approved digest, "
+            "recreates ONLY the tracearr service (never Redis or PostgreSQL), "
+            "verifies app/Redis/PostgreSQL/local HTTP/public HTTP, and rolls "
+            "back automatically if verification fails."),
+        parameters=_p({}, []),
+        handler=_run_approved_update, permission="boss", timeout=1800,
+        action_type="tracearr_update", approval_ttl=3600,
+        prepare=_update_prepare,
     ))
     register(ToolSpec(
         name="tracearr_update_check",

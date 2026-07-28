@@ -13,6 +13,7 @@ Run:  venv/bin/python -m unittest tests.test_nas_tracearr -v
 import asyncio
 import json
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -59,6 +60,11 @@ def boss_ctx():
 
 def crew_ctx():
     return ToolContext(user_id=CREW_ID, user_name="Rob", channel_id="c")
+
+
+def _dispatcher_src():
+    return open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "nas", "loki-nas-maint")).read()
 
 
 def run(coro):
@@ -603,28 +609,38 @@ class ExitWindowLogAction(unittest.TestCase):
                 with self.assertRaises(nm.NasError):
                     run(nm.run_action(bad))
 
-    def test_dispatcher_source_invokes_no_state_changing_docker_verb(self):
-        """Stronger than a name check: the artifact itself must not contain a
-        docker call that could change state. (`tracearr_restart_forensics` is
-        a read-only *name* containing 'restart', so names prove nothing.)"""
-        import os as _os
-        path = _os.path.join(_os.path.dirname(_os.path.dirname(
-            _os.path.abspath(__file__))), "nas", "loki-nas-maint")
-        src = open(path).read()
-        for verb in ("restart", "stop", "kill", "pull", "rm", "create",
-                     "exec", "run", "update", "commit", "push"):
+    def test_dispatcher_never_invokes_a_destructive_verb(self):
+        """The contract changed: approval-gated update actions legitimately
+        pull, exec (pg_dump) and `compose up`. What must NEVER appear is a
+        verb that destroys data or tears things down."""
+        src = _dispatcher_src()
+        for verb in ("rm", "rmi", "prune", "kill", "stop", "down", "volume",
+                     "system", "network"):
             for call in (f'docker("{verb}"', f"docker('{verb}'",
                          f'docker_try("{verb}"', f"docker_try('{verb}'"):
                 self.assertNotIn(call, src, f"dispatcher can invoke: {call}")
 
-    def test_dispatcher_only_invokes_readonly_verbs(self):
-        import os as _os, re as _re
-        path = _os.path.join(_os.path.dirname(_os.path.dirname(
-            _os.path.abspath(__file__))), "nas", "loki-nas-maint")
-        src = open(path).read()
-        verbs = set(_re.findall(r'docker(?:_try)?\(\s*"([a-z]+)"', src))
-        self.assertTrue(verbs <= {"ps", "inspect", "logs", "stats", "events",
-                                  "image"}, f"unexpected docker verbs: {verbs}")
+    def test_dispatcher_docker_verbs_are_the_declared_set(self):
+        src = _dispatcher_src()
+        verbs = set(re.findall(r'docker(?:_try)?\(\s*"([a-z]+)"', src))
+        allowed = {"ps", "inspect", "logs", "stats", "events", "image",
+                   "pull", "compose"}
+        self.assertTrue(verbs <= allowed, f"unexpected docker verbs: {verbs}")
+
+    def test_state_changing_verbs_live_only_in_write_actions(self):
+        """pull / compose up must not be reachable from a read-only action."""
+        src = _dispatcher_src()
+        body = src[src.index("def act_tracearr_update_prepare"):]
+        head = src[:src.index("def act_tracearr_update_prepare")]
+        for marker in ('docker_try("pull"', '"up", "-d"'):
+            self.assertIn(marker, body, f"{marker} should be in write actions")
+            self.assertNotIn(marker, head,
+                             f"{marker} leaked into a read-only action")
+
+    def test_no_shell_execution_anywhere(self):
+        src = _dispatcher_src()
+        self.assertNotIn("shell=True", src)
+        self.assertNotIn("os.system", src)
 
 
 class RestartChurnFinding(unittest.TestCase):
@@ -704,3 +720,177 @@ class ErrorExtractionRedaction(unittest.TestCase):
             self.assertLessEqual(len(e["error_message"]),
                                  self.mod.ERROR_LINE_CHAR_CAP)
             self.assertTrue(e["line_truncated"])
+
+
+BACKUP_OK = {"backup_dir": "/volume2/loki-backups/tracearr/20260728-000000",
+             "compose_ok": True, "database_ok": True,
+             "database_size_bytes": 4096, "gzip_integrity_ok": True}
+VERIFY_OK = {"verified": True, "failures": [], "checks": {}}
+VERIFY_BAD = {"verified": False, "failures": ["local HTTP 502"], "checks": {}}
+
+
+class UpdateToolIsApprovalGated(unittest.TestCase):
+    def test_tool_is_registered_and_consequential(self):
+        import tools
+        spec = tools.REGISTRY["tracearr_update"]
+        self.assertEqual(spec.action_type, "tracearr_update")
+        self.assertEqual(spec.permission, "boss")
+        self.assertTrue(callable(spec.prepare))
+        self.assertEqual(spec.parameters.get("properties"), {})
+
+    def test_write_actions_are_not_directly_callable_tools(self):
+        import tools
+        for a in nm.WRITE_ACTIONS:
+            self.assertNotIn(a, tools.REGISTRY,
+                             f"{a} must not be a model-callable tool")
+
+    def test_write_action_params_are_validated(self):
+        cases = [("tracearr_update_prepare", None), ("tracearr_update_prepare", "x"),
+                 ("tracearr_apply_update", None), ("tracearr_apply_update", "zz"),
+                 ("tracearr_backup", "extra"), ("tracearr_rollback", "extra")]
+        for action, param in cases:
+            with self.subTest(action=action, param=param):
+                with self.assertRaises(nm.NasError):
+                    run(nm.run_action(action, param=param))
+
+    def test_wellformed_digest_and_prepare_id_are_accepted(self):
+        """Shape validation only — no subprocess is spawned."""
+        with mock.patch("asyncio.create_subprocess_exec") as spawn:
+            spawn.side_effect = OSError("blocked")
+            for action, param in (("tracearr_update_prepare", "sha256:" + "a" * 64),
+                                  ("tracearr_apply_update", "0123456789abcdef")):
+                with self.subTest(action=action):
+                    with self.assertRaises(nm.NasError) as cm:
+                        run(nm.run_action(action, param=param))
+                    self.assertIn("could not launch ssh", str(cm.exception))
+
+
+class ApprovedUpdateSequence(unittest.TestCase):
+    def _ctx(self):
+        return boss_ctx()
+
+    def _payload(self):
+        return {"prepare_id": "0123456789abcdef", "installed_version": "v1.4.27",
+                "target_version": "v1.5.0", "target_digest": "sha256:" + "b" * 64,
+                "backup_dir": BACKUP_OK["backup_dir"]}
+
+    def _patch(self, mapping, joplin=True):
+        async def fake(action, timeout=None, param=None):
+            if action not in mapping:
+                raise nm.NasError(f"unexpected action {action}")
+            v = mapping[action]
+            if isinstance(v, Exception):
+                raise v
+            return v
+        ctxs = [mock.patch.object(nm, "run_action", fake)]
+        if joplin:
+            ctxs.append(mock.patch.object(nm, "_record_in_joplin",
+                                          mock.AsyncMock(return_value="note1")))
+        return ctxs
+
+    def _run(self, mapping):
+        patches = self._patch(mapping)
+        for p in patches:
+            p.start()
+        try:
+            return run(nm._run_approved_update(self._payload(), self._ctx()))
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_happy_path_reports_success(self):
+        out = self._run({"tracearr_backup": BACKUP_OK,
+                         "tracearr_apply_update": {"pulled": "img"},
+                         "tracearr_verify_update": VERIFY_OK})
+        self.assertIn("updated v1.4.27 → v1.5.0", out)
+        self.assertIn("verified", out)
+
+    def test_unverified_backup_aborts_before_any_change(self):
+        bad = dict(BACKUP_OK, database_ok=False)
+        out = self._run({"tracearr_backup": bad})
+        self.assertIn("aborted before any change", out)
+        self.assertIn("Nothing was pulled or recreated", out)
+
+    def test_backup_failure_aborts_before_any_change(self):
+        out = self._run({"tracearr_backup": nm.NasError("disk full")})
+        self.assertIn("aborted before any change", out)
+        self.assertIn("disk full", out)
+
+    def test_failed_verification_triggers_rollback(self):
+        out = self._run({"tracearr_backup": BACKUP_OK,
+                         "tracearr_apply_update": {"pulled": "img"},
+                         "tracearr_verify_update": VERIFY_BAD,
+                         "tracearr_rollback": {"verify_after_rollback": VERIFY_OK}})
+        self.assertIn("rolled back", out.lower())
+        self.assertIn("local HTTP 502", out)
+        self.assertIn("database dump was NOT restored", out)
+
+    def test_rollback_that_does_not_verify_is_escalated(self):
+        out = self._run({"tracearr_backup": BACKUP_OK,
+                         "tracearr_apply_update": {"pulled": "img"},
+                         "tracearr_verify_update": VERIFY_BAD,
+                         "tracearr_rollback": {"verify_after_rollback": VERIFY_BAD}})
+        self.assertIn("did not verify", out)
+        self.assertIn("Hands-on attention needed", out)
+
+    def test_rollback_error_is_escalated_not_swallowed(self):
+        out = self._run({"tracearr_backup": BACKUP_OK,
+                         "tracearr_apply_update": {"pulled": "img"},
+                         "tracearr_verify_update": VERIFY_BAD,
+                         "tracearr_rollback": nm.NasError("ssh died")})
+        self.assertIn("rollback errored", out.lower())
+        self.assertIn("hands-on attention", out.lower())
+
+    def test_apply_failure_preserves_backups(self):
+        out = self._run({"tracearr_backup": BACKUP_OK,
+                         "tracearr_apply_update": nm.NasError("pull denied")})
+        self.assertIn("failed while applying", out)
+        self.assertIn("Backups are preserved", out)
+
+    def test_success_and_failure_are_both_recorded_in_joplin(self):
+        for mapping in (
+            {"tracearr_backup": BACKUP_OK, "tracearr_apply_update": {"pulled": "i"},
+             "tracearr_verify_update": VERIFY_OK},
+            {"tracearr_backup": BACKUP_OK, "tracearr_apply_update": {"pulled": "i"},
+             "tracearr_verify_update": VERIFY_BAD,
+             "tracearr_rollback": {"verify_after_rollback": VERIFY_OK}},
+        ):
+            with self.subTest(mapping=sorted(mapping)):
+                rec = mock.AsyncMock(return_value="n1")
+                async def fake(action, timeout=None, param=None):
+                    v = mapping[action]
+                    if isinstance(v, Exception):
+                        raise v
+                    return v
+                with mock.patch.object(nm, "run_action", fake), \
+                     mock.patch.object(nm, "_record_in_joplin", rec):
+                    run(nm._run_approved_update(self._payload(), self._ctx()))
+                rec.assert_awaited()
+
+
+class UpdatePreparePreconditions(unittest.TestCase):
+    def test_refuses_when_upstream_unverified(self):
+        async def up(asset):
+            return {"upstream_check_status": "unavailable", "update_available": None,
+                    "latest_stable_version": None, "latest_stable_digest": None,
+                    "release_source": None, "notes": ["github unreachable"]}
+        async def act(action, timeout=None, param=None):
+            return {"images": {}}
+        with mock.patch.object(nm, "_upstream_for", up), \
+             mock.patch.object(nm, "run_action", act):
+            plan, err = run(nm._prepare_update_plan())
+        self.assertEqual(plan, {})
+        self.assertIn("could not be verified", err)
+
+    def test_refuses_when_already_current(self):
+        async def up(asset):
+            return {"upstream_check_status": "verified", "update_available": False,
+                    "latest_stable_version": "v1.4.27",
+                    "latest_stable_digest": "sha256:" + "c" * 64,
+                    "release_source": "github:x/y", "notes": []}
+        async def act(action, timeout=None, param=None):
+            return {"images": {}}
+        with mock.patch.object(nm, "_upstream_for", up), \
+             mock.patch.object(nm, "run_action", act):
+            plan, err = run(nm._prepare_update_plan())
+        self.assertIn("nothing to update", err)
