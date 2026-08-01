@@ -354,8 +354,58 @@ async def find_note_in_folder(title: str, folder_id: str) -> dict | None:
                  if (n.get("title") or "").strip().lower() == t), None)
 
 
+async def _descendant_folder_ids(root_id: str) -> list[str]:
+    """root_id plus every folder nested under it, from one folder listing."""
+    folders = await get_folder_tree()
+    by_parent: dict[str, list[str]] = {}
+    for f in folders:
+        by_parent.setdefault(f.get("parent_id") or "", []).append(f["id"])
+    out, stack = [], [root_id]
+    while stack:
+        fid = stack.pop()
+        out.append(fid)
+        stack.extend(by_parent.get(fid, []))
+    return out
+
+
+async def _find_note_under_folder(title: str, root_id: str) -> dict | None:
+    """Immediately-consistent lookup across root_id and its descendants —
+    unlike /search, a direct folder listing sees a note the instant it's
+    created, so this is what a read-right-after-write needs."""
+    for fid in await _descendant_folder_ids(root_id):
+        hit = await find_note_in_folder(title, fid)
+        if hit:
+            return hit
+    return None
+
+
 async def find_note_by_title(title: str, notebook: str | None = None) -> dict | None:
-    """Exact-title lookup, optionally scoped to a notebook path."""
+    """Exact-title lookup, optionally scoped to a notebook path.
+
+    Joplin's /search index lags well behind note creation — observed several
+    seconds and up in testing, not a brief race — so a note Loki just wrote
+    can be invisible to search_notes() for a while. Direct folder listings
+    have no such lag, so try one first: scoped to `notebook` when given,
+    otherwise across the whole Loki namespace (where nearly everything Loki
+    itself creates lives). Only fall back to the slower, possibly-stale FTS
+    search for notes outside that reach — journals, recipes, and other
+    notebooks the Boss maintains by hand.
+    """
+    if notebook:
+        folder_id = await resolve_notebook_path(notebook, create=False)
+        if folder_id:
+            hit = await find_note_in_folder(title, folder_id)
+            if hit:
+                # find_note_in_folder only requests id/title/parent_id for
+                # speed; callers expect the full note (body included).
+                return await get_note(hit["id"]) or hit
+    else:
+        loki_root = await resolve_notebook_path(LOKI_NOTEBOOK, create=False)
+        if loki_root:
+            hit = await _find_note_under_folder(title, loki_root)
+            if hit:
+                return await get_note(hit["id"]) or hit
+
     hits = await search_notes(f'title:"{title}"', limit=20)
     if notebook:
         folder_id = await resolve_notebook_path(notebook, create=False)
