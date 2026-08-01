@@ -19,6 +19,22 @@ HA_TOKEN            = os.getenv("HA_TOKEN", "")
 HA_NOTIFY_CHANNEL_ID = int(os.getenv("HA_NOTIFY_CHANNEL_ID", "0"))
 HA_WEBHOOK_PORT     = int(os.getenv("HA_WEBHOOK_PORT", "9100"))
 
+
+# --- Telegram mirror of HA notifications (raw text) to the owner's DM ---
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_MARK = "\U0001F6D2"  # loki_ha_notify titles starting with this ALSO DM Telegram
+
+def _telegram_owner_id() -> int:
+    v = os.getenv("TELEGRAM_OWNER_ID")
+    if v:
+        try: return int(v)
+        except ValueError: pass
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "telegram_state.json")) as f:
+            return int(json.load(f).get("owner_id") or 0)
+    except Exception:
+        return 0
+
 GROQ_API_KEY        = os.getenv("FALLBACK_LLM_API_KEY", "")
 GROQ_MODEL          = os.getenv("FALLBACK_LLM_MODEL", "llama-3.3-70b-versatile")
 GROQ_URL            = "https://api.groq.com/openai/v1/chat/completions"
@@ -174,6 +190,25 @@ async def ha_control(query: str, llm) -> str:
         return "Ran into an issue parsing that request."
 
 
+async def _mirror_to_telegram(title: str, message: str):
+    """Best-effort raw DM of an HA notification to the owner's Telegram. Isolated
+    from the inbound command loop; never raises into the webhook."""
+    token, chat_id = TELEGRAM_BOT_TOKEN, _telegram_owner_id()
+    if not token or not chat_id:
+        return
+    text = f"{title}\n{message}".strip()
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    log.warning(f"Telegram mirror HTTP {r.status}")
+    except Exception as e:
+        log.error(f"Telegram HA-notify mirror failed: {e}")
+
+
 def _make_webhook_app(bot):
     async def handle_notify(request: web.Request) -> web.Response:
         try:
@@ -197,6 +232,10 @@ def _make_webhook_app(bot):
                 await channel.send(f"{text}\n*({ts})*")
             
             asyncio.create_task(send_smart())
+
+        # Mirror title-marked (shopping) notifications to Telegram, raw + best-effort.
+        if title.startswith(TELEGRAM_MARK):
+            asyncio.create_task(_mirror_to_telegram(title, msg))
 
         return web.Response(status=200, text="ok")
 
