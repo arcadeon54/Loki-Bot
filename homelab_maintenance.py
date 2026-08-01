@@ -893,11 +893,11 @@ UNMANAGED_HOSTS = {
             "SSH is off in its UGREEN UI and no credential is installed, so "
             "there is no executor path to it from dex247"),
 }
-# The NAS itself and Tracearr are now REGISTERED assets served by the
+# The NAS itself, Tracearr, and Plex are now REGISTERED assets served by the
 # nas_dispatcher executor, so they resolve normally and never reach this map.
 # What remains are NAS-hosted services with no registered tooling of their own.
 UNMANAGED_ASSETS = {
-    "plex": "nas", "ivn plex": "nas", "jellyseerr": "nas",
+    "jellyseerr": "nas",
     "home assistant": "nas", "ha": "nas", "watchtower": "nas",
     "192 168 1 63": "nas",
 }

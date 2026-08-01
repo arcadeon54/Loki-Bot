@@ -47,9 +47,25 @@ sudo refuses anything not literally listed.
   socket access is root-equivalent on the NAS.
 - **Wildcard docker sudo** (`NOPASSWD: /usr/bin/docker *` and similar). The
   dispatcher exists precisely so this is never needed.
-- Adding a state-changing verb (restart/stop/pull/recreate/exec) to the
-  dispatcher. It has none by construction; updates on the NAS are Watchtower's
-  job, and any change needs an approved plan.
+- Adding `stop`, `kill`, `rm`, `rmi`, `down`, or `prune` anywhere in the
+  dispatcher. None of these verbs exist here, by construction, and never will.
+
+Two narrow, approval-gated exceptions to "the dispatcher only reads" now
+exist, each scoped to exactly one deterministic, reversible action and
+nothing wider:
+
+- **Tracearr update** (`tracearr_update_prepare` / `_backup` / `_apply_update`
+  / `_verify_update` / `_rollback`): `pull` + `compose up -d --no-deps
+  <service>` (a recreate) + `exec` (pg_dump only), gated on verified backups
+  and a matching prepare id.
+- **Plex restart** (`plex_restart`): `docker start` on a container already
+  confirmed STOPPED, gated on its media mounts being present. This is the
+  only place `docker start` appears; `restart` is never used anywhere.
+
+Both require Boss approval every time via Loki's existing draft/approval
+gate — nothing here runs automatically. Anything beyond these two exceptions
+still needs an approved plan of its own, not an addition to this file's verb
+list.
 
 ## Open issue: `/home/unimatrix_001` is mode 0777
 

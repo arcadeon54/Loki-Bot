@@ -382,3 +382,22 @@ assets:
         container_ip: 172.19.0.2
         network_aliases: [timescale, tracearr-db]
         health_field: db
+
+  # Reached ONLY through the restricted dispatcher, same as ugreen-nas and
+  # tracearr above. Container name/IP are deliberately NOT hardcoded here —
+  # the dispatcher discovers the running Plex container by label/image/port
+  # at call time (find_plex), exactly like find_tracearr. This entry exists
+  # so Plex resolves to a registered asset instead of falling into
+  # homelab_maintenance.py's UNMANAGED_ASSETS map.
+  plex:
+    display_name: Plex
+    host: nas
+    executor: nas_dispatcher
+    type: docker_stack
+    aliases:
+      - plex
+      - ivn plex
+      - plex media server
+      - plex server
+    stateful: true
+    update_policy: manual_only

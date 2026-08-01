@@ -152,7 +152,10 @@ class DispatcherActionAllowlist(unittest.TestCase):
             "container_inventory", "host_status", "tracearr_dependencies",
             "tracearr_recent_logs", "tracearr_restart_forensics",
             "tracearr_exit_window_logs",
-            "tracearr_status", "tracearr_update_check"]))
+            "tracearr_status", "tracearr_update_check",
+            "network_status", "network_tooling_check", "network_speed_test",
+            "disk_status", "plex_status", "plex_dependencies",
+            "plex_recent_logs", "plex_transcode_processes"]))
 
     def test_no_state_changing_verb_is_reachable(self):
         for bad in ("restart", "stop", "pull", "recreate", "exec", "docker",
@@ -624,7 +627,7 @@ class ExitWindowLogAction(unittest.TestCase):
         src = _dispatcher_src()
         verbs = set(re.findall(r'docker(?:_try)?\(\s*"([a-z]+)"', src))
         allowed = {"ps", "inspect", "logs", "stats", "events", "image",
-                   "pull", "compose"}
+                   "pull", "compose", "top", "start"}
         self.assertTrue(verbs <= allowed, f"unexpected docker verbs: {verbs}")
 
     def test_state_changing_verbs_live_only_in_write_actions(self):

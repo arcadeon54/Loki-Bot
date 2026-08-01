@@ -87,9 +87,10 @@ class NasAssetsResolveToTheRealBlocker(unittest.TestCase):
     """Tracearr and friends must produce an accurate answer, not a guess."""
 
     # NAS-hosted services that still have NO registered tooling. The NAS
-    # itself and Tracearr were promoted to real assets in Pass 2 and are
-    # covered by tests/test_nas_tracearr.py instead.
-    UNTOOLED_NAS_NAMES = ["Plex", "Jellyseerr", "Watchtower", "192.168.1.63"]
+    # itself, Tracearr (Pass 2) and Plex (Pass 3) were promoted to real
+    # assets and are covered by tests/test_nas_tracearr.py /
+    # tests/test_plex_diagnostics.py instead.
+    UNTOOLED_NAS_NAMES = ["Jellyseerr", "Watchtower", "192.168.1.63"]
 
     def test_nas_hosted_names_report_the_unmanaged_host(self):
         for name in self.UNTOOLED_NAS_NAMES:
@@ -101,16 +102,18 @@ class NasAssetsResolveToTheRealBlocker(unittest.TestCase):
 
     def test_phrases_containing_an_untooled_nas_asset_hit_the_blocker(self):
         """The Boss types sentences, not registry keys."""
-        for phrase in ("the NAS Plex server", "jellyseerr on the nas"):
+        for phrase in ("the NAS Jellyseerr instance", "jellyseerr on the nas"):
             with self.subTest(phrase=phrase):
                 asset, err = hm._resolve_or_error(phrase)
                 self.assertIsNone(asset)
                 self.assertIn("not a managed host", err)
 
     def test_promoted_assets_now_resolve_instead_of_blocking(self):
-        """Pass 2 gave the NAS and Tracearr real executors and tools."""
+        """Pass 2 gave the NAS and Tracearr real executors and tools; Pass 3
+        did the same for Plex."""
         for name, key in (("Tracearr", "tracearr"), ("Tracearr Redis", "tracearr"),
-                          ("nas", "ugreen-nas"), ("UGREEN NAS", "ugreen-nas")):
+                          ("nas", "ugreen-nas"), ("UGREEN NAS", "ugreen-nas"),
+                          ("Plex", "plex"), ("ivn plex", "plex")):
             with self.subTest(name=name):
                 asset, err = hm._resolve_or_error(name)
                 self.assertIsNotNone(asset, err)
@@ -125,11 +128,11 @@ class NasAssetsResolveToTheRealBlocker(unittest.TestCase):
 
     def test_nas_names_do_not_fall_through_to_unknown_asset(self):
         """The old path said 'unknown asset', which reads as 'try harder'."""
-        _, err = hm._resolve_or_error("Plex")
+        _, err = hm._resolve_or_error("Jellyseerr")
         self.assertNotIn("unknown asset", err)
 
     def test_manual_instruction_fallback_is_explicitly_blocked(self):
-        for name in ("Plex", "bogus-thing"):
+        for name in ("Jellyseerr", "bogus-thing"):
             with self.subTest(name=name):
                 _, err = hm._resolve_or_error(name)
                 self.assertIn("manual", err.lower())

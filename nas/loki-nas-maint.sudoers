@@ -17,12 +17,28 @@ unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_updat
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_restart_forensics
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_exit_window_logs
 
+# Pass 3: network / disk / Plex read-only diagnostics, plus one ephemeral
+# throughput test. Same rule: enumerated literally, no wildcard, no shell.
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint network_status
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint network_tooling_check
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint network_speed_test
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint disk_status
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint plex_status
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint plex_dependencies
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint plex_recent_logs
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint plex_transcode_processes
+
 # Approval-gated STATE-CHANGING actions. Still no shell and no free-form
 # argument: the two that take a value are constrained to a literal action name
 # plus a single token, and the dispatcher regex-validates it (sha256 digest or
 # 16-hex prepare id) before doing anything.
-unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_update_prepare sha256:*
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_update_prepare sha256\:*
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_backup
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_apply_update *
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_verify_update
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_rollback
+
+# Plex auto-repair: ONE narrowly-scoped verb (docker start on an already-
+# stopped container). Never restart/stop/kill — those verbs do not exist
+# anywhere in this dispatcher.
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint plex_restart

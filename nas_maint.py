@@ -26,7 +26,10 @@ import asyncio
 import concurrent.futures
 import datetime
 import json
+import os
 import re
+import shutil
+import subprocess
 import logging
 
 import homelab_assets
@@ -36,6 +39,23 @@ log = logging.getLogger("NasMaint")
 
 SSH_ALIAS = "nas-maint"
 DISPATCHER = "/usr/local/sbin/loki-nas-maint"
+
+# Plex's local HTTP API is reached directly from dex247, not through the
+# restricted dispatcher — it needs no privileged access, only LAN reachability,
+# same shape as the existing Jellyfin integration (tools.py). The token is
+# read once here and never logged, returned, or included in an exception.
+PLEX_URL = os.getenv("PLEX_URL", "")
+PLEX_TOKEN = os.getenv("PLEX_TOKEN", "")
+
+# NAS-side iperf3 client run locally on dex247. Path resolved once; if absent
+# the tool degrades to "inconclusive" rather than failing loudly.
+IPERF3_LOCAL = shutil.which("iperf3")
+IPERF3_TEST_SECONDS = 8
+IPERF3_STARTUP_DELAY = 1.2  # let the NAS-side server bind before connecting
+
+# Restart-repair boundary: Plex may only ever be STARTED (never
+# restarted/stopped/killed by Loki) via the approval-gated dispatcher action.
+RESTART_ALERT_THRESHOLD_PLEX = 10
 
 # Mirrors the dispatcher's own table. A caller can never supply an action that
 # is not one of these literals, and the NAS sudoers rule enumerates the same set.
@@ -48,6 +68,14 @@ ACTIONS = (
     "tracearr_update_check",
     "tracearr_restart_forensics",
     "tracearr_exit_window_logs",
+    "network_status",
+    "network_tooling_check",
+    "network_speed_test",
+    "disk_status",
+    "plex_status",
+    "plex_dependencies",
+    "plex_recent_logs",
+    "plex_transcode_processes",
 )
 
 # Approval-gated, STATE-CHANGING dispatcher actions. Never invoked directly by
@@ -59,6 +87,7 @@ WRITE_ACTIONS = {
     "tracearr_apply_update": "prepare_id",
     "tracearr_verify_update": None,
     "tracearr_rollback": None,
+    "plex_restart": None,
 }
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PREPARE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -777,6 +806,402 @@ def _report_body(payload, backup, applied, verify, steps, started,
     return "\n".join(lines)
 
 
+# ── network / disk / Plex diagnostics (Pass 3) ──────────────────────────────
+def _classify_network(status: dict) -> dict:
+    """Obvious saturation/error classification from dispatcher network_status."""
+    counters = status.get("counters") or {}
+    findings = []
+    sat = status.get("saturation_pct_of_link")
+    if sat is not None and sat >= 80:
+        findings.append(f"link saturation {sat}% of negotiated speed")
+    for k in ("rx_errors", "tx_errors", "rx_dropped", "tx_dropped"):
+        v = counters.get(k) or 0
+        if v and v > 0:
+            findings.append(f"{k}={v}")
+    kernel = (status.get("kernel_network_errors") or {}).get("lines") or []
+    if kernel:
+        findings.append(f"{len(kernel)} kernel link-error log line(s)")
+    link = status.get("link") or {}
+    if link.get("operstate") not in (None, "up"):
+        findings.append(f"interface operstate={link.get('operstate')}")
+    return {"healthy": not findings, "findings": findings}
+
+
+def _expected_capacity_mbps(status: dict):
+    link = (status or {}).get("link") or {}
+    return link.get("speed_mbps")
+
+
+async def _tool_nas_network_status(args: dict, ctx: ToolContext) -> str:
+    err = _boss_only(ctx)
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    try:
+        status = await run_action("network_status", timeout=30)
+    except NasError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    diag = _classify_network(status)
+    return json.dumps({"ok": True, "interface": status.get("interface"),
+                       "link": status.get("link"),
+                       "current_throughput": status.get("current_throughput"),
+                       "saturation_pct_of_link": status.get("saturation_pct_of_link"),
+                       "counters": status.get("counters"),
+                       "reachability": status.get("reachability"),
+                       "dns": status.get("dns"),
+                       "routes": status.get("routes"),
+                       "kernel_network_errors": status.get("kernel_network_errors"),
+                       "healthy": diag["healthy"], "findings": diag["findings"]})
+
+
+def _classify_speed_test(server_mbps_down, client_mbps_up, expected_mbps):
+    if server_mbps_down is None and client_mbps_up is None:
+        return "test_inconclusive"
+    if not expected_mbps:
+        return "test_inconclusive"
+    best = max(v for v in (server_mbps_down, client_mbps_up) if v is not None)
+    pct = best / expected_mbps * 100
+    if pct >= 80:
+        return "healthy_for_link_capacity"
+    if pct >= 40:
+        return "degraded"
+    return "severely_degraded"
+
+
+async def _tool_nas_network_speed_test(args: dict, ctx: ToolContext) -> str:
+    err = _boss_only(ctx)
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    if not IPERF3_LOCAL:
+        return json.dumps({"ok": False, "error":
+                           "iperf3 is not installed on dex247 — test cannot run "
+                           "locally. This is a bootstrap gap, not a network fault."})
+    try:
+        tooling = await run_action("network_tooling_check", timeout=15)
+    except NasError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    if not tooling.get("iperf3_installed"):
+        return json.dumps({"ok": False, "error":
+                           "iperf3 is not installed on the NAS — the bootstrap "
+                           "step that stages it has not run yet."})
+
+    async def _server():
+        try:
+            return await run_action("network_speed_test",
+                                     timeout=20)
+        except NasError as e:
+            return {"server_ran": False, "error": str(e)}
+
+    server_task = asyncio.create_task(_server())
+    await asyncio.sleep(IPERF3_STARTUP_DELAY)
+
+    try:
+        status = await run_action("network_status", timeout=30)
+        nas_ip = status.get("address")
+    except NasError:
+        nas_ip = None
+    if not nas_ip:
+        server_task.cancel()
+        return json.dumps({"ok": False, "error":
+                           "could not discover the NAS LAN address to test against"})
+
+    def _run_client(reverse: bool):
+        argv = [IPERF3_LOCAL, "-c", nas_ip, "-p", "5201", "-t",
+                str(IPERF3_TEST_SECONDS), "-J"]
+        if reverse:
+            argv.append("-R")
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True,
+                               timeout=IPERF3_TEST_SECONDS + 10)
+            return p.returncode == 0, p.stdout
+        except (subprocess.TimeoutExpired, OSError):
+            return False, ""
+
+    loop = asyncio.get_event_loop()
+    ok_down, out_down = await loop.run_in_executor(None, _run_client, False)
+    server = await server_task
+
+    down_mbps = retransmits_down = None
+    if ok_down and out_down:
+        try:
+            data = json.loads(out_down)
+            down_mbps = round(data["end"]["sum_received"]["bits_per_second"] / 1e6, 1)
+            retransmits_down = (data.get("end", {}).get("sum_sent") or {}).get("retransmits")
+        except (ValueError, KeyError, TypeError):
+            pass
+
+    # Second, reverse-direction pass needs its own one-off server on the NAS
+    # (the first already exited after serving the download pass).
+    up_mbps = retransmits_up = None
+    if down_mbps is not None:
+        server_task2 = asyncio.create_task(_server())
+        await asyncio.sleep(IPERF3_STARTUP_DELAY)
+        ok_up, out_up = await loop.run_in_executor(None, _run_client, True)
+        await server_task2
+        if ok_up and out_up:
+            try:
+                data = json.loads(out_up)
+                up_mbps = round(data["end"]["sum_received"]["bits_per_second"] / 1e6, 1)
+                retransmits_up = (data.get("end", {}).get("sum_sent") or {}).get("retransmits")
+            except (ValueError, KeyError, TypeError):
+                pass
+
+    expected = _expected_capacity_mbps(status if 'status' in dir() else {})
+    interpretation = _classify_speed_test(down_mbps, up_mbps, expected)
+    return json.dumps({
+        "ok": True,
+        "download_mbps": down_mbps, "upload_mbps": up_mbps,
+        "retransmits": {"download": retransmits_down, "upload": retransmits_up},
+        "expected_link_capacity_mbps": expected,
+        "interpretation": interpretation,
+        "server_ran": server.get("server_ran"),
+        "client_ran": ok_down,
+    })
+
+
+async def _tool_nas_disk_status(args: dict, ctx: ToolContext) -> str:
+    err = _boss_only(ctx)
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    try:
+        data = await run_action("disk_status", timeout=30)
+    except NasError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    findings = []
+    for fs in data.get("filesystems") or []:
+        try:
+            pct = int(str(fs.get("use_pct", "0")).rstrip("%"))
+            if pct >= 90:
+                findings.append(f"{fs.get('mount')} at {pct}% full")
+        except ValueError:
+            pass
+    for s in data.get("smart") or []:
+        if s.get("available") and not s.get("healthy"):
+            findings.append(f"SMART failing on {s.get('device')}")
+    for e in (data.get("kernel_disk_errors") or [])[:5]:
+        findings.append(f"kernel: {e}")
+    return json.dumps({"ok": True, "filesystems": data.get("filesystems"),
+                       "device_io": data.get("device_io"),
+                       "mdraid": data.get("mdraid"), "smart": data.get("smart"),
+                       "kernel_disk_errors": data.get("kernel_disk_errors"),
+                       "healthy": not findings, "findings": findings})
+
+
+def _plex_asset() -> dict:
+    asset = _reg().get("plex")
+    if asset is None:
+        raise NasError("Plex is not in the asset registry")
+    return asset
+
+
+async def _tool_plex_status(args: dict, ctx: ToolContext) -> str:
+    err = _boss_only(ctx)
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    try:
+        data = await run_action("plex_status", timeout=30)
+    except NasError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    app = data.get("plex") or {}
+    out = {"ok": True, "running": app.get("running"),
+           "plex": _summarize(app), "resource_usage": data.get("resource_usage")}
+    rc = app.get("restart_count") or 0
+    if rc > RESTART_ALERT_THRESHOLD_PLEX:
+        out["anomaly"] = f"Plex has restarted {rc} times — that churn is abnormal."
+    return json.dumps(out)
+
+
+async def _tool_plex_diagnose(args: dict, ctx: ToolContext) -> str:
+    err = _boss_only(ctx)
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    try:
+        status = await run_action("plex_status", timeout=30)
+        deps = await run_action("plex_dependencies", timeout=30)
+        transcode = await run_action("plex_transcode_processes", timeout=30)
+    except NasError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    app = status.get("plex") or {}
+    missing_mounts = [m["destination"] for m in deps.get("mounts") or []
+                      if m.get("present") is False]
+    verdict = "Plex and its media mounts are healthy."
+    if not app.get("running"):
+        verdict = f"Plex is not running (state={app.get('state')})."
+    elif missing_mounts:
+        verdict = f"Plex is running but mount(s) missing: {', '.join(missing_mounts)}"
+    return json.dumps({"ok": True, "plex": _summarize(app),
+                       "mounts": deps.get("mounts"),
+                       "transcoding": transcode.get("transcoding"),
+                       "transcode_processes": transcode.get("transcode_processes"),
+                       "missing_mounts": missing_mounts,
+                       "verdict": verdict})
+
+
+async def _plex_http(path: str, timeout: int = 10) -> dict:
+    """Direct call to Plex's own local API. Token used only as a header value
+    — never returned, logged, or included in any exception message."""
+    if not PLEX_URL:
+        raise NasError("PLEX_URL is not configured")
+    import aiohttp
+    headers = {"Accept": "application/json"}
+    if PLEX_TOKEN:
+        headers["X-Plex-Token"] = PLEX_TOKEN
+    url = f"{PLEX_URL.rstrip('/')}{path}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=timeout) as r:
+                if r.status != 200:
+                    raise NasError(f"Plex API returned HTTP {r.status}")
+                return await r.json()
+    except aiohttp.ClientError:
+        raise NasError("could not reach Plex's local API")
+
+
+def _session_transcode_info(s: dict) -> dict:
+    media = (s.get("Media") or [{}])[0]
+    part = (media.get("Part") or [{}])[0]
+    decision = part.get("decision") or media.get("videoDecision") or "unknown"
+    tc = s.get("TranscodeSession") or {}
+    return {
+        "title": s.get("title"),
+        "client": (s.get("Player") or {}).get("product"),
+        "platform": (s.get("Player") or {}).get("platform"),
+        "decision": decision,  # directplay / copy (direct stream) / transcode
+        "bitrate_kbps": media.get("bitrate"),
+        "video_decision": tc.get("videoDecision") or media.get("videoDecision"),
+        "audio_decision": tc.get("audioDecision") or media.get("audioDecision"),
+        "transcode_hw_requested": tc.get("transcodeHwRequested"),
+        "transcode_hw_full_pipeline": tc.get("transcodeHwFullPipeline"),
+        "throttled": tc.get("throttled"),
+        "progress_pct": tc.get("progress"),
+        "speed": tc.get("speed"),
+    }
+
+
+async def _tool_plex_sessions(args: dict, ctx: ToolContext) -> str:
+    err = _boss_only(ctx)
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    try:
+        data = await _plex_http("/status/sessions")
+    except NasError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    sessions = ((data.get("MediaContainer") or {}).get("Metadata") or [])
+    out = [_session_transcode_info(s) for s in sessions]
+    return json.dumps({"ok": True, "active_sessions": len(out), "sessions": out,
+                       "transcoding": any(s["decision"] == "transcode" for s in out)})
+
+
+_PLAYBACK_CONCLUSIONS = (
+    "network_bottleneck", "wifi_or_client_side_likely", "disk_latency",
+    "disk_spin_up_likely", "software_transcode_bottleneck",
+    "hardware_transcode_failure_or_fallback", "plex_database_config_issue",
+    "dns_routing_delay", "container_or_network_issue", "insufficient_evidence",
+)
+
+
+async def _tool_plex_playback_diagnose(args: dict, ctx: ToolContext) -> str:
+    """Bounded 12-step sequence. Never returns a raw checklist — one
+    conclusion, the evidence behind it, and a confidence label."""
+    err = _boss_only(ctx)
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    evidence = {}
+    try:
+        evidence["host"] = await run_action("host_status", timeout=30)
+        evidence["plex"] = await run_action("plex_status", timeout=30)
+        evidence["mounts"] = await run_action("plex_dependencies", timeout=30)
+        evidence["disk"] = await run_action("disk_status", timeout=30)
+        evidence["network"] = await run_action("network_status", timeout=30)
+        evidence["transcode"] = await run_action("plex_transcode_processes", timeout=30)
+    except NasError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    try:
+        sessions_raw = await _plex_http("/status/sessions")
+        sessions = [_session_transcode_info(s) for s in
+                    ((sessions_raw.get("MediaContainer") or {}).get("Metadata") or [])]
+    except NasError:
+        sessions = []
+    try:
+        evidence["logs"] = await run_action("plex_recent_logs", timeout=30)
+    except NasError:
+        evidence["logs"] = None
+
+    app = evidence["plex"].get("plex") or {}
+    net = evidence["network"]
+    net_diag = _classify_network(net)
+    missing_mounts = [m["destination"] for m in evidence["mounts"].get("mounts") or []
+                      if m.get("present") is False]
+    disk_findings = []
+    for fs in evidence["disk"].get("filesystems") or []:
+        try:
+            if int(str(fs.get("use_pct", "0")).rstrip("%")) >= 90:
+                disk_findings.append(fs.get("mount"))
+        except ValueError:
+            pass
+
+    conclusion, confidence, findings = "insufficient_evidence", "low", []
+    if not app.get("running"):
+        conclusion, confidence = "container_or_network_issue", "high"
+        findings.append(f"Plex container state={app.get('state')}")
+    elif missing_mounts:
+        conclusion, confidence = "disk_latency", "high"
+        findings.append(f"missing media mounts: {missing_mounts}")
+    elif not net_diag["healthy"]:
+        conclusion, confidence = "network_bottleneck", "medium"
+        findings += net_diag["findings"]
+    elif any(s["decision"] == "transcode" for s in sessions):
+        tc = next(s for s in sessions if s["decision"] == "transcode")
+        if tc.get("transcode_hw_requested") and not tc.get("transcode_hw_full_pipeline"):
+            conclusion, confidence = "hardware_transcode_failure_or_fallback", "medium"
+        else:
+            conclusion, confidence = "software_transcode_bottleneck", "medium"
+        findings.append(f"active transcode session: {tc}")
+    elif sessions and all(s["decision"] in ("directplay", "copy") for s in sessions):
+        conclusion, confidence = "wifi_or_client_side_likely", "low"
+        findings.append("Direct Play/Direct Stream in use — server-side path is clean")
+    elif disk_findings:
+        conclusion, confidence = "disk_latency", "medium"
+        findings.append(f"filesystem(s) near capacity: {disk_findings}")
+    else:
+        findings.append("no sessions active and no anomaly found in host/network/disk checks")
+
+    return json.dumps({
+        "ok": True, "conclusion": conclusion, "confidence": confidence,
+        "evidence_summary": findings,
+        "plex_state": _summarize(app),
+        "active_sessions": sessions,
+        "network_healthy": net_diag["healthy"],
+    })
+
+
+def _plex_restart_prepare(args: dict, ctx: ToolContext):
+    if user_level(ctx.user_id) != "boss":
+        return {}, "", "Plex restart is Boss-only"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(lambda: asyncio.run(run_action("plex_status", timeout=30)))
+        try:
+            status = fut.result(timeout=45)
+        except Exception as e:                      # noqa: BLE001
+            return {}, "", f"could not check Plex status: {e}"
+    app = status.get("plex") or {}
+    if app.get("running"):
+        return {}, "", "Plex is already running — nothing to restart"
+    summary = (f"START Plex on the UGREEN NAS: container is currently "
+               f"state={app.get('state')}. This only runs `docker start` on "
+               f"the existing stopped container after confirming its media "
+               f"mounts are present — never `restart`, `stop`, or `kill`.")
+    return {"container_state": app.get("state")}, summary, ""
+
+
+async def _run_approved_plex_restart(payload: dict, ctx: ToolContext) -> str:
+    try:
+        result = await run_action("plex_restart", timeout=45)
+    except NasError as e:
+        return f"Plex start failed: {e}"
+    return (f"Plex started: {result.get('container')} is now "
+           f"state={result.get('state')} (running={result.get('running')}).")
+
+
 def _register_tools():
     register(ToolSpec(
         name="nas_status",
@@ -836,6 +1261,96 @@ def _register_tools():
             "performs actual updates and any change needs approval."),
         parameters=_p({}, []),
         handler=_tool_tracearr_update_check, permission="boss", timeout=60,
+    ))
+    register(ToolSpec(
+        name="nas_network_status",
+        description=(
+            "Live NAS network health: active interface, negotiated link "
+            "speed/duplex/MTU, RX/TX errors/drops, current throughput sample, "
+            "gateway/dex247/RAZR reachability and latency, DNS timing, routing "
+            "table, and kernel link errors. FIRST CHOICE for 'is my NAS "
+            "network slow', 'check NAS network', 'is Plex's network ok'. "
+            "Read-only."),
+        parameters=_p({}, []),
+        handler=_tool_nas_network_status, permission="boss", timeout=45,
+    ))
+    register(ToolSpec(
+        name="nas_network_speed_test",
+        description=(
+            "Run a real, bounded (under 20s) iperf3 throughput test between "
+            "dex247 and the UGREEN NAS. FIRST CHOICE for 'run a network speed "
+            "test on the NAS', 'check NAS throughput', 'how fast is the NAS "
+            "network'. Starts a one-off iperf3 server on the NAS bound only "
+            "to its LAN address, tests download and upload, then the server "
+            "exits automatically. No persistent server, no caller-controlled "
+            "host/port/duration."),
+        parameters=_p({}, []),
+        handler=_tool_nas_network_speed_test, permission="boss", timeout=60,
+    ))
+    register(ToolSpec(
+        name="nas_disk_status",
+        description=(
+            "Read-only NAS storage health: filesystem usage, device I/O "
+            "utilization, SMART summaries, mdraid status, and kernel disk "
+            "errors. Use for 'is the NAS disk ok', 'check NAS storage'. Never "
+            "writes a test file or benchmarks disks destructively."),
+        parameters=_p({}, []),
+        handler=_tool_nas_disk_status, permission="boss", timeout=45,
+    ))
+    register(ToolSpec(
+        name="plex_status",
+        description=(
+            "Is Plex running? Live container state, health, restart count, "
+            "CPU/memory on the UGREEN NAS. FIRST CHOICE for 'is Plex up/"
+            "running', 'check Plex'. Read-only."),
+        parameters=_p({}, []),
+        handler=_tool_plex_status, permission="boss", timeout=45,
+    ))
+    register(ToolSpec(
+        name="plex_diagnose",
+        description=(
+            "Diagnose Plex: container state, media mount health, and whether "
+            "it is currently transcoding. FIRST CHOICE for 'Plex is down', "
+            "'diagnose Plex'. Read-only; proposes nothing."),
+        parameters=_p({}, []),
+        handler=_tool_plex_diagnose, permission="boss", timeout=60,
+    ))
+    register(ToolSpec(
+        name="plex_sessions",
+        description=(
+            "Active Plex playback sessions: Direct Play / Direct Stream / "
+            "Transcode state, bitrate, hardware vs software transcode, client "
+            "type, per session. FIRST CHOICE for 'is Plex transcoding', 'is "
+            "Plex using hardware transcoding', 'what is playing on Plex'. "
+            "Calls Plex's own local API directly — never exposes the Plex "
+            "token."),
+        parameters=_p({}, []),
+        handler=_tool_plex_sessions, permission="boss", timeout=30,
+    ))
+    register(ToolSpec(
+        name="plex_playback_diagnose",
+        description=(
+            "Bounded end-to-end diagnosis of slow/buffering Plex playback: "
+            "checks NAS host, Plex container, media mounts, disk, network "
+            "errors/throughput, NAS-to-LAN latency, active sessions, Direct "
+            "Play/Transcode state, transcode load, and bounded logs, then "
+            "returns ONE conclusion with evidence and confidence — never a "
+            "checklist. FIRST CHOICE for 'why is Plex slow to start', 'why is "
+            "this movie buffering', 'Plex is slow'."),
+        parameters=_p({}, []),
+        handler=_tool_plex_playback_diagnose, permission="boss", timeout=90,
+    ))
+    register(ToolSpec(
+        name="plex_start",
+        description=(
+            "Start Plex on the UGREEN NAS ONLY if it is currently stopped and "
+            "its media mounts are healthy. CONSEQUENTIAL: stages an approval "
+            "draft; does nothing until the Boss approves. Uses `docker "
+            "start` only — never restart/stop/kill a running container."),
+        parameters=_p({}, []),
+        handler=_run_approved_plex_restart, permission="boss", timeout=90,
+        action_type="plex_start", approval_ttl=3600,
+        prepare=_plex_restart_prepare,
     ))
 
 

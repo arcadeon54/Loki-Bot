@@ -30,22 +30,53 @@ Contract:
   - Output is JSON on stdout. Environment variable VALUES are never emitted —
     only their names. Labels are allowlisted. Log lines pass a redactor.
 
+Pass 3 additions (network / disk / Plex diagnostics):
+  - READ-ONLY (ACTIONS): network_status, network_tooling_check, disk_status,
+    plex_status, plex_dependencies, plex_recent_logs, plex_transcode_processes.
+    Same contract as the rest of ACTIONS: no arguments, no caller-influenced
+    path or command.
+  - EPHEMERAL (still zero arguments, still no persisted state):
+    network_speed_test starts a ONE-OFF iperf3 server
+    (`-1`) wrapped in a fixed `timeout`, bound only to the discovered LAN IP,
+    on a fixed port. It always exits — either after serving one client or
+    when the timeout fires — so nothing is ever left listening.
+  - APPROVAL-GATED WRITE (WRITE_ACTIONS): plex_restart. The ONLY verb it uses
+    is `docker start` on a container already confirmed STOPPED — never
+    `restart`, `stop`, or `kill`. This mirrors the narrowness of the existing
+    Tracearr pull/exec/recreate exception: one new, deterministic, reversible
+    action (starting something that is already off), not a general
+    stop/kill/restart capability.
+
 Exit codes: 0 ok · 2 unknown/malformed action · 3 discovery failed · 4 docker error
 """
 
 import datetime
 import hashlib
+import ipaddress
 import json
 import re
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import time
 
 DOCKER = "/usr/bin/docker"
 TIMEOUT = 25
 LOG_TAIL = "80"          # fixed bound; not caller-influenced
 MAX_LOG_CHARS = 6000
+
+# ── network / disk / Plex diagnostics (Pass 3) — all fixed constants ───────
+IPERF3 = "/usr/bin/iperf3"       # already present on the NAS (confirmed live)
+IPERF3_PORT = 5201                            # fixed port, never caller-supplied
+IPERF3_SERVER_TIMEOUT = 15                    # hard wall-clock cap
+THROUGHPUT_SAMPLE_SECONDS = 2                 # fixed sampling window
+PING_COUNT = "3"
+PING_TIMEOUT = "2"
+DMESG_LINE_CAP = 40
+PLEX_PORT = 32400
+SAFE_MOUNT_PREFIXES = ("/volume1", "/volume2", "/mnt")  # only these are df'd
 
 # Bounded exit-window log query. All fixed: no caller influences any of these.
 PRE_EXIT_SECONDS = 480       # 8 minutes of context before the exit
@@ -296,6 +327,410 @@ def stack(rows):
     if found["tracearr"] is None:
         found["tracearr"] = app
     return project, found
+
+
+# ── network discovery (Pass 3) ──────────────────────────────────────────────
+def _run(*args, timeout=15):
+    """Fixed argv, non-docker system tool. Returns (ok, stdout, stderr)."""
+    try:
+        p = subprocess.run(list(args), capture_output=True, text=True,
+                           timeout=timeout)
+        return p.returncode == 0, p.stdout, redact(p.stderr.strip())[:300]
+    except subprocess.TimeoutExpired:
+        return False, "", "timeout"
+    except OSError as e:
+        return False, "", e.__class__.__name__
+
+
+def _default_route():
+    """Active default-route interface and gateway, discovered — never hardcoded."""
+    ok, out, _ = _run("/sbin/ip", "-j", "route", "show", "default")
+    if not ok:
+        ok, out, _ = _run("/usr/sbin/ip", "-j", "route", "show", "default")
+    try:
+        routes = json.loads(out or "[]")
+    except ValueError:
+        routes = []
+    for r in routes:
+        if r.get("dst") == "default" and r.get("dev"):
+            return r.get("dev"), r.get("gateway")
+    return None, None
+
+
+def _iface_addr(iface):
+    ok, out, _ = _run("/sbin/ip", "-j", "-4", "addr", "show", "dev", iface)
+    if not ok:
+        ok, out, _ = _run("/usr/sbin/ip", "-j", "-4", "addr", "show", "dev", iface)
+    try:
+        data = json.loads(out or "[]")
+    except ValueError:
+        return None
+    for entry in data:
+        for a in entry.get("addr_info") or []:
+            if a.get("family") == "inet":
+                return a.get("local")
+    return None
+
+
+def _read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_str(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _iface_stats(iface):
+    base = f"/sys/class/net/{iface}"
+    stats_base = f"{base}/statistics"
+    return {
+        "speed_mbps": _read_int(f"{base}/speed"),
+        "duplex": _read_str(f"{base}/duplex"),
+        "mtu": _read_int(f"{base}/mtu"),
+        "carrier": _read_int(f"{base}/carrier"),
+        "carrier_changes": _read_int(f"{base}/carrier_changes"),
+        "operstate": _read_str(f"{base}/operstate"),
+        "rx_bytes": _read_int(f"{stats_base}/rx_bytes"),
+        "tx_bytes": _read_int(f"{stats_base}/tx_bytes"),
+        "rx_errors": _read_int(f"{stats_base}/rx_errors"),
+        "tx_errors": _read_int(f"{stats_base}/tx_errors"),
+        "rx_dropped": _read_int(f"{stats_base}/rx_dropped"),
+        "tx_dropped": _read_int(f"{stats_base}/tx_dropped"),
+    }
+
+
+def _throughput_sample(iface):
+    """RX/TX byte-rate over a fixed, bounded sampling window."""
+    stats_base = f"/sys/class/net/{iface}/statistics"
+    rx0 = _read_int(f"{stats_base}/rx_bytes")
+    tx0 = _read_int(f"{stats_base}/tx_bytes")
+    t0 = time.monotonic()
+    time.sleep(THROUGHPUT_SAMPLE_SECONDS)
+    rx1 = _read_int(f"{stats_base}/rx_bytes")
+    tx1 = _read_int(f"{stats_base}/tx_bytes")
+    elapsed = time.monotonic() - t0
+    if None in (rx0, rx1, tx0, tx1) or elapsed <= 0:
+        return {"rx_mbps": None, "tx_mbps": None, "sample_seconds": elapsed}
+    return {
+        "rx_mbps": round(((rx1 - rx0) * 8 / elapsed) / 1_000_000, 3),
+        "tx_mbps": round(((tx1 - tx0) * 8 / elapsed) / 1_000_000, 3),
+        "sample_seconds": round(elapsed, 2),
+    }
+
+
+def _ping(host):
+    if not host:
+        return {"host": None, "reachable": False}
+    ok, out, err = _run("/bin/ping", "-c", PING_COUNT, "-W", PING_TIMEOUT, host,
+                        timeout=int(PING_COUNT) * int(PING_TIMEOUT) + 5)
+    result = {"host": host, "reachable": ok, "rtt_ms": None, "packet_loss_pct": None}
+    m = re.search(r"(\d+(?:\.\d+)?)% packet loss", out)
+    if m:
+        result["packet_loss_pct"] = float(m.group(1))
+    m = re.search(r"= [\d.]+/([\d.]+)/", out)
+    if m:
+        result["rtt_ms"] = float(m.group(1))
+    if not ok and not out:
+        result["error"] = err[:150]
+    return result
+
+
+def _dns_timing(host):
+    if not host:
+        return {"host": None, "resolved": False}
+    t0 = time.monotonic()
+    try:
+        addr = socket.gethostbyname(host)
+        elapsed_ms = round((time.monotonic() - t0) * 1000, 2)
+        return {"host": host, "resolved": True, "address": addr,
+                "resolve_ms": elapsed_ms}
+    except OSError as e:
+        return {"host": host, "resolved": False,
+                "error": e.__class__.__name__,
+                "resolve_ms": round((time.monotonic() - t0) * 1000, 2)}
+
+
+def _route_table():
+    ok, out, _ = _run("/sbin/ip", "-j", "route", "show")
+    if not ok:
+        ok, out, _ = _run("/usr/sbin/ip", "-j", "route", "show")
+    try:
+        routes = json.loads(out or "[]")
+    except ValueError:
+        return []
+    # Only LAN-relevant fields; nothing exotic (no VPN internals etc.) leaks.
+    return [{"dst": r.get("dst"), "dev": r.get("dev"), "gateway": r.get("gateway"),
+            "prefsrc": r.get("prefsrc")} for r in routes][:30]
+
+
+def _kernel_net_errors():
+    ok, out, _ = _run("/bin/dmesg", timeout=10)
+    if not ok:
+        ok, out, _ = _run("/usr/bin/dmesg", timeout=10)
+    if not ok:
+        return {"available": False, "lines": []}
+    keywords = ("link is down", "link is not ready", "nic link is up",
+                "eth", "carrier", "timeout", "tx queue")
+    lines = [redact(l.strip())[:200] for l in out.splitlines()
+             if any(k in l.lower() for k in keywords)]
+    return {"available": True, "lines": lines[-DMESG_LINE_CAP:]}
+
+
+def _plex_docker_networks(rows):
+    row = find_plex(rows)
+    if row is None:
+        return {}
+    d = inspect(row["ID"])
+    return d.get("networks", {})
+
+
+def act_network_status():
+    iface, gateway = _default_route()
+    if not iface:
+        fail(3, "could not discover the active default-route interface")
+    addr = _iface_addr(iface)
+    stats = _iface_stats(iface)
+    throughput = _throughput_sample(iface)
+
+    known_hosts = {"gateway": gateway, "dex247": os.getenv("LOKI_DEX247_LAN_IP") or None,
+                   "razr": os.getenv("LOKI_RAZR_LAN_IP") or None}
+    reachability = {name: _ping(host) for name, host in known_hosts.items()}
+    dns = {"nas_hostname": _dns_timing(socket.gethostname()),
+          "gateway": _dns_timing(gateway) if gateway else {"resolved": False}}
+
+    rows = ps_all()
+    saturation = None
+    if stats.get("speed_mbps") and throughput.get("rx_mbps") is not None:
+        capacity = stats["speed_mbps"]
+        used_pct = max(throughput["rx_mbps"], throughput["tx_mbps"]) / capacity * 100
+        saturation = round(used_pct, 1)
+
+    return {
+        "interface": iface,
+        "address": addr,
+        "gateway": gateway,
+        "link": {"speed_mbps": stats.get("speed_mbps"),
+                 "duplex": stats.get("duplex"),
+                 "mtu": stats.get("mtu"),
+                 "operstate": stats.get("operstate"),
+                 "carrier": stats.get("carrier"),
+                 "carrier_changes": stats.get("carrier_changes")},
+        "counters": {"rx_bytes": stats.get("rx_bytes"), "tx_bytes": stats.get("tx_bytes"),
+                    "rx_errors": stats.get("rx_errors"), "tx_errors": stats.get("tx_errors"),
+                    "rx_dropped": stats.get("rx_dropped"), "tx_dropped": stats.get("tx_dropped")},
+        "current_throughput": throughput,
+        "saturation_pct_of_link": saturation,
+        "reachability": reachability,
+        "dns": dns,
+        "routes": _route_table(),
+        "kernel_network_errors": _kernel_net_errors(),
+        "plex_docker_networks": _plex_docker_networks(rows),
+    }
+
+
+def act_network_tooling_check():
+    present = os.path.isfile(IPERF3) and os.access(IPERF3, os.X_OK)
+    version = ""
+    if present:
+        ok, out, _ = _run(IPERF3, "--version", timeout=10)
+        version = out.splitlines()[0][:80] if ok and out else ""
+    return {"iperf3_installed": present, "iperf3_path": IPERF3 if present else None,
+            "iperf3_version": version}
+
+
+def act_network_speed_test():
+    if not (os.path.isfile(IPERF3) and os.access(IPERF3, os.X_OK)):
+        fail(3, f"{IPERF3} is not installed — run network_tooling_check first")
+    iface, _gw = _default_route()
+    if not iface:
+        fail(3, "could not discover the active default-route interface")
+    addr = _iface_addr(iface)
+    if not addr:
+        fail(3, f"interface {iface} has no IPv4 address to bind the test to")
+    try:
+        ipaddress.ip_address(addr)
+    except ValueError:
+        fail(3, "discovered bind address failed validation")
+    # -1: exit after ONE client test. timeout: hard backstop if none connects.
+    # Bound to the discovered LAN address only — never 0.0.0.0.
+    ok, out, err = _run("/usr/bin/timeout", str(IPERF3_SERVER_TIMEOUT), IPERF3,
+                        "-s", "-1", "-B", addr, "-p", str(IPERF3_PORT), "-J",
+                        timeout=IPERF3_SERVER_TIMEOUT + 5)
+    return {"bind_address": addr, "port": IPERF3_PORT, "server_ran": ok,
+            "server_output_json": out[:4000] if ok else "",
+            "server_stderr": err if not ok else ""}
+
+
+# ── disk diagnostics (Pass 3) ────────────────────────────────────────────
+def act_disk_status():
+    ok, out, _ = _run("/bin/df", "-hT")
+    if not ok:
+        ok, out, _ = _run("/usr/bin/df", "-hT")
+    disks = []
+    for line in (out or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 7 and any(parts[-1].startswith(p) for p in SAFE_MOUNT_PREFIXES):
+            disks.append({"fs": parts[0][:60], "type": parts[1], "size": parts[2],
+                         "used": parts[3], "avail": parts[4], "use_pct": parts[5],
+                         "mount": parts[-1]})
+
+    diskstats = []
+    for line in (_read_str("/proc/diskstats") or "").splitlines():
+        parts = line.split()
+        if len(parts) < 14:
+            continue
+        name = parts[2]
+        if re.match(r"^(loop|ram|dm-)", name):
+            continue
+        diskstats.append({"device": name, "reads_completed": int(parts[3]),
+                          "writes_completed": int(parts[7]),
+                          "io_in_progress": int(parts[11]),
+                          "io_ms_weighted": int(parts[13])})
+
+    mdstat = _read_str("/proc/mdstat")
+    smart = []
+    for d in diskstats:
+        dev = f"/dev/{d['device']}"
+        ok, out, _ = _run("/usr/sbin/smartctl", "-H", dev, timeout=10)
+        if not ok and "smartctl" not in (out or ""):
+            smart.append({"device": dev, "available": False})
+            continue
+        health = "PASSED" in out or "OK" in out
+        smart.append({"device": dev, "available": True, "healthy": health})
+
+    kernel_errors = []
+    ok, out, _ = _run("/bin/dmesg", timeout=10)
+    if ok:
+        kernel_errors = [redact(l.strip())[:200] for l in out.splitlines()
+                         if re.search(r"(?i)i/o error|ata\d+.*error|end_request",
+                                     l)][-DMESG_LINE_CAP:]
+
+    return {"filesystems": disks, "device_io": diskstats,
+            "mdraid": mdstat, "smart": smart,
+            "kernel_disk_errors": kernel_errors}
+
+
+# ── Plex diagnostics (Pass 3) ────────────────────────────────────────────
+def find_plex(rows):
+    """Identify Plex without trusting any caller input, same shape as
+    find_tracearr: label/image/name match first, published port as fallback."""
+    for row in rows:
+        labels = parse_labels(row.get("Labels"))
+        hay = " ".join([
+            labels.get("com.docker.compose.service", ""),
+            labels.get("com.docker.compose.project", ""),
+            labels.get("org.opencontainers.image.title", ""),
+            row.get("Image", ""), row.get("Names", ""),
+        ]).lower()
+        if "plex" in hay:
+            return row
+    for row in rows:
+        if f":{PLEX_PORT}->" in (row.get("Ports") or ""):
+            return row
+    return None
+
+
+def plex_or_die(rows):
+    row = find_plex(rows)
+    if row is None:
+        fail(3, "Plex container not found by label, image, port or name")
+    return row
+
+
+def act_plex_status():
+    rows = ps_all()
+    row = plex_or_die(rows)
+    app = inspect(row["ID"])
+    stats = _stats([row["ID"]])
+    return {"plex": app, "resource_usage": stats}
+
+
+def act_plex_dependencies():
+    rows = ps_all()
+    row = plex_or_die(rows)
+    raw = docker("inspect", row["ID"])
+    try:
+        data = json.loads(raw)[0]
+    except (ValueError, IndexError):
+        fail(4, "could not parse docker inspect output")
+    mounts = []
+    for m in data.get("Mounts") or []:
+        dest = m.get("Destination") or ""
+        entry = {"destination": dest, "type": m.get("Type"), "rw": m.get("RW")}
+        if any(dest.startswith(p) for p in SAFE_MOUNT_PREFIXES) or dest.startswith("/data") \
+                or dest.startswith("/config") or dest.startswith("/media"):
+            ok, out, _ = _run("/bin/df", "-h", dest, timeout=10)
+            if ok:
+                parts = out.splitlines()[-1].split() if len(out.splitlines()) > 1 else []
+                entry["present"] = True
+                entry["avail"] = parts[3] if len(parts) >= 4 else None
+                entry["use_pct"] = parts[4] if len(parts) >= 5 else None
+            else:
+                entry["present"] = False
+        mounts.append(entry)
+    app = inspect(row["ID"])
+    return {"plex": {"name": app["name"], "state": app["state"]},
+            "mounts": mounts, "networks": app.get("networks", {})}
+
+
+def act_plex_recent_logs():
+    rows = ps_all()
+    row = plex_or_die(rows)
+    out = docker("logs", "--tail", LOG_TAIL, "--timestamps", row["ID"])
+    lines = [redact(ln) for ln in out.splitlines()]
+    blob = "\n".join(lines)[-MAX_LOG_CHARS:]
+    return {"container": row.get("Names"), "lines_returned": len(lines),
+            "tail": blob, "tail_limit": int(LOG_TAIL)}
+
+
+def act_plex_transcode_processes():
+    rows = ps_all()
+    row = plex_or_die(rows)
+    raw = docker("top", row["ID"])
+    lines = raw.splitlines()
+    if not lines:
+        return {"container": row.get("Names"), "processes": []}
+    header = lines[0].split()
+    cmd_idx = header.index("CMD") if "CMD" in header else len(header) - 1
+    procs = []
+    for line in lines[1:]:
+        parts = line.split(None, len(header) - 1)
+        if len(parts) <= cmd_idx:
+            continue
+        cmd = parts[cmd_idx]
+        if "transcode" in cmd.lower() or "ffmpeg" in cmd.lower() or "plex tv" in cmd.lower():
+            procs.append({"cmd": redact(cmd)[:200],
+                          "cpu": parts[header.index("%CPU")] if "%CPU" in header else None})
+    return {"container": row.get("Names"), "transcode_processes": procs,
+            "transcoding": bool(procs)}
+
+
+def act_plex_restart():
+    """Start Plex ONLY if it is currently stopped and its declared media
+    mounts are present. Never restart/stop/kill a running container."""
+    rows = ps_all()
+    row = plex_or_die(rows)
+    app = inspect(row["ID"])
+    if app["running"]:
+        fail(3, "Plex is already running — refusing to touch a running container")
+    if app["state"] not in ("exited", "created", "dead"):
+        fail(3, f"Plex is in state {app['state']!r}, not a stopped state — refusing")
+    deps = act_plex_dependencies()
+    missing = [m["destination"] for m in deps["mounts"] if m.get("present") is False]
+    if missing:
+        fail(3, f"refusing to start Plex: mounts missing: {', '.join(missing)}")
+    docker("start", row["ID"])
+    after = inspect(row["ID"])
+    return {"started": True, "container": after["name"], "state": after["state"],
+            "running": after["running"]}
 
 
 # ── actions ────────────────────────────────────────────────────────────────
@@ -1088,6 +1523,14 @@ ACTIONS = {
     "tracearr_update_check": act_tracearr_update_check,
     "tracearr_restart_forensics": act_tracearr_restart_forensics,
     "tracearr_exit_window_logs": act_tracearr_exit_window_logs,
+    "network_status": act_network_status,
+    "network_tooling_check": act_network_tooling_check,
+    "network_speed_test": act_network_speed_test,
+    "disk_status": act_disk_status,
+    "plex_status": act_plex_status,
+    "plex_dependencies": act_plex_dependencies,
+    "plex_recent_logs": act_plex_recent_logs,
+    "plex_transcode_processes": act_plex_transcode_processes,
 }
 
 # Actions that change state. Each is approval-gated on Loki's side; the
@@ -1099,6 +1542,7 @@ WRITE_ACTIONS = {
     "tracearr_apply_update": (act_tracearr_apply_update, "prepare_id"),
     "tracearr_verify_update": (act_tracearr_verify_update, None),
     "tracearr_rollback": (act_tracearr_rollback, None),
+    "plex_restart": (act_plex_restart, None),
 }
 
 
