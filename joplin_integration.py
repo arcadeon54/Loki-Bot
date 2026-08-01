@@ -228,8 +228,12 @@ async def get_folder_tree() -> list[dict]:
 async def resolve_notebook_path(path: str, create: bool = True) -> str | None:
     """Walk 'A/B/C' and return C's folder id, creating missing levels.
 
+    Also accepts the arrow/gt forms the Boss types in chat ('A → B', 'A > B')
+    by normalizing them to '/' first.
+
     Positive results cached 1h; creation is idempotent-ish (we re-list on
     every miss so concurrent creators converge)."""
+    path = path.replace("→", "/").replace(">", "/")
     path = path.strip().strip("/")
     if not path:
         return None
@@ -241,6 +245,9 @@ async def resolve_notebook_path(path: str, create: bool = True) -> str | None:
     parent_id = ""
     current: list[str] = []
     for segment in path.split("/"):
+        segment = segment.strip()
+        if not segment:
+            continue
         current.append(segment)
         match = next(
             (f for f in folders
@@ -271,6 +278,93 @@ async def folder_path_of(folder_id: str) -> str:
         cur = folders[cur].get("parent_id") or ""
         hops += 1
     return "/".join(reversed(parts))
+
+
+class NotebookAmbiguous(JoplinError):
+    """More than one notebook shares a bare name; never guessed between them."""
+
+    def __init__(self, name: str, paths: list[str]):
+        self.name = name
+        self.paths = paths
+        super().__init__(f"'{name}' matches multiple notebooks: {', '.join(paths)}")
+
+
+_FOLDER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+async def get_folder(folder_id: str) -> dict | None:
+    return await _request("GET", f"/folders/{quote(folder_id)}",
+                          {"fields": "id,title,parent_id"})
+
+
+async def find_folders_by_name(name: str) -> list[dict]:
+    """All notebooks whose own title matches `name` exactly (case-insensitive),
+    regardless of where they sit in the tree — this is how duplicate-name
+    ambiguity is detected."""
+    name_l = name.strip().lower()
+    return [f for f in await get_folder_tree() if f["title"].strip().lower() == name_l]
+
+
+async def resolve_notebook_ref(name_or_path: str) -> tuple[str, str]:
+    """Resolve a bare notebook name, a slash/arrow path, or a raw folder id to
+    exactly one notebook. Returns (folder_id, display_path).
+
+    Raises JoplinError if nothing matches, or NotebookAmbiguous if a bare name
+    matches more than one notebook — callers must surface that to the Boss as
+    a clarifying question rather than picking one."""
+    ref = name_or_path.strip()
+    if _FOLDER_ID_RE.match(ref):
+        folder = await get_folder(ref)
+        if not folder:
+            raise JoplinError(f"No notebook with id '{ref}'.")
+        return ref, await folder_path_of(ref)
+    if "/" in ref or "→" in ref or ">" in ref:
+        folder_id = await resolve_notebook_path(ref, create=False)
+        if not folder_id:
+            raise JoplinError(f"No notebook found at path '{ref}'.")
+        return folder_id, await folder_path_of(folder_id)
+    matches = await find_folders_by_name(ref)
+    if not matches:
+        raise JoplinError(f"No notebook named '{ref}'.")
+    if len(matches) > 1:
+        paths = [await folder_path_of(m["id"]) for m in matches]
+        raise NotebookAmbiguous(ref, paths)
+    folder_id = matches[0]["id"]
+    return folder_id, await folder_path_of(folder_id)
+
+
+def build_notebook_tree(folders: list[dict]) -> list[dict]:
+    """Flat [{id,title,parent_id}] -> nested [{id,title,children:[...]}]."""
+    by_id = {f["id"]: {"id": f["id"], "title": f["title"], "children": []}
+             for f in folders}
+    roots = []
+    for f in folders:
+        node = by_id[f["id"]]
+        parent_id = f.get("parent_id") or ""
+        if parent_id and parent_id in by_id:
+            by_id[parent_id]["children"].append(node)
+        else:
+            roots.append(node)
+    return roots
+
+
+async def folder_children(folder_id: str) -> list[dict]:
+    """Immediate child notebooks of folder_id."""
+    return [f for f in await get_folder_tree()
+            if (f.get("parent_id") or "") == folder_id]
+
+
+async def notes_in_folder(folder_id: str, limit: int | None = None) -> list[dict]:
+    """Notes directly in folder_id (not recursive), most recently updated first."""
+    items = await _paginated(f"/folders/{folder_id}/notes",
+                             {"fields": "id,title,updated_time"})
+    items.sort(key=lambda n: n.get("updated_time") or 0, reverse=True)
+    return items[:limit] if limit else items
+
+
+async def move_note(note_id: str, folder_id: str) -> dict:
+    """Move an existing note into a different notebook."""
+    return await update_note(note_id, parent_id=folder_id)
 
 
 # ─── Notes ────────────────────────────────────────────────────────────────────

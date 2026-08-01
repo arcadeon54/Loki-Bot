@@ -12,7 +12,13 @@ Tools:
     note_search       full-text search all Joplin notes
     note_read         read a note by title/search
     note_append       append to (or create) a note
+    note_move         move an existing note into a different notebook
     list_create       create a checkbox to-do list note
+    notebook_list     flat list of every Joplin notebook (with its path)
+    notebook_tree     the full notebook hierarchy, indented
+    notebook_get      info about one notebook: path, sub-notebooks, note count
+    notebook_children sub-notebooks directly under one notebook
+    notebook_notes    notes directly inside one notebook
     home_status       Home Assistant entity states matching a query
     home_control      natural-language Home Assistant command
     work_hours        work-session report (the 90-min tracker)
@@ -122,6 +128,130 @@ async def _note_append(args: dict, ctx: ToolContext) -> str:
         return "Need both a note title and content to append."
     await jp.append_or_create(title, notebook, content)
     return f"Appended to \"{title}\" ({jp.sync_summary()})."
+
+
+async def _note_move(args: dict, ctx: ToolContext) -> str:
+    import joplin_integration as jp
+    title = str(args.get("note", "")).strip()
+    from_notebook = str(args.get("from_notebook", "")).strip() or None
+    dest = str(args.get("notebook", "")).strip()
+    if not title or not dest:
+        return "Need both the note (by title) and the destination notebook."
+    note = await jp.find_note_by_title(title, from_notebook)
+    if not note:
+        hits = await jp.search_notes(title, limit=1)
+        note = hits[0] if hits else None
+    if not note:
+        return f"Couldn't find a note like '{title}'."
+    try:
+        folder_id, dest_path = await jp.resolve_notebook_ref(dest)
+    except jp.NotebookAmbiguous as e:
+        return f"'{dest}' matches more than one notebook: {', '.join(e.paths)}. Which one did you mean?"
+    except jp.JoplinError as e:
+        return str(e)
+    await jp.move_note(note["id"], folder_id)
+    return f"Moved \"{note['title']}\" into {dest_path} ({jp.sync_summary()})."
+
+
+# ─── Joplin notebooks ────────────────────────────────────────────────────────
+
+async def _notebook_list(args: dict, ctx: ToolContext) -> str:
+    import joplin_integration as jp
+    folders = await jp.get_folder_tree()
+    if not folders:
+        return "No notebooks found."
+    by_id = {f["id"]: f for f in folders}
+
+    def path_of(fid):
+        parts = []
+        cur, hops = fid, 0
+        while cur and cur in by_id and hops < 20:
+            parts.append(by_id[cur]["title"])
+            cur = by_id[cur].get("parent_id") or ""
+            hops += 1
+        return "/".join(reversed(parts))
+
+    paths = sorted(path_of(f["id"]) for f in folders)
+    return "Joplin notebooks:\n" + "\n".join(f"- {p}" for p in paths)
+
+
+def _render_notebook_tree(nodes: list[dict], depth: int = 0) -> list[str]:
+    lines = []
+    for n in sorted(nodes, key=lambda x: x["title"].lower()):
+        lines.append("  " * depth + f"- {n['title']}")
+        lines.extend(_render_notebook_tree(n["children"], depth + 1))
+    return lines
+
+
+async def _notebook_tree(args: dict, ctx: ToolContext) -> str:
+    import joplin_integration as jp
+    folders = await jp.get_folder_tree()
+    if not folders:
+        return "No notebooks found."
+    tree = jp.build_notebook_tree(folders)
+    return "Joplin notebook tree:\n" + "\n".join(_render_notebook_tree(tree))
+
+
+async def _notebook_get(args: dict, ctx: ToolContext) -> str:
+    import joplin_integration as jp
+    ref = str(args.get("name_or_id", "")).strip()
+    if not ref:
+        return "Which notebook?"
+    try:
+        folder_id, path = await jp.resolve_notebook_ref(ref)
+    except jp.NotebookAmbiguous as e:
+        return f"'{ref}' matches more than one notebook: {', '.join(e.paths)}. Which one did you mean?"
+    except jp.JoplinError as e:
+        return str(e)
+    children = await jp.folder_children(folder_id)
+    notes = await jp.notes_in_folder(folder_id)
+    lines = [f"Notebook: {path}", f"Sub-notebooks ({len(children)}): "
+             + (", ".join(c["title"] for c in children) if children else "none"),
+             f"Notes: {len(notes)}"]
+    return "\n".join(lines)
+
+
+async def _notebook_children(args: dict, ctx: ToolContext) -> str:
+    import joplin_integration as jp
+    ref = str(args.get("name_or_id", "")).strip()
+    if not ref:
+        return "Which notebook?"
+    try:
+        folder_id, path = await jp.resolve_notebook_ref(ref)
+    except jp.NotebookAmbiguous as e:
+        return f"'{ref}' matches more than one notebook: {', '.join(e.paths)}. Which one did you mean?"
+    except jp.JoplinError as e:
+        return str(e)
+    children = await jp.folder_children(folder_id)
+    if not children:
+        return f"'{path}' has no sub-notebooks."
+    lines = [f"Sub-notebooks under '{path}':"]
+    lines += [f"- {c['title']}" for c in sorted(children, key=lambda c: c["title"].lower())]
+    return "\n".join(lines)
+
+
+async def _notebook_notes(args: dict, ctx: ToolContext) -> str:
+    import joplin_integration as jp
+    ref = str(args.get("notebook", "")).strip()
+    if not ref:
+        return "Which notebook?"
+    limit = args.get("limit")
+    try:
+        limit = int(limit) if limit not in (None, "") else None
+    except (TypeError, ValueError):
+        limit = None
+    try:
+        folder_id, path = await jp.resolve_notebook_ref(ref)
+    except jp.NotebookAmbiguous as e:
+        return f"'{ref}' matches more than one notebook: {', '.join(e.paths)}. Which one did you mean?"
+    except jp.JoplinError as e:
+        return str(e)
+    notes = await jp.notes_in_folder(folder_id, limit)
+    if not notes:
+        return f"No notes in '{path}'."
+    lines = [f"Notes in '{path}':"]
+    lines += [f"- {n['title']}" for n in notes]
+    return "\n".join(lines)
 
 
 _CHECKBOX_RE = re.compile(r"^\s*-\s*\[[ xX]?\]\s*")
@@ -387,8 +517,11 @@ register(ToolSpec(
             "title": {"type": "string"},
             "body": {"type": "string"},
             "notebook": {"type": "string",
-                         "description": "Notebook path like 'Loki/Projects' or "
-                                        "'Kitchen Corner'. Omit for the Loki inbox."},
+                         "description": "Any existing notebook, by name or nested "
+                                        "path ('Personal/Officer Logs' or "
+                                        "'Personal → Officer Logs'). Use "
+                                        "notebook_get first if unsure it exists. "
+                                        "Omit for the Loki inbox."},
         },
         "required": ["title", "body"],
     },
@@ -430,6 +563,92 @@ register(ToolSpec(
         "required": ["title", "content"],
     },
     handler=_note_append, permission="boss",
+))
+
+register(ToolSpec(
+    name="note_move",
+    description=("Move an existing Joplin note into a different notebook, e.g. "
+                 "'move this note into Officer Logs'. `notebook` accepts a bare "
+                 "name, a nested path like 'Personal/Officer Logs' or "
+                 "'Personal → Officer Logs', or a notebook id from notebook_get."),
+    parameters={
+        "type": "object",
+        "properties": {
+            "note": {"type": "string", "description": "The note's (approximate) title"},
+            "notebook": {"type": "string", "description": "Destination notebook name or path"},
+            "from_notebook": {"type": "string",
+                              "description": "Optional: scope the note lookup if the "
+                                             "title alone is ambiguous"},
+        },
+        "required": ["note", "notebook"],
+    },
+    handler=_note_move, permission="boss",
+))
+
+register(ToolSpec(
+    name="notebook_list",
+    description=("Flat list of every Joplin notebook, with its full path. FIRST "
+                 "CHOICE for 'show me my Joplin notebooks', 'what notebooks do "
+                 "I have'. Read-only."),
+    parameters={"type": "object", "properties": {}},
+    handler=_notebook_list, permission="boss",
+))
+
+register(ToolSpec(
+    name="notebook_tree",
+    description=("The full Joplin notebook hierarchy, indented by nesting. FIRST "
+                 "CHOICE for 'show me my notebook tree', 'browse my notebooks'. "
+                 "Read-only."),
+    parameters={"type": "object", "properties": {}},
+    handler=_notebook_tree, permission="boss",
+))
+
+register(ToolSpec(
+    name="notebook_get",
+    description=("Info about one Joplin notebook: its full path, its "
+                 "sub-notebooks, and how many notes it holds. FIRST CHOICE for "
+                 "'open Officer Logs', 'what notebook is X'. Accepts a bare "
+                 "name, a nested path ('Personal/Officer Logs' or "
+                 "'Personal → Officer Logs'), or a notebook id. If the name is "
+                 "ambiguous (matches more than one notebook) it reports the "
+                 "candidates instead of guessing — ask the Boss which one."),
+    parameters={
+        "type": "object",
+        "properties": {"name_or_id": {"type": "string"}},
+        "required": ["name_or_id"],
+    },
+    handler=_notebook_get, permission="boss",
+))
+
+register(ToolSpec(
+    name="notebook_children",
+    description=("Sub-notebooks directly under one Joplin notebook. FIRST "
+                 "CHOICE for 'what notebooks are under Personal', 'what's "
+                 "inside X'. Same name/path/id resolution as notebook_get."),
+    parameters={
+        "type": "object",
+        "properties": {"name_or_id": {"type": "string"}},
+        "required": ["name_or_id"],
+    },
+    handler=_notebook_children, permission="boss",
+))
+
+register(ToolSpec(
+    name="notebook_notes",
+    description=("Notes directly inside one Joplin notebook (not its "
+                 "sub-notebooks). FIRST CHOICE for 'show me the notes in "
+                 "Officer Logs', 'list the notes in Personal → Officer Logs'. "
+                 "Same name/path/id resolution as notebook_get."),
+    parameters={
+        "type": "object",
+        "properties": {
+            "notebook": {"type": "string"},
+            "limit": {"type": "integer",
+                      "description": "Cap the number of notes returned; omit for all"},
+        },
+        "required": ["notebook"],
+    },
+    handler=_notebook_notes, permission="boss",
 ))
 
 register(ToolSpec(
