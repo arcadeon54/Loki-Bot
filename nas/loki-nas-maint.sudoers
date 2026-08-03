@@ -32,7 +32,13 @@ unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint plex_transcode
 # argument: the two that take a value are constrained to a literal action name
 # plus a single token, and the dispatcher regex-validates it (sha256 digest or
 # 16-hex prepare id) before doing anything.
-unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_update_prepare sha256\:*
+#
+# The digest entry deliberately does NOT try to match the "sha256:" prefix here.
+# A ':' inside a sudoers command argument must be backslash-escaped, and older
+# sudo builds disagree about that escape; the wildcard avoids the portability
+# hazard entirely. Containment is unchanged: one literal action name plus one
+# token, regex-validated by the dispatcher before anything runs.
+unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_update_prepare *
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_backup
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_apply_update *
 unimatrix_001 ALL=(root) NOPASSWD: /usr/local/sbin/loki-nas-maint tracearr_verify_update
