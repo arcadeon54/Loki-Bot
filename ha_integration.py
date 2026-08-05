@@ -18,6 +18,9 @@ HA_URL              = os.getenv("HA_URL", "https://ha.ivn-group.cc")
 HA_TOKEN            = os.getenv("HA_TOKEN", "")
 HA_NOTIFY_CHANNEL_ID = int(os.getenv("HA_NOTIFY_CHANNEL_ID", "0"))
 HA_WEBHOOK_PORT     = int(os.getenv("HA_WEBHOOK_PORT", "9100"))
+# Same entity presence_monitor watches — the roommate whose home/away state
+# rides along with the Boss's welcome-home notification.
+ROOMMATE_ENTITY     = os.getenv("PRESENCE_ROOMMATE_ENTITY", "person.ammiel")
 
 
 # --- Telegram mirror of HA notifications (raw text) to the owner's DM ---
@@ -91,6 +94,27 @@ async def call_service(domain: str, service: str, entity_id: str = None, extra: 
 
 async def get_smart_notification(title: str, message: str) -> str:
     log.info(f"Processing smart notification: {title}")
+
+    # The Boss's own presence transitions are already written in Loki's voice
+    # by Home Assistant. They are delivered VERBATIM — rewriting them is what
+    # produced "Boss, you are not home and the office has been checked out".
+    # This sits ahead of the no-API-key fallback too, so neither path can
+    # narrate them again.
+    kind = personality.presence_kind(message)
+    if kind is not None:
+        rob_state = None
+        if kind == personality.ARRIVE_HOME:
+            # Rob's home/away decides the top lock, so it rides along with the
+            # welcome. Best-effort: an unreachable HA drops the line, never
+            # the welcome itself.
+            try:
+                st = await get_state(ROOMMATE_ENTITY)
+                rob_state = (st or {}).get("state")
+            except Exception as e:
+                log.warning(f"roommate state unavailable for welcome-home: {e}")
+        log.info(f"Presence transition '{kind}' delivered verbatim (no rewrite)")
+        return personality.presence_text(kind, rob_state=rob_state)
+
     if not GROQ_API_KEY:
         return f"**{title}**\n{message}"
 

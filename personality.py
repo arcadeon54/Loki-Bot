@@ -79,3 +79,67 @@ HA_NOTIFICATION = (
     "Address the recipient as 'Boss' and do not mention or address anyone else. "
     "Output a single short message, ready for Discord."
 )
+
+# ── Boss presence transitions: delivered verbatim, never rewritten ─────────
+# Home Assistant already sends these four in Loki's own voice. Feeding them
+# through HA_NOTIFICATION turned four glanceable state changes into narrated
+# sentences that restated what the Boss already knew — "Boss, you are not home
+# and the office has been checked out", "someone has been detected in the
+# office". Only the Boss's own check-in/out is tracked, so there is no
+# "someone" to describe and no reason to explain what the state means.
+#
+# These bypass the rewriter entirely, so the wording cannot drift with the
+# model's mood — or reappear through the no-API-key fallback.
+ROOMMATE_NAME = "Rob"
+
+LEAVE_HOME, OFFICE_IN, OFFICE_OUT, ARRIVE_HOME = (
+    "leave_home", "office_in", "office_out", "arrive_home")
+
+PRESENCE_TEXT = {
+    LEAVE_HOME:  "✌ - Peace out, Homie! I'll hold things down til you get back 💯",
+    OFFICE_IN:   "💼 - Office check-in - 💼",
+    OFFICE_OUT:  "💼 - Office check-out - 💼",
+    ARRIVE_HOME: "🏠 - Welcome home, Boss - 🏠",
+}
+
+# Matched on a distinctive fragment of what HA actually sends, so an upstream
+# emoji or spacing tweak cannot silently re-enable the rewriter.
+_PRESENCE_MATCHES = (
+    ("peace out", LEAVE_HOME),
+    ("office check-in", OFFICE_IN),
+    ("office check-out", OFFICE_OUT),
+    ("welcome home", ARRIVE_HOME),
+)
+
+
+def presence_kind(message: str):
+    """Which Boss presence transition this notification is, or None if it is
+    an ordinary smart-home notification that still gets rewritten."""
+    low = (message or "").strip().lower()
+    for needle, kind in _PRESENCE_MATCHES:
+        if needle in low:
+            return kind
+    return None
+
+
+def roommate_line(rob_state) -> str:
+    """The top-lock decision in one clause. Empty when Rob's state is unknown —
+    a guess here is worse than saying nothing, since it drives a real lock."""
+    st = (rob_state or "").strip().lower()
+    if st == "home":
+        return f"{ROOMMATE_NAME}'s home — top lock's good."
+    if st in ("not_home", "away", "not home"):
+        return f"{ROOMMATE_NAME}'s out — don't lock the top lock."
+    return ""
+
+
+def presence_text(kind: str, rob_state=None) -> str:
+    """The exact user-facing text for a presence transition. Arriving home
+    carries Rob's home/away state with it — the Boss uses it to decide the
+    top lock, so it must land in the same glance, not a separate message."""
+    text = PRESENCE_TEXT[kind]
+    if kind == ARRIVE_HOME:
+        line = roommate_line(rob_state)
+        if line:
+            return f"{text}\n{line}"
+    return text
