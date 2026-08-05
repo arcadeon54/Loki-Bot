@@ -111,9 +111,16 @@ assets:
       containers:
         - joplin
         - joplin-db
-        - loki-joplin-api
+        # loki-joplin-api (the old CLI sidecar container) was REPLACED by
+        # loki-joplin-desktop.service on 2026-07-19. Both mount the same
+        # profile, and two Joplin instances cannot share one SQLite profile —
+        # the container crash-looped in JoplinDatabase.initialize and was
+        # SIGKILLed (137, OOMKilled=false, no memory limit). It is superseded,
+        # not broken. Monitoring it produced a permanent false incident; the
+        # live sidecar is covered by systemd.sync_unit + the Data API check.
     systemd:
       sync_unit: loki-joplin-desktop.service   # headless Desktop sync sidecar
+      # Owns the Data API on 127.0.0.1:41184 — the authoritative runtime.
 
   cloudflare-ddns:
     display_name: Cloudflare DDNS

@@ -123,11 +123,22 @@ async def _note_append(args: dict, ctx: ToolContext) -> str:
     import joplin_integration as jp
     title = str(args.get("title", "")).strip()
     content = str(args.get("content", "")).rstrip()
-    notebook = str(args.get("notebook", "")).strip() or f"{jp.LOKI_NOTEBOOK}/Inbox"
+    asked_for = str(args.get("notebook", "")).strip()
+    notebook = asked_for or f"{jp.LOKI_NOTEBOOK}/Inbox"
     if not title or not content:
         return "Need both a note title and content to append."
-    await jp.append_or_create(title, notebook, content)
-    return f"Appended to \"{title}\" ({jp.sync_summary()})."
+    # No notebook named: find the note wherever it lives. Scoping the search
+    # to the default Inbox made an append to a note in one of the Boss's own
+    # notebooks silently create a duplicate there instead.
+    note = await jp.append_or_create(title, notebook, content,
+                                     search_all=not asked_for)
+    where = ""
+    try:
+        where = await jp.folder_path_of((note or {}).get("parent_id", ""))
+    except Exception:
+        pass
+    return (f"Appended to \"{title}\"" + (f" in {where}" if where else "")
+            + f" ({jp.sync_summary()}).")
 
 
 async def _note_move(args: dict, ctx: ToolContext) -> str:

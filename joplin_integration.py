@@ -462,6 +462,23 @@ async def _descendant_folder_ids(root_id: str) -> list[str]:
     return out
 
 
+async def _find_note_anywhere(title: str) -> dict | None:
+    """Exact-title lookup across EVERY notebook, immediately consistent.
+
+    One `/notes` listing sees a note the instant it is written, unlike the
+    full-text index, and costs a single paginated call regardless of how many
+    notebooks exist — cheaper than walking folders one at a time. When several
+    notes share a title the most recently updated one wins, so a read that
+    follows a write returns what was just written."""
+    items = await _paginated("/notes",
+                             {"fields": "id,title,parent_id,updated_time"})
+    t = title.strip().lower()
+    hits = [n for n in items if (n.get("title") or "").strip().lower() == t]
+    if not hits:
+        return None
+    return max(hits, key=lambda n: n.get("updated_time") or 0)
+
+
 async def _find_note_under_folder(title: str, root_id: str) -> dict | None:
     """Immediately-consistent lookup across root_id and its descendants —
     unlike /search, a direct folder listing sees a note the instant it's
@@ -478,12 +495,16 @@ async def find_note_by_title(title: str, notebook: str | None = None) -> dict | 
 
     Joplin's /search index lags well behind note creation — observed several
     seconds and up in testing, not a brief race — so a note Loki just wrote
-    can be invisible to search_notes() for a while. Direct folder listings
-    have no such lag, so try one first: scoped to `notebook` when given,
-    otherwise across the whole Loki namespace (where nearly everything Loki
-    itself creates lives). Only fall back to the slower, possibly-stale FTS
-    search for notes outside that reach — journals, recipes, and other
-    notebooks the Boss maintains by hand.
+    can be invisible to search_notes() for a while. Direct listings have no
+    such lag, so try one first: scoped to `notebook` when given, otherwise
+    across every notebook.
+
+    That unscoped lookup used to cover only the Loki namespace, on the
+    assumption that Loki reads back only what it filed there. It doesn't: the
+    Boss's own notebooks are equally valid targets ("add this to Officer
+    Logs"), and a note written to one was invisible to the very next read —
+    which made note_append believe the note was missing and create a DUPLICATE
+    instead of appending. A single `/notes` listing covers everything.
     """
     if notebook:
         folder_id = await resolve_notebook_path(notebook, create=False)
@@ -494,11 +515,9 @@ async def find_note_by_title(title: str, notebook: str | None = None) -> dict | 
                 # speed; callers expect the full note (body included).
                 return await get_note(hit["id"]) or hit
     else:
-        loki_root = await resolve_notebook_path(LOKI_NOTEBOOK, create=False)
-        if loki_root:
-            hit = await _find_note_under_folder(title, loki_root)
-            if hit:
-                return await get_note(hit["id"]) or hit
+        hit = await _find_note_anywhere(title)
+        if hit:
+            return await get_note(hit["id"]) or hit
 
     hits = await search_notes(f'title:"{title}"', limit=20)
     if notebook:
@@ -549,10 +568,19 @@ async def upsert_note(title: str, body: str, notebook: str,
 
 async def append_or_create(title: str, notebook: str, content: str,
                            header: str | None = None,
-                           tags: list[str] | None = None) -> dict:
+                           tags: list[str] | None = None,
+                           search_all: bool = False) -> dict:
     """Append a line/block to a note, creating it (with optional header) first
-    if missing. The workhorse for logs (work sessions, lists, journals)."""
-    existing = await find_note_by_title(title, notebook)
+    if missing. The workhorse for logs (work sessions, lists, journals).
+
+    `notebook` is where the note is CREATED if it does not exist. By default
+    the lookup is scoped there too, which is what the log writers want: a
+    daily journal note must match the one in the journal notebook, never a
+    same-titled note elsewhere. `search_all=True` instead looks everywhere —
+    for "append to the note called X" where the Boss named no notebook, and
+    scoping the search to a default would create a duplicate of a note that
+    already exists in one of his own notebooks."""
+    existing = await find_note_by_title(title, None if search_all else notebook)
     if existing:
         return await append_to_note(existing["id"], content)
     body = (header.rstrip() + "\n" if header else "") + content + "\n"

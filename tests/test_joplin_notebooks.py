@@ -277,3 +277,142 @@ class ToolRegistration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadBackAfterWriteOutsideLokiNamespace(unittest.TestCase):
+    """Regression: a note written to one of the BOSS's notebooks was invisible
+    to the very next read.
+
+    find_note_by_title() with no notebook only scanned the Loki namespace and
+    then fell back to /search, whose full-text index lags creation by seconds.
+    So "add this to Officer Logs" then "read it back" failed — and note_append
+    concluded the note was missing and created a DUPLICATE in the default
+    Inbox, splitting the content across two notes.
+    """
+    NOTE = {"id": "n1", "title": "Officer log 2026-08-05",
+            "parent_id": "officer-logs", "updated_time": 200}
+    ALL_NOTES = [
+        {"id": "n0", "title": "something else", "parent_id": "loki-root",
+         "updated_time": 100},
+        NOTE,
+    ]
+
+    def _patched(self, all_notes=None):
+        """Stub the listing endpoint; /search stays empty to stand in for the
+        lagging index that made this fail in production."""
+        return (
+            mock.patch.object(jp, "_paginated",
+                              new=mock.AsyncMock(return_value=all_notes
+                                                 if all_notes is not None
+                                                 else self.ALL_NOTES)),
+            mock.patch.object(jp, "search_notes",
+                              new=mock.AsyncMock(return_value=[])),
+            mock.patch.object(jp, "get_note",
+                              new=mock.AsyncMock(side_effect=lambda i, **k: dict(
+                                  self.NOTE, body="line one"))),
+        )
+
+    def test_finds_a_note_outside_the_loki_namespace(self):
+        p1, p2, p3 = self._patched()
+        with p1, p2, p3:
+            hit = run(jp.find_note_by_title("Officer log 2026-08-05"))
+        self.assertIsNotNone(hit, "note in the Boss's own notebook was not found")
+        self.assertEqual(hit["id"], "n1")
+
+    def test_lookup_does_not_depend_on_the_lagging_search_index(self):
+        p1, p2, p3 = self._patched()
+        with p1, p2, p3 as _get:
+            run(jp.find_note_by_title("Officer log 2026-08-05"))
+        # search_notes returned [] throughout; the hit came from the listing.
+
+    def test_most_recently_updated_wins_when_titles_collide(self):
+        dupes = [
+            {"id": "old", "title": "Same", "parent_id": "a", "updated_time": 1},
+            {"id": "new", "title": "Same", "parent_id": "b", "updated_time": 9},
+        ]
+        with mock.patch.object(jp, "_paginated",
+                               new=mock.AsyncMock(return_value=dupes)):
+            hit = run(jp._find_note_anywhere("Same"))
+        self.assertEqual(hit["id"], "new")
+
+    def test_titles_match_case_and_whitespace_insensitively(self):
+        with mock.patch.object(jp, "_paginated",
+                               new=mock.AsyncMock(return_value=self.ALL_NOTES)):
+            hit = run(jp._find_note_anywhere("  officer LOG 2026-08-05 "))
+        self.assertEqual(hit["id"], "n1")
+
+    def test_missing_note_is_still_none(self):
+        with mock.patch.object(jp, "_paginated",
+                               new=mock.AsyncMock(return_value=self.ALL_NOTES)):
+            self.assertIsNone(run(jp._find_note_anywhere("no such note")))
+
+
+class AppendFindsTheNoteWhereverItLives(unittest.TestCase):
+    """note_append with no notebook must append to the existing note, not
+    create a second copy in the default Inbox."""
+
+    def test_unscoped_append_searches_everywhere(self):
+        seen = {}
+
+        async def fake_find(title, notebook=None):
+            seen["notebook"] = notebook
+            return {"id": "n1", "title": title, "parent_id": "officer-logs"}
+
+        with mock.patch.object(jp, "find_note_by_title", fake_find), \
+             mock.patch.object(jp, "append_to_note",
+                               new=mock.AsyncMock(return_value={"id": "n1"})), \
+             mock.patch.object(jp, "create_note",
+                               new=mock.AsyncMock()) as created:
+            run(jp.append_or_create("T", "Loki/Inbox", "more", search_all=True))
+        self.assertIsNone(seen["notebook"], "unscoped append must search everywhere")
+        created.assert_not_called()
+
+    def test_scoped_append_still_scopes_the_lookup(self):
+        """Log writers (journals, work sessions) must keep matching only
+        inside their own notebook."""
+        seen = {}
+
+        async def fake_find(title, notebook=None):
+            seen["notebook"] = notebook
+            return {"id": "n1", "title": title, "parent_id": "x"}
+
+        with mock.patch.object(jp, "find_note_by_title", fake_find), \
+             mock.patch.object(jp, "append_to_note",
+                               new=mock.AsyncMock(return_value={"id": "n1"})):
+            run(jp.append_or_create("T", "Loki/Journal", "more"))
+        self.assertEqual(seen["notebook"], "Loki/Journal")
+
+    def test_tool_without_notebook_requests_a_global_search(self):
+        captured = {}
+
+        async def fake_aoc(title, notebook, content, header=None, tags=None,
+                           search_all=False):
+            captured.update(notebook=notebook, search_all=search_all)
+            return {"id": "n1", "parent_id": "officer-logs"}
+
+        with mock.patch.object(jp, "append_or_create", fake_aoc), \
+             mock.patch.object(jp, "folder_path_of",
+                               new=mock.AsyncMock(return_value="Personal/Officer Logs")), \
+             mock.patch.object(jp, "sync_summary", lambda *a, **k: "sync ok"):
+            out = run(REGISTRY["note_append"].handler(
+                {"title": "T", "content": "more"}, boss_ctx()))
+        self.assertTrue(captured["search_all"])
+        self.assertIn("Personal/Officer Logs", out)
+
+    def test_tool_with_notebook_keeps_the_scope(self):
+        captured = {}
+
+        async def fake_aoc(title, notebook, content, header=None, tags=None,
+                           search_all=False):
+            captured.update(notebook=notebook, search_all=search_all)
+            return {"id": "n1", "parent_id": "x"}
+
+        with mock.patch.object(jp, "append_or_create", fake_aoc), \
+             mock.patch.object(jp, "folder_path_of",
+                               new=mock.AsyncMock(return_value="Personal/Officer Logs")), \
+             mock.patch.object(jp, "sync_summary", lambda *a, **k: "sync ok"):
+            run(REGISTRY["note_append"].handler(
+                {"title": "T", "content": "more",
+                 "notebook": "Personal/Officer Logs"}, boss_ctx()))
+        self.assertFalse(captured["search_all"])
+        self.assertEqual(captured["notebook"], "Personal/Officer Logs")

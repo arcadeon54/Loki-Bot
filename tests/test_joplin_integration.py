@@ -72,30 +72,29 @@ class FindNoteByTitleImmediateConsistency(unittest.TestCase):
             result = run(jp.find_note_by_title("Test Note", notebook="Loki/Documentation"))
         self.assertEqual(result, full_note)
 
-    def test_unscoped_lookup_searches_the_loki_namespace_first(self):
-        note_stub = {"id": "n2", "title": "Just Created", "parent_id": "loki-inbox"}
+    def test_unscoped_lookup_searches_every_notebook(self):
+        """Not just the Loki namespace: the Boss's own notebooks are equally
+        valid targets, and scoping the search to Loki/ made a note written to
+        Personal/Officer Logs invisible to the very next read."""
+        note_stub = {"id": "n2", "title": "Just Created", "parent_id": "officer-logs"}
         full_note = {**note_stub, "body": "fresh body", "updated_time": 2}
-        with mock.patch.object(jp, "resolve_notebook_path",
-                              new=mock.AsyncMock(return_value="loki-root")), \
-             mock.patch.object(jp, "_find_note_under_folder",
+        with mock.patch.object(jp, "_find_note_anywhere",
                               new=mock.AsyncMock(return_value=note_stub)), \
              mock.patch.object(jp, "get_note",
                               new=mock.AsyncMock(return_value=full_note)), \
              mock.patch.object(jp, "search_notes",
                               new=mock.AsyncMock(side_effect=AssertionError(
                                   "search_notes must not be called when the "
-                                  "Loki-namespace fast path already succeeded"))):
+                                  "listing lookup already succeeded"))):
             result = run(jp.find_note_by_title("Just Created"))
         self.assertEqual(result, full_note)
 
     def test_falls_back_to_search_outside_the_loki_namespace(self):
-        """A note the Boss filed by hand elsewhere (e.g. Personal/Recipes)
-        isn't reachable by the fast path, so search is still needed there."""
+        """If the listing somehow misses it, the full-text index is still a
+        last resort."""
         recipe_hit = {"id": "r1", "title": "Gumbo", "parent_id": "personal-recipes",
                       "body": "roux first"}
-        with mock.patch.object(jp, "resolve_notebook_path",
-                              new=mock.AsyncMock(return_value="loki-root")), \
-             mock.patch.object(jp, "_find_note_under_folder",
+        with mock.patch.object(jp, "_find_note_anywhere",
                               new=mock.AsyncMock(return_value=None)), \
              mock.patch.object(jp, "search_notes",
                               new=mock.AsyncMock(return_value=[recipe_hit])):
@@ -119,9 +118,7 @@ class FindNoteByTitleImmediateConsistency(unittest.TestCase):
         self.assertEqual(result["body"], "the real content")
 
     def test_no_match_anywhere_returns_none(self):
-        with mock.patch.object(jp, "resolve_notebook_path",
-                              new=mock.AsyncMock(return_value="loki-root")), \
-             mock.patch.object(jp, "_find_note_under_folder",
+        with mock.patch.object(jp, "_find_note_anywhere",
                               new=mock.AsyncMock(return_value=None)), \
              mock.patch.object(jp, "search_notes", new=mock.AsyncMock(return_value=[])):
             result = run(jp.find_note_by_title("Does Not Exist"))
