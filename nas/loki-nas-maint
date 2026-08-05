@@ -106,6 +106,11 @@ TRACEARR_REPO = "ghcr.io/connorgallopo/tracearr"
 STATE_DIR = "/var/lib/loki-nas-maint"
 STATE_FILE = STATE_DIR + "/tracearr_update.json"
 BACKUP_ROOT = "/volume2/loki-backups/tracearr"
+# Bounded readiness wait used by BOTH post-update and post-rollback
+# verification. Deliberately shorter than the client's 240s verify timeout so
+# the dispatcher always returns a structured verdict rather than being killed.
+READINESS_DEADLINE_SECONDS = 150
+READINESS_POLL_SECONDS = 5
 LOCAL_HEALTH_URL = "http://127.0.0.1:3001/health"
 PUBLIC_HEALTH_URL = "https://tracearr.ivn-group.cc/health"
 MIN_FREE_MB = 2048
@@ -1424,8 +1429,8 @@ def _http_check(url, timeout=15):
             "body": redact(body.strip())[:300]}
 
 
-def act_tracearr_verify_update():
-    """Verify the app, both dependencies, and local + public HTTP."""
+def _verify_once():
+    """One full verification sweep. Returns (checks, failures)."""
     rows = ps_all()
     _project, found = stack(rows)
     checks, failures = {}, []
@@ -1453,9 +1458,34 @@ def act_tracearr_verify_update():
     public = _http_check(PUBLIC_HEALTH_URL)
     checks["public_http"] = public
     # Public URL is supplementary evidence: proxy/DNS faults are not the app's.
-    state = _state_read()
+    return checks, failures
+
+
+def act_tracearr_verify_update():
+    """Verify the stack, waiting a bounded time for the app to become ready.
+
+    `compose up -d` returns when the container is CREATED, not when the app is
+    listening. Tracearr needs tens of seconds to bind its port, so a single
+    immediate sweep reports `health: starting` and `local HTTP 000` and calls a
+    perfectly good deploy a failure. Poll until the sweep comes back clean or
+    the deadline expires; only then is a failure real.
+    """
+    started = time.time()
+    attempts = 0
+    while True:
+        attempts += 1
+        checks, failures = _verify_once()
+        waited = int(time.time() - started)
+        if not failures or waited >= READINESS_DEADLINE_SECONDS:
+            break
+        time.sleep(READINESS_POLL_SECONDS)
+
     result = {"checks": checks, "failures": failures, "verified": not failures,
-              "public_http_supplementary": True}
+              "public_http_supplementary": True,
+              "readiness": {"attempts": attempts, "waited_seconds": waited,
+                            "deadline_seconds": READINESS_DEADLINE_SECONDS,
+                            "timed_out": bool(failures)}}
+    state = _state_read()
     if state.get("prepare_id"):
         state["verified"] = result
         _state_write(state)

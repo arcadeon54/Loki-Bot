@@ -459,6 +459,37 @@ async def _latest_stable_release(session, release_source: str) -> tuple[str, tup
     return best, best_v
 
 
+async def _find_stable_release(session, release_source: str, version: str) -> tuple:
+    """Version tuple for one EXPLICIT stable upstream release, or raise.
+
+    An approved plan must name the release the Boss agreed to, so a requested
+    target is verified against the upstream feed rather than trusted: it has to
+    exist, be a real release, and not be a prerelease. 'latest' drifts — a new
+    major can land between the checkpoint and the approval — which is exactly
+    why a pinned target exists."""
+    if not release_source.startswith("github:"):
+        raise NasError(f"unsupported release source {release_source!r}")
+    want = (version or "").strip()
+    parsed = _parse_stable(want)
+    if parsed is None:
+        raise NasError(f"{want!r} is not a stable release tag (prereleases are "
+                       f"never an update target)")
+    repo = release_source.split(":", 1)[1]
+    data = await _http_json(session,
+                            f"https://api.github.com/repos/{repo}/releases?per_page=100",
+                            {"Accept": "application/vnd.github+json"})
+    for rel in data:
+        if (rel.get("tag_name") or "").strip() != want:
+            continue
+        if rel.get("draft"):
+            raise NasError(f"upstream release {want} is a draft")
+        if rel.get("prerelease"):
+            raise NasError(f"upstream release {want} is a prerelease and is "
+                           f"never a valid update target")
+        return parsed
+    raise NasError(f"upstream has no stable release tagged {want}")
+
+
 async def _registry_digest(session, repo: str, tag: str) -> str:
     """Resolve a tag to its content digest WITHOUT pulling the image."""
     host, path = repo.split("/", 1)
@@ -482,21 +513,28 @@ async def _registry_digest(session, repo: str, tag: str) -> str:
     return digest
 
 
-async def check_upstream(asset: dict, session) -> dict:
-    """Verified upstream status, or an honest 'unavailable'. Never guesses."""
+async def check_upstream(asset: dict, session, target_version: str = "") -> dict:
+    """Verified upstream status, or an honest 'unavailable'. Never guesses.
+
+    `target_version` pins an explicit stable release instead of taking
+    whatever is newest — the approved plan then names that exact release."""
     spec = asset.get("updates") or {}
     source = spec.get("release_source") or ""
     repo = spec.get("registry_repo") or ""
     out = {"release_source": source or None,
            "latest_stable_version": None, "latest_stable_digest": None,
            "upstream_check_status": "unavailable", "update_available": None,
-           "notes": []}
+           "target_is_pinned": bool(target_version), "notes": []}
     if not source or not repo:
         out["notes"].append("no release_source/registry_repo configured for "
                             "this asset, so upstream cannot be verified")
         return out
     try:
-        latest, latest_v = await _latest_stable_release(session, source)
+        if target_version:
+            latest = target_version.strip()
+            latest_v = await _find_stable_release(session, source, latest)
+        else:
+            latest, latest_v = await _latest_stable_release(session, source)
         tag = _registry_tag(latest, spec.get("registry_tag_style") or "")
         digest = await _registry_digest(session, repo, tag)
     except NasError as e:
@@ -512,6 +550,16 @@ async def check_upstream(asset: dict, session) -> dict:
     if installed_v is None:
         out["notes"].append("installed version is not a parseable stable "
                             "semver, so no comparison was made")
+        return out
+    if target_version:
+        # A pinned target is "available" whenever it differs from what is
+        # installed; going backwards is a deliberate, flagged choice.
+        out["update_available"] = latest_v != installed_v
+        if latest_v < installed_v:
+            out["is_downgrade"] = True
+            out["notes"].append(
+                f"{latest} is OLDER than the installed {asset.get('version')} "
+                f"— this is a downgrade, not an update")
         return out
     out["update_available"] = latest_v > installed_v
     return out
@@ -587,13 +635,13 @@ async def _tool_tracearr_update_check(args: dict, ctx: ToolContext) -> str:
     return json.dumps(out)
 
 
-async def _upstream_for(asset: dict) -> dict:
+async def _upstream_for(asset: dict, target_version: str = "") -> dict:
     """Upstream check with its own session, so a network fault degrades to
     'unavailable' instead of failing the whole status call."""
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            return await check_upstream(asset, session)
+            return await check_upstream(asset, session, target_version)
     except Exception as e:
         return {"release_source": (asset.get("updates") or {}).get("release_source"),
                 "latest_stable_version": None, "latest_stable_digest": None,
@@ -602,7 +650,7 @@ async def _upstream_for(asset: dict) -> dict:
 
 
 # ── approval-gated update workflow ─────────────────────────────────────────
-async def _prepare_update_plan() -> tuple[dict, str]:
+async def _prepare_update_plan(target_version: str = "") -> tuple[dict, str]:
     """Resolve the target digest, record a plan on the NAS, return (plan, err).
 
     Read-only up to and including this point: tracearr_update_prepare writes a
@@ -612,7 +660,7 @@ async def _prepare_update_plan() -> tuple[dict, str]:
         data = await run_action("tracearr_update_check")
     except NasError as e:
         return {}, str(e)
-    upstream = await _upstream_for(asset)
+    upstream = await _upstream_for(asset, target_version)
     if upstream["upstream_check_status"] != "verified":
         return {}, ("upstream release data could not be verified, so there is "
                     "no trustworthy target to approve. "
@@ -621,6 +669,9 @@ async def _prepare_update_plan() -> tuple[dict, str]:
     if not _DIGEST_RE.match(digest):
         return {}, f"upstream returned a malformed digest: {digest[:32]!r}"
     if not upstream.get("update_available"):
+        if target_version:
+            return {}, (f"Tracearr is already on "
+                        f"{upstream.get('latest_stable_version')} — nothing to do.")
         return {}, (f"Tracearr is already on {asset.get('version')}, which is "
                     f"the latest verified stable release — nothing to update.")
     running = (data.get("images") or {}).get("tracearr") or {}
@@ -633,6 +684,9 @@ async def _prepare_update_plan() -> tuple[dict, str]:
         "installed_version": asset.get("version"),
         "target_version": upstream.get("latest_stable_version"),
         "target_digest": digest,
+        "target_is_pinned": bool(target_version),
+        "is_downgrade": bool(upstream.get("is_downgrade")),
+        "upstream_notes": upstream.get("notes") or [],
         "running_image": running.get("image"),
         "release_source": upstream.get("release_source"),
         "approval_policy": asset.get("update_policy"),
@@ -644,11 +698,12 @@ def _update_prepare(args: dict, ctx: ToolContext):
     """Draft-gate hook: build the human summary the Boss approves."""
     if user_level(ctx.user_id) != "boss":
         return {}, "", "Tracearr updates are Boss-only"
+    target_version = str((args or {}).get("version") or "").strip()
     # create_draft() calls this hook SYNCHRONOUSLY from inside the running bot
     # loop, so the async work has to happen on a loop of its own — scheduling
     # it back onto the caller's loop and blocking would deadlock the bot.
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(lambda: asyncio.run(_prepare_update_plan()))
+        fut = pool.submit(lambda: asyncio.run(_prepare_update_plan(target_version)))
         try:
             plan, err = fut.result(timeout=PREPARE_TIMEOUT)
         except concurrent.futures.TimeoutError:
@@ -660,9 +715,12 @@ def _update_prepare(args: dict, ctx: ToolContext):
         return {}, "", err
     space = ("OK" if plan.get("sufficient_space") else
              f"LOW ({plan.get('free_mb')}MB free, {plan.get('free_mb_required')}MB needed)")
+    verb = "DOWNGRADE" if plan.get("is_downgrade") else "UPDATE"
+    pin = (" (pinned target — NOT necessarily the newest release)"
+           if plan.get("target_is_pinned") else " (latest verified stable)")
     summary = "\n".join([
-        f"UPDATE Tracearr on the UGREEN NAS: "
-        f"{plan.get('installed_version')} → {plan.get('target_version')}",
+        f"{verb} Tracearr on the UGREEN NAS: "
+        f"{plan.get('installed_version')} → {plan.get('target_version')}{pin}",
         f"Target digest: {plan.get('target_digest', '')[:26]}…",
         f"Release source: {plan.get('release_source')}",
         f"Compose: {plan.get('compose_file')} (service {plan.get('compose_service')})",
@@ -677,8 +735,55 @@ def _update_prepare(args: dict, ctx: ToolContext):
     return {"prepare_id": plan["prepare_id"],
             "target_digest": plan["target_digest"],
             "target_version": plan.get("target_version"),
+            "target_is_pinned": plan.get("target_is_pinned", False),
             "installed_version": plan.get("installed_version"),
             "backup_dir": plan.get("backup_dir")}, summary, ""
+
+
+def _record_registry_version(new_version: str, new_digest: str) -> str:
+    """After a VERIFIED update, write the new version + digest back into the
+    asset registry. Without this the registry keeps claiming the old release
+    and the next update-check reports `deployment_matches_configuration:
+    false` — a real deployment reading as drift or tampering.
+
+    A surgical line edit rather than a YAML round-trip: this file's comments
+    are load-bearing documentation and safe_dump would erase them. Only the
+    two lines inside the tracearr block are touched, and only when they still
+    hold the values we started from."""
+    try:
+        import homelab_assets
+        path = homelab_assets.REGISTRY_PATH
+        with open(path) as f:
+            lines = f.readlines()
+        start = next((i for i, ln in enumerate(lines)
+                      if ln.rstrip("\n") == "  tracearr:"), None)
+        if start is None:
+            return "registry not updated: tracearr block not found"
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            ln = lines[i]
+            if ln.strip() and not ln.startswith("    ") and not ln.startswith("#"):
+                end = i
+                break
+        changed = []
+        for i in range(start + 1, end):
+            if lines[i].startswith("    version:"):
+                lines[i] = f"    version: {new_version}\n"
+                changed.append("version")
+            elif lines[i].startswith("    image_digest:"):
+                lines[i] = f"    image_digest: {new_digest}\n"
+                changed.append("image_digest")
+        if len(changed) != 2:
+            return f"registry not updated: expected version+image_digest, got {changed}"
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.writelines(lines)
+        os.replace(tmp, path)
+        homelab_assets.load(force=True)     # drop the cached old values
+        return f"registry updated to {new_version}"
+    except Exception as e:                   # noqa: BLE001 - bookkeeping only
+        log.warning("registry version write failed: %s", e)
+        return f"registry not updated ({e.__class__.__name__})"
 
 
 async def _record_in_joplin(title: str, body: str) -> str:
@@ -727,10 +832,15 @@ async def _run_approved_update(payload: dict, ctx: ToolContext) -> str:
 
     # 3. Verify app + dependencies + local and public HTTP.
     try:
-        verify = await run_action("tracearr_verify_update", timeout=180)
+        verify = await run_action("tracearr_verify_update", timeout=240)
     except NasError as e:
         verify = {"verified": False, "failures": [f"verification could not run: {e}"]}
     if verify.get("verified"):
+        # The deployment is now the target; the registry must say so, or the
+        # next update-check reports the running digest as configuration drift.
+        reg = _record_registry_version(str(payload.get("target_version") or ""),
+                                       str(payload.get("target_digest") or ""))
+        _line(reg)
         body = _report_body(payload, backup, applied, verify, steps, started,
                             outcome="SUCCESS")
         await _record_in_joplin(
@@ -739,12 +849,12 @@ async def _run_approved_update(payload: dict, ctx: ToolContext) -> str:
         return (f"Tracearr updated {payload.get('installed_version')} → "
                 f"{payload.get('target_version')} and verified: app, Redis, "
                 f"PostgreSQL, local HTTP and public HTTP all healthy. "
-                f"Backups kept at {backup.get('backup_dir')}.")
+                f"Backups kept at {backup.get('backup_dir')}. {reg}.")
 
     # 4. Verification failed — roll back.
     _line(f"verification FAILED: {'; '.join(verify.get('failures') or [])}")
     try:
-        rb = await run_action("tracearr_rollback", timeout=960)
+        rb = await run_action("tracearr_rollback", timeout=1140)
     except NasError as e:
         body = _report_body(payload, backup, applied, verify, steps, started,
                             outcome="FAILED, ROLLBACK ERRORED")
@@ -1238,8 +1348,12 @@ def _register_tools():
     register(ToolSpec(
         name="tracearr_update",
         description=(
-            "Update Tracearr on the UGREEN NAS to the latest verified stable "
-            "release. FIRST CHOICE for 'update Tracearr', 'upgrade Tracearr'. "
+            "Update Tracearr on the UGREEN NAS to a verified stable release — "
+            "the latest one by default, or an exact release when `version` is "
+            "given (e.g. 'update Tracearr to v1.5.0'). Use `version` whenever "
+            "the Boss names one, so the approved plan pins that exact release "
+            "instead of drifting to whatever is newest. "
+            "FIRST CHOICE for 'update Tracearr', 'upgrade Tracearr'. "
             "This is CONSEQUENTIAL: it stages an approval draft with the exact "
             "versions, digest and backup plan, and does nothing until the Boss "
             "approves. On approval it backs up the compose file and the "
@@ -1247,7 +1361,12 @@ def _register_tools():
             "recreates ONLY the tracearr service (never Redis or PostgreSQL), "
             "verifies app/Redis/PostgreSQL/local HTTP/public HTTP, and rolls "
             "back automatically if verification fails."),
-        parameters=_p({}, []),
+        parameters=_p({"version": {
+            "type": "string",
+            "description": ("Exact stable release tag to pin, e.g. 'v1.5.0'. "
+                            "Omit to target the latest verified stable release. "
+                            "Prereleases are refused."),
+        }}, []),
         handler=_run_approved_update, permission="boss", timeout=1800,
         action_type="tracearr_update", approval_ttl=3600,
         prepare=_update_prepare,

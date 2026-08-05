@@ -254,9 +254,9 @@ assets:
       network: tracearr_tracearr-network
       container_ip: 172.19.0.4
       restart_policy: unless-stopped
-    version: v1.4.27
+    version: v1.5.0
     # Digest actually running as of discovery; an update must change this.
-    image_digest: sha256:4802c793336ec2393de8db1088b0c8aa170c8b8b0aa7bba33a56a599c5d72544
+    image_digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     updates:
       # Authoritative upstream feed. A digest match against the CONFIGURED pin
       # proves deployment consistency only — never that the pin is current.

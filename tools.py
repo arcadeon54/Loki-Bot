@@ -122,8 +122,13 @@ def set_approval_intercept(fn):
 
 
 def user_level(user_id: str) -> str:
-    uid = str(user_id)
-    if uid == OWNER_USER_ID:
+    # An unset OWNER_USER_ID must never promote anyone: without the empty
+    # guards, a missing .env makes `"" == ""` true and hands Boss — every
+    # destructive, approval-gated tool — to any caller with a blank id.
+    uid = str(user_id or "").strip()
+    if not uid:
+        return "everyone"
+    if OWNER_USER_ID and uid == OWNER_USER_ID:
         return "boss"
     if uid in CREW_USER_IDS:
         return "crew"

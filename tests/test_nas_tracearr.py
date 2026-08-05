@@ -237,7 +237,7 @@ class ToolBehaviour(unittest.TestCase):
     def test_update_check_never_offers_to_update(self):
         payload = {"compose_project": "tracearr",
                    "images": {"tracearr": {"container": "tracearr",
-                                           "image": "ghcr.io/x/tracearr@sha256:4802c793336ec2393de8db1088b0c8aa170c8b8b0aa7bba33a56a599c5d72544"}},
+                                           "image": f"ghcr.io/x/tracearr@{PINNED}"}},
                    "note": "local image metadata only"}
         async def no_upstream(asset):
             return {"release_source": None, "latest_stable_version": None,
@@ -308,7 +308,10 @@ def _upstream(status="verified", latest="v1.5.0", digest="sha256:2b6aca8d",
             "notes": list(notes or [])}
 
 
-PINNED = "sha256:4802c793336ec2393de8db1088b0c8aa170c8b8b0aa7bba33a56a599c5d72544"
+# Whatever digest the registry currently pins. Hardcoding one coupled these
+# tests to the deployed release, so a real verified update — which rewrites the
+# pin — made "deployment matches configuration" false and failed them.
+PINNED = (nm._reg().get("tracearr") or {}).get("image_digest", "sha256:" + "0" * 64)
 UPDATE_PAYLOAD = {
     "compose_project": "tracearr",
     "images": {"tracearr": {"container": "tracearr",
@@ -739,7 +742,10 @@ class UpdateToolIsApprovalGated(unittest.TestCase):
         self.assertEqual(spec.action_type, "tracearr_update")
         self.assertEqual(spec.permission, "boss")
         self.assertTrue(callable(spec.prepare))
-        self.assertEqual(spec.parameters.get("properties"), {})
+        # Only an optional pinned-release target; nothing required, so the
+        # bare "update Tracearr" request still works unchanged.
+        self.assertEqual(set(spec.parameters.get("properties")), {"version"})
+        self.assertEqual(spec.parameters.get("required"), [])
 
     def test_write_actions_are_not_directly_callable_tools(self):
         import tools
@@ -873,7 +879,7 @@ class ApprovedUpdateSequence(unittest.TestCase):
 
 class UpdatePreparePreconditions(unittest.TestCase):
     def test_refuses_when_upstream_unverified(self):
-        async def up(asset):
+        async def up(asset, target_version=""):
             return {"upstream_check_status": "unavailable", "update_available": None,
                     "latest_stable_version": None, "latest_stable_digest": None,
                     "release_source": None, "notes": ["github unreachable"]}
@@ -886,7 +892,7 @@ class UpdatePreparePreconditions(unittest.TestCase):
         self.assertIn("could not be verified", err)
 
     def test_refuses_when_already_current(self):
-        async def up(asset):
+        async def up(asset, target_version=""):
             return {"upstream_check_status": "verified", "update_available": False,
                     "latest_stable_version": "v1.4.27",
                     "latest_stable_digest": "sha256:" + "c" * 64,
@@ -897,3 +903,268 @@ class UpdatePreparePreconditions(unittest.TestCase):
              mock.patch.object(nm, "run_action", act):
             plan, err = run(nm._prepare_update_plan())
         self.assertIn("nothing to update", err)
+
+
+class VerifyReadinessWait(unittest.TestCase):
+    """`compose up -d` returns when the container is created, not when the app
+    is listening. Verification must wait that out instead of failing instantly."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "nas", "loki-nas-maint")
+        spec = importlib.util.spec_from_loader("dispatcher_ready", None)
+        cls.mod = importlib.util.module_from_spec(spec)
+        exec(open(path).read(), cls.mod.__dict__)
+
+    def _harness(self, sweeps):
+        """Feed a scripted sequence of _verify_once() results; record sleeps."""
+        m = self.mod
+        slept = []
+        seq = list(sweeps)
+        m._verify_once = lambda: seq.pop(0) if len(seq) > 1 else seq[0]
+        m.time.sleep = lambda s: slept.append(s)
+        m._state_read = lambda: {}
+        m._state_write = lambda s: None
+        return m, slept
+
+    def test_waits_for_a_slow_app_then_verifies(self):
+        starting = ({}, ["tracearr running/starting", "local HTTP 000"])
+        ready = ({"local_http": {"ok": True}}, [])
+        m, slept = self._harness([starting, starting, ready])
+        r = m.act_tracearr_verify_update()
+        self.assertTrue(r["verified"])
+        self.assertEqual(r["readiness"]["attempts"], 3)
+        self.assertFalse(r["readiness"]["timed_out"])
+        self.assertEqual(len(slept), 2)
+
+    def test_ready_immediately_does_not_sleep(self):
+        m, slept = self._harness([({}, [])])
+        r = m.act_tracearr_verify_update()
+        self.assertTrue(r["verified"])
+        self.assertEqual(r["readiness"]["attempts"], 1)
+        self.assertEqual(slept, [])
+
+    def test_genuine_failure_still_fails_after_the_deadline(self):
+        m, slept = self._harness([({}, ["tracearr exited/unhealthy"])])
+        real_time = m.time.time
+        clock = {"t": 0.0}
+        m.time.time = lambda: clock["t"]
+        m.time.sleep = lambda s: clock.__setitem__("t", clock["t"] + s)
+        try:
+            r = m.act_tracearr_verify_update()
+        finally:
+            m.time.time = real_time
+        self.assertFalse(r["verified"])
+        self.assertTrue(r["readiness"]["timed_out"])
+        self.assertGreaterEqual(r["readiness"]["waited_seconds"],
+                                m.READINESS_DEADLINE_SECONDS)
+        self.assertIn("tracearr exited/unhealthy", r["failures"])
+
+    def test_deadline_fits_inside_the_client_timeout(self):
+        import nas_maint  # noqa: F401
+        src = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "nas_maint.py")).read()
+        self.assertIn('"tracearr_verify_update", timeout=240', src)
+        self.assertLess(self.mod.READINESS_DEADLINE_SECONDS, 240)
+
+    def test_rollback_verification_uses_the_same_wait(self):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "nas", "loki-nas-maint")).read()
+        rollback = src.split("def act_tracearr_rollback")[1]
+        self.assertIn("verify = act_tracearr_verify_update()", rollback)
+
+
+class PinnedTargetRelease(unittest.TestCase):
+    """The Boss can name the exact release to update to. Without this, an
+    approved plan silently targets whatever is newest — a major release landing
+    upstream between checkpoint and approval would be applied unannounced."""
+
+    def _releases(self):
+        return [
+            {"tag_name": "v2.0.0", "prerelease": False, "draft": False},
+            {"tag_name": "v2.0.0-beta.4", "prerelease": True, "draft": False},
+            {"tag_name": "v1.5.0", "prerelease": False, "draft": False},
+            {"tag_name": "v1.4.27", "prerelease": False, "draft": False},
+        ]
+
+    def _session(self):
+        rels = self._releases()
+
+        class S:
+            async def _json(self, *a, **k):
+                return rels
+        return S()
+
+    def _patched(self, fn):
+        async def http_json(session, url, headers, timeout=12):
+            return self._releases()
+        return mock.patch.object(nm, "_http_json", http_json)
+
+    def test_pinned_stable_release_is_accepted(self):
+        with self._patched(None):
+            v = run(nm._find_stable_release(None, "github:x/y", "v1.5.0"))
+        self.assertEqual(v, (1, 5, 0))
+
+    def test_prerelease_is_refused_as_a_target(self):
+        with self._patched(None):
+            with self.assertRaises(nm.NasError) as e:
+                run(nm._find_stable_release(None, "github:x/y", "v2.0.0-beta.4"))
+        self.assertIn("prerelease", str(e.exception).lower())
+
+    def test_unknown_tag_is_refused(self):
+        with self._patched(None):
+            with self.assertRaises(nm.NasError) as e:
+                run(nm._find_stable_release(None, "github:x/y", "v9.9.9"))
+        self.assertIn("no stable release", str(e.exception).lower())
+
+    def test_pinned_target_does_not_drift_to_latest(self):
+        """The whole point: v2.0.0 exists upstream, but a v1.5.0 plan pins v1.5.0."""
+        asset = {"version": "v1.4.27",
+                 "updates": {"release_source": "github:x/y",
+                             "registry_repo": "ghcr.io/x/y"}}
+
+        async def digest(session, repo, tag):
+            return "sha256:" + ("a" * 64)
+
+        with self._patched(None), mock.patch.object(nm, "_registry_digest", digest):
+            out = run(nm.check_upstream(asset, None, "v1.5.0"))
+        self.assertEqual(out["latest_stable_version"], "v1.5.0")
+        self.assertTrue(out["update_available"])
+        self.assertTrue(out["target_is_pinned"])
+        self.assertFalse(out.get("is_downgrade"))
+
+    def test_unpinned_still_takes_latest(self):
+        asset = {"version": "v1.4.27",
+                 "updates": {"release_source": "github:x/y",
+                             "registry_repo": "ghcr.io/x/y"}}
+
+        async def digest(session, repo, tag):
+            return "sha256:" + ("a" * 64)
+
+        with self._patched(None), mock.patch.object(nm, "_registry_digest", digest):
+            out = run(nm.check_upstream(asset, None))
+        self.assertEqual(out["latest_stable_version"], "v2.0.0")
+        self.assertFalse(out["target_is_pinned"])
+
+    def test_downgrade_is_allowed_but_flagged(self):
+        asset = {"version": "v2.0.0",
+                 "updates": {"release_source": "github:x/y",
+                             "registry_repo": "ghcr.io/x/y"}}
+
+        async def digest(session, repo, tag):
+            return "sha256:" + ("a" * 64)
+
+        with self._patched(None), mock.patch.object(nm, "_registry_digest", digest):
+            out = run(nm.check_upstream(asset, None, "v1.5.0"))
+        self.assertTrue(out["update_available"])
+        self.assertTrue(out["is_downgrade"])
+        self.assertTrue(any("downgrade" in n for n in out["notes"]))
+
+    def test_approval_summary_names_the_pinned_target(self):
+        plan = {"prepare_id": "a" * 16, "target_digest": "sha256:" + "b" * 64,
+                "installed_version": "v1.4.27", "target_version": "v1.5.0",
+                "target_is_pinned": True, "backup_dir": "/volume2/x",
+                "compose_file": "/volume2/tracearr/docker-compose.yml",
+                "compose_service": "tracearr", "sufficient_space": True,
+                "release_source": "github:x/y", "approval_policy": "approval_always"}
+
+        async def prep(target_version=""):
+            return plan, ""
+
+        with mock.patch.object(nm, "_prepare_update_plan", prep):
+            payload, summary, err = nm._update_prepare({"version": "v1.5.0"}, boss_ctx())
+        self.assertEqual(err, "")
+        self.assertEqual(payload["target_version"], "v1.5.0")
+        self.assertTrue(payload["target_is_pinned"])
+        self.assertIn("v1.4.27 → v1.5.0", summary)
+        self.assertIn("pinned target", summary)
+        self.assertIn("Redis and PostgreSQL are NOT updated", summary)
+
+
+class RegistryVersionWriteback(unittest.TestCase):
+    """A verified update must write the new version+digest back to the asset
+    registry. Without it the registry keeps claiming the old release and the
+    next update-check reports the real deployment as configuration drift."""
+
+    SAMPLE = (
+        "assets:\n"
+        "  other:\n"
+        "    version: v9.9.9\n"
+        "  tracearr:\n"
+        "    display_name: Tracearr\n"
+        "    version: v1.4.27\n"
+        "    # Digest actually running; an update must change this.\n"
+        "    image_digest: sha256:" + "4" * 64 + "\n"
+        "    updates:\n"
+        "      release_source: github:x/y\n"
+        "  plex:\n"
+        "    version: v1.0.0\n"
+    )
+    NEW_DIGEST = "sha256:" + "2" * 64
+
+    def _write(self, text):
+        d = tempfile.mkdtemp(prefix="reg-test-")
+        p = os.path.join(d, "homelab_assets.yml")
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def _run(self, path):
+        import homelab_assets
+        with mock.patch.object(homelab_assets, "REGISTRY_PATH", path), \
+             mock.patch.object(homelab_assets, "load", lambda **k: None):
+            return nm._record_registry_version("v1.5.0", self.NEW_DIGEST)
+
+    def test_writes_new_version_and_digest(self):
+        p = self._write(self.SAMPLE)
+        msg = self._run(p)
+        out = open(p).read()
+        self.assertIn("v1.5.0", msg)
+        self.assertIn("    version: v1.5.0\n", out)
+        self.assertIn(f"    image_digest: {self.NEW_DIGEST}\n", out)
+
+    def test_only_the_tracearr_block_is_touched(self):
+        p = self._write(self.SAMPLE)
+        self._run(p)
+        out = open(p).read()
+        self.assertIn("    version: v9.9.9\n", out)   # the 'other' asset
+        self.assertIn("    version: v1.0.0\n", out)   # plex
+        self.assertNotIn("v1.4.27", out)
+
+    def test_comments_survive(self):
+        p = self._write(self.SAMPLE)
+        self._run(p)
+        self.assertIn("# Digest actually running", open(p).read())
+
+    def test_missing_block_is_reported_not_crashed(self):
+        p = self._write("assets:\n  plex:\n    version: v1.0.0\n")
+        msg = self._run(p)
+        self.assertIn("not updated", msg)
+
+
+class OwnerIdMisconfigurationIsNotBoss(unittest.TestCase):
+    """An unset OWNER_USER_ID must never promote a caller. Without the empty
+    guard, `"" == ""` made every blank-id caller Boss — which is every
+    approval-gated destructive tool, including this one."""
+
+    def test_blank_owner_grants_nobody_boss(self):
+        import tools as t
+        real_owner, real_crew = t.OWNER_USER_ID, t.CREW_USER_IDS
+        t.OWNER_USER_ID, t.CREW_USER_IDS = "", set()
+        try:
+            for uid in ("", None, "   ", "somebody"):
+                self.assertEqual(t.user_level(uid), "everyone", repr(uid))
+        finally:
+            t.OWNER_USER_ID, t.CREW_USER_IDS = real_owner, real_crew
+
+    def test_real_owner_still_boss(self):
+        import tools as t
+        real_owner = t.OWNER_USER_ID
+        t.OWNER_USER_ID = "123456789012345678"
+        try:
+            self.assertEqual(t.user_level("123456789012345678"), "boss")
+            self.assertEqual(t.user_level(""), "everyone")
+        finally:
+            t.OWNER_USER_ID = real_owner
