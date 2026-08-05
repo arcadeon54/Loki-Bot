@@ -256,7 +256,7 @@ assets:
       restart_policy: unless-stopped
     version: v1.5.0
     # Digest actually running as of discovery; an update must change this.
-    image_digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    image_digest: sha256:2b6aca8d86126bb57211f54f1a34e9d8292ad0d783dbc48015452b2af1b9fe3c
     updates:
       # Authoritative upstream feed. A digest match against the CONFIGURED pin
       # proves deployment consistency only — never that the pin is current.

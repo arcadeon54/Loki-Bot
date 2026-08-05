@@ -26,6 +26,20 @@ _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _tmp.close()
 os.environ.setdefault("HOMELAB_DB_PATH", _tmp.name)
 
+# Point the asset registry at a THROWAWAY COPY before anything imports it.
+# A verified update writes the new version+digest back into this file, so a
+# mocked success path running against the real config would rewrite production
+# asset state with fixture values. Copy, don't mock: this protects every test
+# in the module no matter which code path reaches the writer.
+import shutil as _shutil
+_real_registry = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "homelab_assets.yml")
+_tmp_registry = tempfile.NamedTemporaryFile(suffix="-assets.yml", delete=False)
+_tmp_registry.close()
+_shutil.copyfile(_real_registry, _tmp_registry.name)
+os.environ["HOMELAB_ASSETS_PATH"] = _tmp_registry.name
+
 import homelab_assets
 import homelab_maintenance as hm
 import nas_maint as nm
@@ -795,6 +809,12 @@ class ApprovedUpdateSequence(unittest.TestCase):
         if joplin:
             ctxs.append(mock.patch.object(nm, "_record_in_joplin",
                                           mock.AsyncMock(return_value="note1")))
+        # The success path writes the new version+digest into the REAL asset
+        # registry. Stub it here or a mocked run rewrites production config
+        # with fixture values; RegistryVersionWriteback covers it for real,
+        # against a temp file.
+        ctxs.append(mock.patch.object(nm, "_record_registry_version",
+                                      lambda v, d: "registry updated (stubbed)"))
         return ctxs
 
     def _run(self, mapping):
@@ -872,7 +892,9 @@ class ApprovedUpdateSequence(unittest.TestCase):
                         raise v
                     return v
                 with mock.patch.object(nm, "run_action", fake), \
-                     mock.patch.object(nm, "_record_in_joplin", rec):
+                     mock.patch.object(nm, "_record_in_joplin", rec), \
+                     mock.patch.object(nm, "_record_registry_version",
+                                       lambda v, d: "stubbed"):
                     run(nm._run_approved_update(self._payload(), self._ctx()))
                 rec.assert_awaited()
 
