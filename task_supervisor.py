@@ -40,6 +40,11 @@ from typing import Awaitable, Callable, Optional
 
 from tools import PERM_RANK, ToolContext, ToolSpec, register, user_level
 
+try:
+    import maintenance_notify as mn
+except Exception:      # standalone/test import of the supervisor alone
+    mn = None
+
 log = logging.getLogger("TaskSupervisor")
 
 # ── Tunables (env-overridable) ─────────────────────────────────────────────
@@ -163,6 +168,21 @@ _MIGRATIONS = (
     "ALTER TABLE tasks ADD COLUMN priority          INTEGER NOT NULL DEFAULT 0",
 )
 
+def _readdress_autonomous_tasks(conn) -> int:
+    """Idempotent data repair. Autonomous maintenance tasks created before the
+    ops feed existed were addressed to the Boss's Telegram DM. They are
+    long-lived — a paused_quota row never finishes — so every restart
+    re-announced their lifecycle there. Re-address them to the feed.
+
+    Only rows the maintenance stack itself submitted are touched; a task a
+    person asked for keeps the conversation it came from."""
+    if mn is None:
+        return 0
+    cur = conn.execute(
+        "UPDATE tasks SET channel_id=? WHERE requester_name=? AND channel_id<>?",
+        (mn.OPS_CHANNEL, mn.AUTONOMOUS_REQUESTER, mn.OPS_CHANNEL))
+    return cur.rowcount or 0
+
 _conn: Optional[sqlite3.Connection] = None
 
 
@@ -178,6 +198,13 @@ def _db() -> sqlite3.Connection:
                 _conn.execute(mig)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        try:
+            moved = _readdress_autonomous_tasks(_conn)
+            if moved:
+                log.info("re-addressed %d autonomous maintenance task(s) from a "
+                         "chat channel to the ops feed", moved)
+        except sqlite3.OperationalError:
+            log.debug("autonomous task re-addressing skipped", exc_info=True)
         _conn.commit()
     return _conn
 
@@ -370,6 +397,17 @@ async def _maybe_announce(task_id: str):
     # Persist the intent first. If the send fails we drop one message rather
     # than risk announcing the same transition twice after a restart.
     _update(task_id, last_announced=row["status"])
+    # An AUTONOMOUS maintenance task is not a conversation: the feed carries
+    # what the job FOUND, and the router drops the queued/started/claimed/
+    # paused/retry chatter entirely. Matched on requester identity, not the
+    # stored channel — legacy rows still carry the Boss's Telegram chat.
+    # Tasks a person started from a chat are untouched.
+    if mn is not None and mn.is_autonomous_task(row):
+        try:
+            await mn.announce_task(row)
+        except Exception:
+            log.exception("task %s ops announce failed (%s)", task_id, row["status"])
+        return
     if _send is None or not row.get("channel_id"):
         return
     try:

@@ -894,8 +894,12 @@ def reconcile_incidents(name: str) -> dict:
     # Monitor incidents: either keyed on the asset, or (the container-sweep
     # case) keyed on the sweep but opened solely because of this container.
     try:
+        # Active means "not closed" — the monitor keeps escalated/given-up
+        # incidents active until health recovers, and a decommission must
+        # close those too, not just the ones still in 'open'.
         rows = conn.execute(
-            "SELECT * FROM monitor_incidents WHERE status='open' AND "
+            "SELECT * FROM monitor_incidents WHERE closed_at IS NULL AND "
+            "status IN ('open','escalated','gave_up') AND "
             "(key=? OR display_name=? OR detection_json LIKE ? OR evidence_json LIKE ?)",
             (name, name, like, like)).fetchall()
         for r in rows:

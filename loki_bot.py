@@ -238,6 +238,14 @@ except Exception as _cu_err:
         f"container updates unavailable: {_cu_err}")
 
 try:
+    import maintenance_notify  # side effect: none — routing table + env config
+    _maintenance_notify_available = True
+except Exception as _mn_err:
+    _maintenance_notify_available = False
+    logging.getLogger("MaintenanceNotify").warning(
+        f"maintenance notification routing unavailable: {_mn_err}")
+
+try:
     import homelab_monitor  # side effect: none — polling starts only via .start()
     _homelab_monitor_available = homelab_monitor.enabled
 except Exception as _mon_err:
@@ -5428,6 +5436,14 @@ async def on_ready():
     async def _channel_send(channel_id: str, text: str,
                             file_path: str | None = None,
                             filename: str | None = None):
+        if (_maintenance_notify_available
+                and maintenance_notify.is_ops_channel(channel_id)):
+            # Not a conversation — the maintenance ops feed. Resolved here so
+            # the sentinel never reaches int() as a Discord id.
+            if not maintenance_notify.OPS_CHANNEL_ID:
+                await _dm_boss(text)
+                return
+            channel_id = maintenance_notify.OPS_CHANNEL_ID
         if channel_id.startswith("tg:"):
             chat_id = int(channel_id[3:])
             if _telegram_iface is None:
@@ -5511,28 +5527,52 @@ async def on_ready():
     if _container_updates_available:
         log.info("Container updates online — inventory + approval-gated updates")
 
+    # Maintenance notification routing — ONE Discord operations channel is the
+    # canonical feed for autonomous maintenance. The Boss's Telegram line is
+    # reserved for the urgent categories (see maintenance_notify.EVENTS) and is
+    # also the fallback whenever no ops channel is configured.
+    async def _notify_boss_urgent(text: str):
+        if _telegram_iface is not None and _telegram_iface.owner_id:
+            await _telegram_iface.send(_telegram_iface.owner_id, text)
+        else:
+            await _dm_boss(text)
+
+    if _maintenance_notify_available:
+        async def _ops_send(text: str):
+            cid = int(maintenance_notify.OPS_CHANNEL_ID)
+            channel = bot.get_channel(cid) or await bot.fetch_channel(cid)
+            await channel.send(text)
+
+        # boss_send is the Telegram line — urgent events only. If the ops
+        # channel itself fails, non-urgent events fall back to the Boss's
+        # DISCORD DM, never to Telegram.
+        maintenance_notify.bind(ops_send=_ops_send,
+                                boss_send=_notify_boss_urgent,
+                                fallback_send=_dm_boss)
+        log.info("Maintenance notifications — %s", maintenance_notify.status_line())
+
     # Homelab monitor — conservative automatic health checks + known-issue
-    # repair on top of the maintenance controller. Boss-only notifications:
-    # Telegram (the Boss's private line) once paired, else a Discord DM.
+    # repair on top of the maintenance controller. Notifications go to the
+    # Discord ops feed; only urgent events also reach Telegram.
     if _homelab_monitor_available:
-        def _boss_channel_id() -> str:
+        def _maintenance_channel_id() -> str:
+            """Where autonomous escalations report: the ops feed when one is
+            configured, otherwise the Boss's line as before."""
+            if _maintenance_notify_available and maintenance_notify.ops_channel_id():
+                return maintenance_notify.ops_channel_id()
             if _telegram_iface is not None and _telegram_iface.owner_id:
                 return f"tg:{_telegram_iface.owner_id}"
             return str(OWNER_USER_ID)
-
-        async def _notify_boss_monitor(text: str):
-            if _telegram_iface is not None and _telegram_iface.owner_id:
-                await _telegram_iface.send(_telegram_iface.owner_id, text)
-            else:
-                await _dm_boss(text)
 
         def _discord_status():
             return {"ready": bot.is_ready(), "latency_ms":
                     (bot.latency * 1000) if bot.latency == bot.latency else None}
 
-        homelab_monitor.bind(notify_boss=_notify_boss_monitor,
+        # The monitor's own last-resort notifier is the Discord DM, not
+        # Telegram: it only fires when the ops feed is unreachable.
+        homelab_monitor.bind(notify_boss=_dm_boss,
                              discord_status=_discord_status,
-                             boss_channel_id=_boss_channel_id)
+                             boss_channel_id=_maintenance_channel_id)
         homelab_monitor.start()
         log.info("Homelab monitor online — polling every %ss",
                  homelab_monitor.POLL_INTERVAL_SECS)

@@ -40,6 +40,11 @@ import maintenance_policy as policy
 import tools
 from tools import ToolContext, ToolSpec, register, user_level
 
+try:
+    import maintenance_notify as _mn
+except Exception:      # routing layer optional — falls back to the caller's channel
+    _mn = None
+
 log = logging.getLogger("HomelabMaintenance")
 
 DB_PATH = os.getenv("HOMELAB_DB_PATH",
@@ -651,14 +656,18 @@ async def _hermes_handler(h):
         inc = get_incident(incident_id) if incident_id else None
         if job.get("escalated") and inc and not inc.get("hermes_escalation_announced"):
             _incident_update(incident_id, hermes_escalation_announced=1)
-            if ts._send is not None and h.row.get("channel_id"):
-                try:
-                    await ts._send(
-                        h.row["channel_id"],
-                        "🔎 Hermes needed a deeper look and escalated to its stronger "
-                        "model — still working, I'll follow up.")
-                except Exception:
-                    log.exception("hermes escalation notice failed")
+            cid = h.row.get("channel_id")
+            note = ("🔎 Hermes needed a deeper look and escalated to its stronger "
+                    "model — still working, I'll follow up.")
+            try:
+                # Autonomous incidents report to the maintenance ops feed; an
+                # escalation the Boss asked for answers where he asked.
+                if _mn is not None and _mn.is_autonomous_task(h.row):
+                    await _mn.notify("diagnostic_progress", note)
+                elif ts._send is not None and cid:
+                    await ts._send(cid, note)
+            except Exception:
+                log.exception("hermes escalation notice failed")
 
         diagnosis = job.get("diagnosis") or {}
         if incident_id:

@@ -12,27 +12,39 @@ Hard rules, all enforced here rather than left to a prompt:
 
   - A single failed check is not an incident. Two CONSECUTIVE failures are
     required before anything opens or notifies.
-  - One open incident per asset. A second failure while one is already open
-    never creates a duplicate.
-  - After an incident closes (resolved or given up on), a cooldown blocks a
-    new incident for the same asset for a while — flapping does not produce
-    a new incident every five minutes.
+  - ONE active incident per asset, and it stays active until the health
+    condition verifies recovered. Reaching "escalated" or "gave up" says what
+    automation has left to try; it does NOT close the incident. Repeat
+    detections update that one incident (occurrence_count, last_seen) and buy
+    nothing: no second incident, no second Hermes job, no repeat notification.
+  - Hermes runs AT MOST ONCE per active incident. A submission that never
+    reached the bridge is not an escalation and may be retried, but only
+    behind a growing backoff and a hard attempt cap. Quota exhaustion is
+    recorded on the incident and backed off, never re-attempted per poll.
+  - Recovery is verified, not assumed: an incident closes only after
+    RECOVERY_THRESHOLD consecutive healthy polls (or a runbook repair that
+    verified itself). Only then does a cooldown block a fresh incident, so a
+    flapping service still cannot produce one every five minutes.
   - Automatic repair is attempted at most once, except for the one runbook
     that is provably idempotent and already verifies+rolls back
     (BLACK-BOXX's policy-rule restore), which gets a second try if the first
     verification fails.
   - A repair that fails verification stops immediately and escalates. There
     is no retry loop.
-  - Every notification is sent to the Boss only — never a guild/group
-    channel — and only on a real state transition, never repeated per poll.
+  - Every notification goes to the configured Discord operations channel via
+    maintenance_notify (never a general chat channel), and only on a real
+    state transition, never repeated per poll. Only the urgent categories
+    also reach the Boss's Telegram line.
   - State survives a Loki restart: an in-flight incident is reloaded from
     SQLite, not reopened from scratch.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from typing import Optional
@@ -41,6 +53,7 @@ import aiohttp
 
 import homelab_lifecycle as lifecycle
 import homelab_maintenance as hm
+import maintenance_notify as mn
 import maintenance_policy as policy
 
 log = logging.getLogger("HomelabMonitor")
@@ -58,6 +71,28 @@ VERIFY_SETTLE_SECS = int(os.getenv("MONITOR_VERIFY_SETTLE_SECS", "8"))
 IDEMPOTENT_DOUBLE_ATTEMPT = frozenset({"black-boxx"})
 
 OPEN, RESOLVED, ESCALATED, GAVE_UP = "open", "resolved", "escalated", "gave_up"
+
+# An incident is ACTIVE until the health condition verifies recovered. Reaching
+# "escalated" or "gave_up" is a statement about what automation has left to try,
+# NOT about whether the fault is over — closing on those is what produced 297
+# incidents and 297 billed Hermes jobs for two faults that never went away.
+ACTIVE_STATUSES = (OPEN, ESCALATED, GAVE_UP)
+
+# Consecutive healthy polls required before an active incident closes. The
+# mirror image of FAILURE_THRESHOLD: recovery is verified, not assumed.
+RECOVERY_THRESHOLD = int(os.getenv("MONITOR_RECOVERY_THRESHOLD", "2"))
+
+# Hermes is billed per job. One SUCCESSFUL escalation per active incident, full
+# stop. A submission that never reached the bridge (unreachable/quota) is not
+# an escalation, so it may be retried — but only after a growing backoff, and
+# only a few times, never once per five-minute poll.
+HERMES_MAX_SUBMIT_ATTEMPTS = int(os.getenv("MONITOR_HERMES_MAX_SUBMIT_ATTEMPTS", "3"))
+HERMES_BACKOFF_BASE_SECS = int(os.getenv("MONITOR_HERMES_BACKOFF_SECS", "3600"))
+HERMES_BACKOFF_MAX_SECS = int(os.getenv("MONITOR_HERMES_BACKOFF_MAX_SECS", "21600"))
+
+# Recurrence evidence is capped: a fault that persists for days at a five-minute
+# poll would otherwise grow the row without bound.
+EVIDENCE_LIMIT = 20
 
 enabled = True
 
@@ -108,14 +143,54 @@ CREATE TABLE IF NOT EXISTS monitor_incidents (
     joplin_note_id  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_monitor_incidents_key ON monitor_incidents(key);
+CREATE TABLE IF NOT EXISTS monitor_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 """
+
+# Columns added after the first release — applied to pre-existing DBs, same
+# pattern as homelab_maintenance._MIGRATIONS.
+_MIGRATIONS = (
+    "ALTER TABLE monitor_incidents ADD COLUMN occurrence_count INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE monitor_incidents ADD COLUMN first_seen REAL",
+    "ALTER TABLE monitor_incidents ADD COLUMN last_seen REAL",
+    "ALTER TABLE monitor_incidents ADD COLUMN fault_signature TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE monitor_incidents ADD COLUMN hermes_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE monitor_incidents ADD COLUMN hermes_backoff_until REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE monitor_incidents ADD COLUMN hermes_block_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE monitor_incidents ADD COLUMN hermes_result TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE monitor_incidents ADD COLUMN boss_alerted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE monitor_checks ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0",
+)
+
+_migrated_conn = None
 
 
 def _db():
+    global _migrated_conn
     conn = hm._db()
     conn.executescript(_SCHEMA)
+    if _migrated_conn is not conn:
+        for mig in _MIGRATIONS:
+            try:
+                conn.execute(mig)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        _migrated_conn = conn
     conn.commit()
     return conn
+
+
+def _meta_get(key: str, default: str = "") -> str:
+    r = _db().execute("SELECT value FROM monitor_meta WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else default
+
+
+def _meta_set(key: str, value: str):
+    _db().execute("INSERT INTO monitor_meta (key, value) VALUES (?,?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    _db().commit()
 
 
 def _get_check(key: str) -> dict:
@@ -160,10 +235,75 @@ def _update_incident(incident_id: str, **fields):
     _db().commit()
 
 
-def list_open_incidents() -> list[dict]:
+def _is_active(incident: dict) -> bool:
+    return (incident.get("closed_at") is None
+            and incident.get("status") in ACTIVE_STATUSES)
+
+
+def list_active_incidents() -> list[dict]:
+    """Every incident whose underlying fault has not verified recovered —
+    including escalated and given-up ones, which stay active precisely so a
+    recurrence updates them instead of opening a duplicate."""
+    marks = ",".join("?" * len(ACTIVE_STATUSES))
     return [dict(r) for r in _db().execute(
-        "SELECT * FROM monitor_incidents WHERE status=? ORDER BY opened_at",
-        (OPEN,)).fetchall()]
+        f"SELECT * FROM monitor_incidents WHERE closed_at IS NULL AND "
+        f"status IN ({marks}) ORDER BY opened_at", ACTIVE_STATUSES).fetchall()]
+
+
+# Retained name: "open" has always meant "not finished" to every caller.
+list_open_incidents = list_active_incidents
+
+
+def active_incident_for(key: str) -> Optional[dict]:
+    """The one active incident for an asset, if any. This is the dedup key —
+    a repeat detection of an ongoing fault attaches here."""
+    marks = ",".join("?" * len(ACTIVE_STATUSES))
+    r = _db().execute(
+        f"SELECT * FROM monitor_incidents WHERE key=? AND closed_at IS NULL AND "
+        f"status IN ({marks}) ORDER BY opened_at DESC LIMIT 1",
+        (key, *ACTIVE_STATUSES)).fetchone()
+    return dict(r) if r else None
+
+
+def _fault_signature(result: dict) -> str:
+    """A stable fingerprint of WHICH checks are failing, so a recurrence can be
+    recognised as the same condition. Derived from check names only — never
+    from free-text detail, which carries timestamps and would change every
+    poll, defeating the very dedup it is meant to support."""
+    failing = sorted(str(c.get("name", "")) for c in result.get("checks", [])
+                     if not c.get("ok"))
+    if not failing:
+        failing = [hm.redact(str(result.get("diagnosis", "")))[:80]]
+    return hashlib.sha256("|".join(failing).encode()).hexdigest()[:16]
+
+
+def _record_recurrence(incident: dict, detail: str, signature: str, now: float):
+    """Same unresolved fault seen again: update the existing incident. No new
+    incident, no new Hermes job, no new notification."""
+    incident_id = incident["incident_id"]
+    evidence = []
+    try:
+        evidence = json.loads(incident.get("evidence_json") or "[]")
+    except ValueError:
+        evidence = []
+    if not evidence or evidence[-1] != detail:
+        evidence.append(detail)
+    fields = {
+        "occurrence_count": (incident.get("occurrence_count") or 1) + 1,
+        "last_seen": now,
+        "evidence_json": json.dumps(evidence[-EVIDENCE_LIMIT:]),
+    }
+    prior = incident.get("fault_signature") or ""
+    if signature and prior and signature != prior:
+        # The failing checks changed while the incident is still active. That
+        # is a mutation of one ongoing problem, not a second incident — record
+        # it and keep the single incident.
+        fields["fault_signature"] = signature
+        log.info("incident %s fault signature changed %s -> %s",
+                 incident_id, prior, signature)
+    elif signature and not prior:
+        fields["fault_signature"] = signature
+    _update_incident(incident_id, **fields)
 
 
 def recent_incidents(limit: int = 20) -> list[dict]:
@@ -172,15 +312,25 @@ def recent_incidents(limit: int = 20) -> list[dict]:
         (limit,)).fetchall()]
 
 
-# ── Notifications (Boss-only; never a guild/group channel) ─────────────────
-async def _notify(text: str):
-    if _notify_boss is None:
-        log.info("(no notify_boss bound) %s", text)
-        return
+# ── Notifications ──────────────────────────────────────────────────────────
+# Destination is maintenance_notify's decision, not this module's: every
+# notification names its event and the router sends it to the Discord ops feed
+# (the canonical maintenance feed) or, for the urgent categories only, to the
+# Boss's private line as well. `_notify_boss` is the LAST-RESORT relay for an
+# unconfigured/unreachable ops channel — loki_bot binds a Discord DM to it, not
+# Telegram, so a feed outage can never push maintenance onto the Boss's phone.
+# It is also what keeps this module usable standalone.
+async def _notify(event: str, text: str):
+    async def _boss(t: str):
+        if _notify_boss is None:
+            log.info("(no notify_boss bound) %s", t)
+            return
+        await _notify_boss(t)
+
     try:
-        await _notify_boss(text)
+        await mn.notify(event, text, fallback=_boss)
     except Exception:
-        log.exception("boss notification failed")
+        log.exception("maintenance notification failed [%s]", event)
 
 
 def _incident_tag(key: str, display_name: str, incident_id: str) -> str:
@@ -260,8 +410,11 @@ async def _escalate(incident_id: str, key: str, display_name: str, symptom: str,
         return None
     bundle = _monitor_escalation_bundle(key, display_name, symptom, checks, [],
                                         subjects=subjects)
-    ctx = tools.ToolContext(user_id=tools.OWNER_USER_ID, user_name="Boss (auto)",
-                            channel_id=_boss_channel_id_fn())
+    # The requester marker is load-bearing: it is what tells the task
+    # supervisor this lifecycle belongs to the ops feed, not to a chat.
+    ctx = tools.ToolContext(user_id=tools.OWNER_USER_ID,
+                            user_name=mn.AUTONOMOUS_REQUESTER,
+                            channel_id=_boss_channel_id_fn() or mn.OPS_CHANNEL)
     task_id = ts.submit(tt, ctx, {"asset": key, "incident_id": incident_id,
                                   "symptom": symptom, "bundle": bundle})
     _update_incident(incident_id, escalated_task_id=task_id)
@@ -315,10 +468,11 @@ def _public_view(result: dict) -> dict:
 
 # ── The state machine ───────────────────────────────────────────────────────
 async def _process_check(key: str, display_name: str, check_fn, symptom_label: str):
-    """One poll of one monitored key. This function alone enforces the
-    2-consecutive-failure threshold, incident dedup, cooldown, the repair
-    attempt limit, escalation on failed/impossible repair, and notification —
-    every rule in the module docstring lives here."""
+    """One poll of one monitored key. This function alone decides WHETHER a
+    detection becomes (or joins) an incident: the 2-consecutive-failure
+    threshold, the one-active-incident-per-asset dedup rule, the recovery
+    threshold, and the post-resolution cooldown. What an incident is still
+    OWED — repair, escalation, backoff — is _advance_incident's job."""
     row = _get_check(key)
     now = time.time()
     open_id = row.get("open_incident_id")
@@ -332,33 +486,46 @@ async def _process_check(key: str, display_name: str, check_fn, symptom_label: s
 
     healthy = bool(result.get("healthy"))
     detail = hm.redact(str(result.get("diagnosis", "")))[:500]
+    # The pointer on monitor_checks is a cache; the incident table is the
+    # truth, so a restart or a manually closed row can never strand a fault
+    # with no incident (or attach one to an already-closed incident).
+    active = active_incident_for(key)
+    active_id = active["incident_id"] if active else None
+    if active_id != open_id:
+        _update_check(key, open_incident_id=active_id)
 
     if healthy:
-        _update_check(key, consecutive_failures=0, last_status="ok",
-                      last_detail=detail, last_checked_at=now, open_incident_id=None)
-        if open_id:
-            await _resolve_incident(open_id, result)
+        successes = (row.get("consecutive_successes") or 0) + 1
+        _update_check(key, consecutive_failures=0, consecutive_successes=successes,
+                      last_status="ok", last_detail=detail, last_checked_at=now)
+        if active_id and successes >= RECOVERY_THRESHOLD:
+            # Recovery is VERIFIED, not assumed: only now does the incident close.
+            await _resolve_incident(active_id, result)
+        elif active_id:
+            log.info("incident %s: %d/%d healthy polls — not closing yet",
+                     active_id, successes, RECOVERY_THRESHOLD)
         return
 
-    if open_id:
-        # An incident is already open for this key: this failure is more
-        # evidence on the SAME incident, never a second one.
-        _update_check(key, consecutive_failures=row.get("consecutive_failures", 0) + 1,
-                      last_status="fail", last_detail=detail, last_checked_at=now)
-        await _continue_incident(open_id, key, result, check_fn)
+    _update_check(key, consecutive_failures=(row.get("consecutive_failures") or 0) + 1,
+                  consecutive_successes=0, last_status="fail",
+                  last_detail=detail, last_checked_at=now)
+
+    if active:
+        # THE DEDUP RULE. The same unresolved fault seen again updates the one
+        # active incident: occurrence count, last_seen, evidence. It never
+        # opens a second incident, never notifies again, and never buys a
+        # second Hermes job.
+        _record_recurrence(active, detail, _fault_signature(result), now)
+        await _advance_incident(active_id, key, result, check_fn)
         return
 
     if now < (row.get("cooldown_until") or 0):
-        # Cooldown after a recent close: track the failure but do not open a
-        # new incident or notify — this is exactly what stops an alert storm
-        # from a service that is flapping.
-        _update_check(key, consecutive_failures=row.get("consecutive_failures", 0) + 1,
-                      last_status="fail", last_detail=detail, last_checked_at=now)
+        # Cooldown after a genuine resolution: track the failure but do not
+        # open a new incident or notify — this is what stops an alert storm
+        # from a service that is flapping in and out of health.
         return
 
-    streak = row.get("consecutive_failures", 0) + 1
-    _update_check(key, consecutive_failures=streak, last_status="fail",
-                  last_detail=detail, last_checked_at=now)
+    streak = (row.get("consecutive_failures") or 0) + 1
     if streak < FAILURE_THRESHOLD:
         return   # a single failed check is not an incident
 
@@ -366,32 +533,51 @@ async def _process_check(key: str, display_name: str, check_fn, symptom_label: s
     _insert_incident({
         "incident_id": incident_id, "key": key, "display_name": display_name,
         "status": OPEN, "opened_at": now, "updated_at": now,
+        "first_seen": now, "last_seen": now, "occurrence_count": 1,
+        "fault_signature": _fault_signature(result),
         "detection_json": json.dumps(_public_view(result)),
         "evidence_json": json.dumps([detail]),
     })
     _update_check(key, open_incident_id=incident_id)
-    await _notify(f"🔴 Incident opened — {display_name}: {detail}"[:1500])
-    await _continue_incident(incident_id, key, result, check_fn)
+    await _notify("incident_opened",
+                  f"🔴 Incident opened — {display_name}: {detail}"[:1500])
+    await _advance_incident(incident_id, key, result, check_fn)
 
 
-async def _continue_incident(incident_id: str, key: str, result: dict, check_fn):
+async def _advance_incident(incident_id: str, key: str, result: dict, check_fn):
+    """Decide what automation still owes an ACTIVE incident. Every exit here is
+    idempotent across polls: an incident that has already escalated, already
+    spent its repair budget, or is backing off does nothing at all."""
     incident = get_incident(incident_id)
-    if incident is None or incident["status"] != OPEN:
+    if incident is None or not _is_active(incident):
         return
+
+    if incident.get("escalated_task_id"):
+        # Already handed to Hermes. Follow the job's fate; never buy another.
+        await _reconcile_escalation(incident)
+        return
+
+    if time.time() < (incident.get("hermes_backoff_until") or 0):
+        return   # a previous submission failed; wait out the backoff
 
     plan = result.get("repair")
-    if plan is None:
-        await _give_up_and_escalate(incident, result, reason="no automatic repair available")
-        return
-
     limit = 2 if key in IDEMPOTENT_DOUBLE_ATTEMPT else 1
     attempts = incident.get("repair_attempts", 0)
-    if attempts >= limit:
-        await _give_up_and_escalate(incident, result, reason="repair attempt limit reached")
+    if plan is None:
+        await _escalate_incident(incident, result, reason="no automatic repair available")
         return
+    if attempts >= limit:
+        await _escalate_incident(incident, result, reason="repair attempt limit reached")
+        return
+    await _attempt_repair(incident, key, result, check_fn, plan, attempts, limit)
 
+
+async def _attempt_repair(incident: dict, key: str, result: dict, check_fn,
+                          plan: dict, attempts: int, limit: int):
+    incident_id = incident["incident_id"]
     display = incident["display_name"]
-    await _notify(f"🔧 Repair starting — {display}: "
+    await _notify("repair_started",
+                  f"🔧 Repair starting — {display}: "
                   f"{plan.get('description', plan.get('action', 'repair'))}"[:1500])
     attempts += 1
     _update_incident(incident_id, repair_attempts=attempts, repair_json=json.dumps(plan))
@@ -426,27 +612,83 @@ async def _continue_incident(incident_id: str, key: str, result: dict, check_fn)
     # immediate stop.
     if attempts < limit:
         return
-    await _notify(f"⚠️ Repair failed verification — {display}. Escalating."[:1500])
-    await _give_up_and_escalate(incident, repaired, reason="repair failed verification")
+    await _notify("repair_failed",
+                  f"⚠️ Repair failed verification — {display}. Escalating."[:1500])
+    await _escalate_incident(get_incident(incident_id), repaired,
+                            reason="repair failed verification")
 
 
 async def _resolve_incident(incident_id: str, result: dict):
+    """The ONLY way an incident closes: the health condition verified recovered."""
     incident = get_incident(incident_id)
-    if incident is None or incident["status"] != OPEN:
+    if incident is None or not _is_active(incident):
         return
     rr = result.get("repair_result") or {}
     _update_incident(incident_id, status=RESOLVED, closed_at=time.time(),
                      result=RESOLVED, verification_json=json.dumps(result.get("repair_result")))
     _update_check(incident["key"], cooldown_until=time.time() + COOLDOWN_SECS,
-                  open_incident_id=None, consecutive_failures=0)
+                  open_incident_id=None, consecutive_failures=0,
+                  consecutive_successes=0)
     note = " (auto-repaired and verified)" if rr.get("ok") else ""
-    await _notify(f"✅ Resolved — {incident['display_name']}{note}"[:1500])
+    occurrences = incident.get("occurrence_count") or 1
+    seen = f" after {occurrences} detections" if occurrences > 1 else ""
+    await _notify("incident_resolved",
+                  f"✅ Resolved — {incident['display_name']}{note}{seen}"[:1500])
     await _write_joplin_summary(get_incident(incident_id))
 
 
-async def _give_up_and_escalate(incident: dict, result: dict, reason: str):
+async def _reconcile_escalation(incident: dict):
+    """Track the fate of the ONE Hermes job this incident bought. The job's
+    outcome never closes the incident — only recovered health does — but a
+    quota/auth stop is recorded so nothing keeps knocking on the bridge."""
+    incident_id = incident["incident_id"]
+    task_id = incident.get("escalated_task_id") or ""
+    try:
+        import task_supervisor as ts
+    except Exception:
+        return
+    row = ts.get_task(task_id)
+    if row is None:
+        return
+    status = row.get("status") or ""
+    if status == (incident.get("hermes_result") or ""):
+        return   # already recorded; nothing new to say
+    if status in ("queued", "running"):
+        return
+    fields = {"hermes_result": status}
+    if status in ("paused_quota", "paused_auth", "failed"):
+        fields["hermes_block_reason"] = (
+            row.get("error_category") or status)
+        fields["hermes_backoff_until"] = time.time() + HERMES_BACKOFF_MAX_SECS
+    _update_incident(incident_id, **fields)
+    log.info("incident %s: hermes task %s ended '%s' — incident stays active "
+             "until health recovers", incident_id, task_id, status)
+
+    if status in ("paused_quota", "failed") and not incident.get("boss_alerted"):
+        _update_incident(incident_id, boss_alerted=1)
+        why = ("Hermes is out of quota" if status == "paused_quota"
+               else "the Hermes diagnosis failed")
+        await _notify("needs_boss_hands",
+                      f"🆘 {incident['display_name']}: {why} and I have no automatic "
+                      f"repair left. The incident stays open — needs your hands."[:1500])
+
+
+async def _escalate_incident(incident: dict, result: dict, reason: str):
+    """At most ONE Hermes job per active incident. A submission that never
+    reached the bridge is not an escalation, so it may be retried — but behind
+    a growing backoff and a hard attempt cap, never once per poll."""
+    if incident is None or not _is_active(incident):
+        return
     incident_id = incident["incident_id"]
     display = incident["display_name"]
+    if incident.get("escalated_task_id"):
+        return                                   # already escalated — never again
+    attempts = incident.get("hermes_attempts") or 0
+    if attempts >= HERMES_MAX_SUBMIT_ATTEMPTS:
+        return
+    if time.time() < (incident.get("hermes_backoff_until") or 0):
+        return
+
     checks = result.get("checks", [])
     symptom = f"{display}: {reason}. {hm.redact(str(result.get('diagnosis', '')))[:200]}"
     subjects = _escalation_subjects(incident["key"], checks)
@@ -457,22 +699,55 @@ async def _give_up_and_escalate(incident: dict, result: dict, reason: str):
             task_id = await _escalate(incident_id, incident["key"], display, symptom, checks)
         except Exception:
             log.exception("escalation submission failed for %s", incident_id)
-    status = ESCALATED if task_id else GAVE_UP
-    _update_incident(incident_id, status=status, closed_at=time.time(), result=status)
-    _update_check(incident["key"], cooldown_until=time.time() + COOLDOWN_SECS,
-                  open_incident_id=None, consecutive_failures=0)
+
+    if suppressed:
+        # Intentionally excluded from escalation — say nothing, and stop
+        # trying. Alerting about an asset the Boss retired is exactly the
+        # noise this module removes. The incident stays active (a recurrence
+        # attaches to it) but buys nothing.
+        _update_incident(incident_id, status=GAVE_UP, result=GAVE_UP,
+                         hermes_attempts=HERMES_MAX_SUBMIT_ATTEMPTS,
+                         hermes_block_reason="lifecycle-suppressed")
+        log.info("incident %s not escalated (lifecycle-suppressed)", incident_id)
+        await _write_joplin_summary(get_incident(incident_id))
+        return
+
+    attempts += 1
     if task_id:
-        await _notify(f"🆘 Approval needed — {display}: escalated for a closer look "
+        _update_incident(incident_id, status=ESCALATED, result=ESCALATED,
+                         hermes_attempts=attempts, hermes_backoff_until=0,
+                         hermes_block_reason="")
+        await _notify("incident_escalated",
+                      f"🆘 Escalated — {display}: handed to Hermes for a closer look "
                       f"(task {task_id[-8:]}). I'll follow up when it reports back."[:1500])
-    elif suppressed:
-        # Intentionally excluded from escalation — say nothing. Alerting about
-        # an asset the Boss retired is exactly the noise this module removes.
-        log.info("incident %s closed without escalation (lifecycle-suppressed)",
-                 incident_id)
-    else:
-        await _notify(f"🆘 {display}: {reason}. I could not auto-repair this and "
+        await _write_joplin_summary(get_incident(incident_id))
+        return
+
+    # Submission never landed. Back off — do NOT retry on the next poll.
+    backoff = min(HERMES_BACKOFF_BASE_SECS * (2 ** (attempts - 1)),
+                  HERMES_BACKOFF_MAX_SECS)
+    exhausted = attempts >= HERMES_MAX_SUBMIT_ATTEMPTS
+    _update_incident(incident_id, status=GAVE_UP if exhausted else OPEN,
+                     result=GAVE_UP if exhausted else "",
+                     hermes_attempts=attempts,
+                     hermes_backoff_until=time.time() + backoff,
+                     hermes_block_reason="hermes unreachable")
+    log.info("incident %s: hermes submission %d/%d failed — backing off %ds",
+             incident_id, attempts, HERMES_MAX_SUBMIT_ATTEMPTS, backoff)
+    if not incident.get("boss_alerted"):
+        # Nothing automatic is left and no diagnosis is coming. Said ONCE per
+        # incident, not once per poll.
+        _update_incident(incident_id, boss_alerted=1)
+        await _notify("needs_boss_hands",
+                      f"🆘 {display}: {reason}. I could not auto-repair this and "
                       f"Hermes isn't reachable right now — needs your hands."[:1500])
-    await _write_joplin_summary(get_incident(incident_id))
+    if exhausted:
+        await _write_joplin_summary(get_incident(incident_id))
+
+
+# Retained entry point: the old name described closing-on-escalation, which is
+# exactly the behaviour that was wrong. Escalation no longer closes anything.
+_give_up_and_escalate = _escalate_incident
 
 
 # ── Per-asset check functions ───────────────────────────────────────────────
@@ -719,6 +994,7 @@ async def _report_reappearances(entries: list[dict]):
             continue
         lifecycle.mark_reappearance_notified(e["name"])
         await _notify(
+            "lifecycle_notice",
             f"⚠️ {e['name']} was previously decommissioned but has reappeared "
             f"({e['status']}). I have not touched it — tell me if it should stay.")
 
@@ -728,7 +1004,8 @@ async def _remind_pending_cleanup(entries: list[dict]):
         if not lifecycle.due_for_cleanup_reminder(e["name"]):
             continue
         lifecycle.mark_reminder_sent(e["name"])
-        await _notify(f"🧹 Reminder: {e['name']} is decommissioned and its cleanup "
+        await _notify("lifecycle_notice",
+                      f"🧹 Reminder: {e['name']} is decommissioned and its cleanup "
                       f"is still waiting on your approval. No rush — it raises no "
                       f"alerts in the meantime.")
 
@@ -749,6 +1026,61 @@ MONITORS = {
 }
 
 
+# ── Periodic maintenance summary (ops feed only) ───────────────────────────
+# A digest of what the monitor did on its own, so the feed reads as a record
+# rather than a stream of isolated alerts. Silent when nothing happened —
+# a recurring "all quiet" is the noise this whole module exists to avoid.
+SUMMARY_INTERVAL_SECS = int(os.getenv("MONITOR_SUMMARY_INTERVAL_SECS", "86400"))
+_SUMMARY_META_KEY = "last_summary_at"
+
+
+def _summary_text(since: float) -> str:
+    rows = [dict(r) for r in _db().execute(
+        "SELECT * FROM monitor_incidents WHERE opened_at>=? OR "
+        "(closed_at IS NOT NULL AND closed_at>=?)", (since, since)).fetchall()]
+    open_now = list_active_incidents()
+    if not rows and not open_now:
+        return ""
+    counts = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    hours = max(1, int(round((time.time() - since) / 3600)))
+    lines = [f"📋 Maintenance summary — last {hours}h: {len(rows)} incident(s)"]
+    if counts:
+        lines.append("  " + ", ".join(
+            f"{n} {status.replace('_', ' ')}" for status, n in sorted(counts.items())))
+    for r in open_now:
+        age = int((time.time() - r["opened_at"]) / 3600)
+        seen = r.get("occurrence_count") or 1
+        note = f" [{r['hermes_block_reason']}]" if r.get("hermes_block_reason") else ""
+        lines.append(f"  ⏳ still open: {r['display_name']} ({age}h, "
+                     f"{seen} detections, {r['status']}){note}")
+    if not open_now:
+        lines.append("  Nothing open right now.")
+    return "\n".join(lines)[:1500]
+
+
+async def maybe_send_summary():
+    if SUMMARY_INTERVAL_SECS <= 0:
+        return
+    now = time.time()
+    try:
+        last = float(_meta_get(_SUMMARY_META_KEY, "") or 0)
+    except ValueError:
+        last = 0
+    if last <= 0:
+        # First run after deploy: start the clock instead of summarising all
+        # of history into the first message.
+        _meta_set(_SUMMARY_META_KEY, str(now))
+        return
+    if now - last < SUMMARY_INTERVAL_SECS:
+        return
+    text = _summary_text(last)
+    _meta_set(_SUMMARY_META_KEY, str(now))
+    if text:
+        await _notify("summary", text)
+
+
 # ── Poll loop ────────────────────────────────────────────────────────────────
 async def poll_once():
     for key, (display_name, check_fn) in MONITORS.items():
@@ -764,6 +1096,10 @@ async def _poll_loop():
             await poll_once()
         except Exception:
             log.exception("homelab monitor poll loop error")
+        try:
+            await maybe_send_summary()
+        except Exception:
+            log.exception("maintenance summary failed")
         await asyncio.sleep(POLL_INTERVAL_SECS)
 
 
