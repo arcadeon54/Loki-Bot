@@ -639,6 +639,12 @@ async def _hermes_handler(h):
                                  error_detail=str(e),
                                  summary="lost contact with the Hermes bridge")
         await h.beat()
+        # Provider protection bookkeeping: observed cost, quota pauses,
+        # completions. No network of its own — it reads the job we just polled.
+        try:
+            await hh.note_job_state(job)
+        except Exception:
+            log.debug("hermes guard job-signal failed", exc_info=True)
 
         # If the asset was decommissioned while this job was in flight, the
         # result is audit history, not an operational signal: stop polling,

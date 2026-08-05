@@ -65,6 +65,11 @@ EVENTS = {
     "lifecycle_notice":    OPS,
     "summary":             OPS,
 
+    # ── Provider protection (hermes_guard): once per transition, feed only ─
+    "provider_circuit_open":      OPS,
+    "provider_circuit_recovered": OPS,
+    "provider_budget_reached":    OPS,
+
     # "Nothing automatic is left" is a STATUS, not a decision the Boss has to
     # make right now — it belongs on the feed with everything else. It used to
     # be urgent; that is what put "Hermes is out of quota / needs your hands"

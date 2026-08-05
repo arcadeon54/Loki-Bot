@@ -408,6 +408,21 @@ async def _escalate(incident_id: str, key: str, display_name: str, symptom: str,
     tt = ts._TYPES.get("hermes_escalation")
     if tt is None or not hh.enabled:
         return None
+    # Provider circuit breaker pre-check: when the circuit is open, do not
+    # even create the escalation task — record WHY on the incident and leave
+    # it active. blocked_reason() is empty when a recovery probe is due, so
+    # the next genuine escalation doubles as the controlled probe.
+    try:
+        import hermes_guard as hg
+        why = hg.blocked_reason()
+    except Exception:
+        why = ""
+    if why:
+        hg.note_blocked("monitor escalation")
+        _update_incident(incident_id,
+                         hermes_block_reason=f"provider unavailable: {why}"[:250])
+        log.info("escalation of %s suppressed — %s", incident_id, why[:150])
+        return None
     bundle = _monitor_escalation_bundle(key, display_name, symptom, checks, [],
                                         subjects=subjects)
     # The requester marker is load-bearing: it is what tells the task
@@ -727,11 +742,16 @@ async def _escalate_incident(incident: dict, result: dict, reason: str):
     backoff = min(HERMES_BACKOFF_BASE_SECS * (2 ** (attempts - 1)),
                   HERMES_BACKOFF_MAX_SECS)
     exhausted = attempts >= HERMES_MAX_SUBMIT_ATTEMPTS
+    # _escalate may already have written a more specific reason (the provider
+    # circuit breaker's) — never replace specific with generic.
+    prior = (get_incident(incident_id) or {}).get("hermes_block_reason") or ""
+    reason_note = prior if prior.startswith("provider unavailable") \
+        else "hermes unreachable"
     _update_incident(incident_id, status=GAVE_UP if exhausted else OPEN,
                      result=GAVE_UP if exhausted else "",
                      hermes_attempts=attempts,
                      hermes_backoff_until=time.time() + backoff,
-                     hermes_block_reason="hermes unreachable")
+                     hermes_block_reason=reason_note)
     log.info("incident %s: hermes submission %d/%d failed — backing off %ds",
              incident_id, attempts, HERMES_MAX_SUBMIT_ATTEMPTS, backoff)
     if not incident.get("boss_alerted"):

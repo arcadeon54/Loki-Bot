@@ -5520,6 +5520,9 @@ async def on_ready():
         log.info("Hermes escalation client online — %s",
                  "bridge configured" if homelab_hermes.enabled
                  else "HERMES_WORKER_URL/TOKEN not set, inactive")
+        if homelab_hermes.guard is not None:
+            log.info("Hermes provider guard online — %s",
+                     homelab_hermes.guard.status_line())
 
     # Container updates — read-only inventory plus approval-gated update and
     # rollback workflows. Uses homelab_maintenance's bound session for release
