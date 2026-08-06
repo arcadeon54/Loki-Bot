@@ -16,7 +16,6 @@ loki_memory_meta_backup_*.json
 *.db-shm
 *.db-wal
 *.json.bak
-AGENTS.md
 eval_queries.json
 tool_calls.jsonl
 proactive_state.json
@@ -25,3 +24,15 @@ proactive_state.json
 presence_state.json
 work_tracker_state.json
 telegram_state.json
+
+# Antigravity (agy) runtime scratch. The DURABLE customizations —
+# .agents/rules, .agents/skills, .agents/agents, .agents/hooks.json — are
+# tracked on purpose; only the per-run orchestration metadata is ignored.
+.agents/*_*/
+.agents/ORIGINAL_REQUEST.md
+.agents/DISPATCH.md
+.agents/BRIEFING.md
+.agents/DEAD_ENDS.md
+.agents/GATE_STATUS.md
+.agents/progress.md
+.gemini/

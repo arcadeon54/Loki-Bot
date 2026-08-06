@@ -1,0 +1,16 @@
+{
+  "loki-permission-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/permission-guard.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
