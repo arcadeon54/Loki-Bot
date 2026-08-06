@@ -15,7 +15,8 @@ the module here. Adding a runbook = adding a module + listing it in RUNBOOKS.
 """
 
 from . import (black_boxx_connectivity, jellyfin_health, immich_status,
-               joplin_sync, loki_interfaces, stateless_container)
+               joplin_sync, loki_interfaces, stateless_container,
+               qbittorrent_health)
 
 RUNBOOKS = {
     black_boxx_connectivity.NAME: black_boxx_connectivity.run,
@@ -24,4 +25,5 @@ RUNBOOKS = {
     joplin_sync.NAME: joplin_sync.run,
     loki_interfaces.NAME: loki_interfaces.run,
     stateless_container.NAME: stateless_container.run,
+    qbittorrent_health.NAME: qbittorrent_health.run,
 }

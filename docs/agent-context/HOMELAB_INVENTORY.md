@@ -42,6 +42,13 @@ current config as of 2026-08-06.
 Jellyfin · Joplin Server (`joplin` + `joplin-db`) · `watchtower` ·
 `loki-joplin-api` (**stopped, obsolete, restart=no — leave it alone**).
 
+**PrivacyServer stack** (`/home/g2k247/PrivacyServer/docker-compose.yml`):
+`qbittorrent` (binhex/arch-qbittorrentvpn, own embedded WireGuard VPN, WebUI
+:8080) · `sonarr` · `radarr` · `prowlarr` · `sabnzbd` · `jellyfin` ·
+`flaresolverr` · `seer` · `bazarr` · `nzbhydra2` · `subgen` · `gluetun`
+(VPN gateway for sonarr/radarr/prowlarr/sabnzbd — **qBittorrent is NOT behind
+gluetun; it has its own VPN**). Config root: `/home/g2k247/PrivacyServer/config/`.
+
 ### BLACK-BOXX network facts
 
 `wlp2s0` = AP interface, `192.168.10.1/24`, clients `192.168.10.0/24`.
@@ -112,7 +119,8 @@ network `tracearr_tracearr-network`:
 
 ## Registry
 
-Nine assets in `config/homelab_assets.yml`: `black-boxx`, `jellyfin`, `joplin`,
-`cloudflare-ddns`, `loki-interfaces`, `immich`, `ugreen-nas`, `tracearr`, `plex`.
+Ten assets in `config/homelab_assets.yml`: `black-boxx`, `qbittorrent`,
+`jellyfin`, `joplin`, `cloudflare-ddns`, `loki-interfaces`, `immich`,
+`ugreen-nas`, `tracearr`, `plex`.
 Plus one tombstone: `ivn-site`, decommissioned 2026-07-26, archive at
 `/home/g2k247/backups/decommission/ivn-site-20260726-014813`.

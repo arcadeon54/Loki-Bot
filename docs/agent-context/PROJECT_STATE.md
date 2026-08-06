@@ -29,7 +29,7 @@ Presence monitor online — Boss: home, Rob: home
 Career-Ops liaison online — bridge at configured URL
 Task supervisor online
 Browser research online — RAZR worker at configured URL
-Homelab maintenance online — 9 assets
+Homelab maintenance online — 10 assets
 Hermes escalation client online — bridge configured
 Hermes provider guard online — circuit closed 0/6/h 0/20/24h $0.00/$5.00
 Container updates online

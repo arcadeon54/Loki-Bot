@@ -64,6 +64,42 @@ assets:
       conflicting_units:
         - wg-quick@wg-ap.service
 
+  qbittorrent:
+    display_name: qBittorrent
+    host: dex247
+    type: docker_service
+    aliases:
+      - qbittorrent
+      - qbit
+      - q bit
+      - torrent
+      - torrents
+      - torrent client
+      - download client
+      - nzb360
+    runbook: qbittorrent_health
+    stateful: false                # config bind-mounted, downloads on NAS share
+    update_policy: approval
+    docker:
+      container: qbittorrent
+      compose_project: privacyserver
+      compose_file: /home/g2k247/PrivacyServer/docker-compose.yml
+      compose_service: qbittorrent
+      image: binhex/arch-qbittorrentvpn
+    health:
+      local_url: http://127.0.0.1:8080/
+      api_url: http://127.0.0.1:8080/api/v2/torrents/info
+      public_url: https://qbit.ivn-group.cc
+    mounts:
+      config: /home/g2k247/PrivacyServer/config/qbittorrent
+    notes: >
+      Uses binhex/arch-qbittorrentvpn — embeds its own WireGuard VPN (wg0)
+      inside the container; separate from gluetun. Supervisor manages
+      start-script (VPN bring-up) and watchdog-script (qbittorrent-nox).
+      Both have autorestart=false. If OOM-killed, only docker restart recovers
+      them. mem_limit was removed 2026-08-06 to fix recurring OOM connectivity
+      failures (threshold was 1GB, libtorrent workers need more).
+
   jellyfin:
     display_name: Jellyfin
     host: dex247

@@ -15,6 +15,7 @@ result and the local commit.
 | 7 | Joplin note read-back | **DONE** 2026-08-05 | Loki can read back notes it writes to the Boss's own notebooks | `dc479a6` |
 | 8 | Presence notification style | **DONE** 2026-08-05 | Concise legacy style; roommate state retained on welcome-home | `ede172d`, 20 tests |
 | 9 | Google Sheets export | **DONE** 2026-08-06 | Reliable sync queue, no data loss on failure, idempotency maintained | Durable queue reading `sheets_ok=0` from SQLite |
+| 10 | qBittorrent recurring connectivity | **DONE** 2026-08-06 | Root cause proven, durable fix applied, LAN+proxy+nzb360 stable beyond recurrence window | Removed `mem_limit: 1g` from compose; `qbittorrent_health` runbook added |
 
 ## Backlog — not started, not authorized
 

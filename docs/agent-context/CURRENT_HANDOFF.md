@@ -4,6 +4,18 @@
 
 ## Just completed
 
+**qBittorrent recurring connectivity — DONE 2026-08-06.** Root cause was
+`mem_limit: 1g` in `/home/g2k247/PrivacyServer/docker-compose.yml`. The kernel
+cgroup OOM killer fired every 20-30 minutes against libtorrent peer-connection
+workers (~1 GB anon-RSS each), killing both qbittorrent-nox workers and the
+internal `watchdog-script`. Because supervisord has `autorestart=false` for
+both, nothing inside the container recovered — WebUI permanently unreachable
+until manual `docker restart`. Fix: removed `mem_limit`/`memswap_limit` from
+compose, container recreated. LAN IPv4, reverse proxy `qbit.ivn-group.cc`, and
+nzb360 API all HTTP 200. Stability timer set for 35 min past fix to confirm no
+further OOM kills. `qbittorrent_health` runbook added; qbittorrent registered
+as managed asset (10th).
+
 **Google Sheets export defect — DONE 2026-08-06.** `work_tracker.py` was silently dropping Sheets exports if the Home Assistant HTTP POST failed or timed out during the exact second the session closed. Rewrote the export path as a background queue processor (`_sync_pending_sheets`) that reads `sheets_ok=0` directly from the durable SQLite DB. Validated live: all previously failed/dropped sessions naturally retried and reached Google Sheets successfully. No unit tests broken.
 
 **Antigravity migration — DONE 2026-08-06.** `agy` 1.1.10 installed at
@@ -38,7 +50,7 @@ presence notification passthrough (`ede172d`).
 
 ## Next active task
 
-**None assigned.** The Google Sheets export objective is closed.
+**None assigned.** The qBittorrent objective is closed.
 
 If the Boss wants the next thing from the backlog, `docs/NEXT_STEPS.md` is the
 ordered list. The **weekly Discord export 403** (bot lacks channel permission — needs a Boss-side Discord change, not code) is the last remaining broken item. It is not authorized to start without the Boss saying so.

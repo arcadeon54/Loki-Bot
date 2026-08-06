@@ -7,6 +7,31 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## qBittorrent
+
+**DONE — recurring connectivity failure fixed** (2026-08-06).
+Root cause: `mem_limit: 1g` in `/home/g2k247/PrivacyServer/docker-compose.yml`
+created a cgroup ceiling too small for qBittorrent's active libtorrent peer
+connection workers (~1 GB anon-RSS each). The kernel OOM killer fired every
+20-30 minutes, killing both qbittorrent-nox workers AND the internal
+`watchdog-script`. Because supervisord has `autorestart=false` for both
+processes, nothing inside the container could recover — WebUI became
+permanently unreachable until manual `docker restart`. Confirmed by `dmesg`:
+multiple OOM kills from `2026-08-05` through `2026-08-06 13:33`.
+
+Fix: removed `mem_limit` and `memswap_limit` from the compose service.
+Container recreated with `docker compose up -d qbittorrent`. Validated live:
+- LAN IPv4 `192.168.1.155:8080` → HTTP 200
+- Reverse proxy `qbit.ivn-group.cc` → HTTP 200
+- nzb360 API `/api/v2/torrents/info` → 10 torrents returned
+- No further OOM kills observed after fix applied
+
+Also added: `qbittorrent_health` runbook in `maintenance_runbooks/` —
+detects container state, OOM flag, cgroup limit advisory (warns if tight limit
+re-introduced), WebUI health, and performs a single safe `docker restart` when
+the known failure pattern is present. `qbittorrent` registered as a managed
+asset in `config/homelab_assets.yml` (10th asset).
+
 ## BLACK-BOXX
 
 **DONE — deterministic diagnosis and repair** (`8355d21`, 2026-08-06).
