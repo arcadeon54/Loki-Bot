@@ -57,6 +57,10 @@ NOW = int(time.time())
 
 # ── Scripted system output ──────────────────────────────────────────────────
 BB_HEALTHY = {
+    # black-boxx-ap.service owns the whole stack (wg-ap, hostapd, dnsmasq,
+    # marking, table, rule, NAT). The runbook reads it first and treats a dead
+    # unit as the single root cause of every downstream check.
+    "systemctl_is_active": (0, "active"),
     "ip_addr": lambda p: (0, "wlp2s0 UP 192.168.10.1/24")
         if p["iface"] == "wlp2s0" else (0, "wg-ap UNKNOWN 100.64.145.100/32"),
     "pgrep_hostapd": (0, "7274 hostapd -B /etc/hostapd/black-boxx.conf"),

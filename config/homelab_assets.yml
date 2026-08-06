@@ -46,6 +46,14 @@ assets:
       dhcp_leases_file: /var/lib/misc/dnsmasq.leases
       hostapd_conf: /etc/hostapd/black-boxx.conf
       dnsmasq_conf: /etc/dnsmasq.d/black-boxx-ap.conf
+    systemd:
+      # The unit that owns the WHOLE stack: it brings up wg-ap, then hostapd
+      # and dnsmasq, then the marking/table/rule/NAT. hostapd.service and
+      # dnsmasq.service are masked on purpose — this script drives them — so
+      # when this unit is dead every downstream check fails at once. Declaring
+      # it here also allows systemctl is-active/restart for it under the
+      # existing policy allowlist (registry-derived unit values).
+      ap_unit: black-boxx-ap.service
 
   jellyfin:
     display_name: Jellyfin
