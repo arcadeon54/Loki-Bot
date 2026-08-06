@@ -380,5 +380,82 @@ class NoAssetSystemdSectionStillWorks(unittest.TestCase):
         self.assertIsNone(check(r, "ap_service"))
 
 
+class BootOwnershipConflict(unittest.TestCase):
+    """The boot-time race that left the AP dead after a reboot: wg-quick@wg-ap
+    was still enabled alongside black-boxx-ap.service, both ran `ip link add
+    wg-ap`, and the loser's cleanup (`ip link delete dev wg-ap`) destroyed the
+    winner's interface.
+
+    It is invisible in every check of the RUNNING path, so it must never be
+    reported by failing one of those checks — a working AP is not unhealthy."""
+
+    CONFLICT_ASSET = {**ASSET,
+                      "systemd": {"ap_unit": "black-boxx-ap.service",
+                                  "conflicting_units": ["wg-quick@wg-ap.service"]}}
+
+    def _table(self, enabled_state, rc=0):
+        t = dict(HEALTHY)
+        t[("systemctl_is_enabled", "wg-quick@wg-ap.service")] = (rc, enabled_state)
+        t[("systemctl_disable_unit", "wg-quick@wg-ap.service")] = (0, "")
+        t[("systemctl_enable_unit", "wg-quick@wg-ap.service")] = (0, "")
+        return t
+
+    def test_enabled_conflict_is_an_advisory_not_a_failed_check(self):
+        r = run(bb.run(self.CONFLICT_ASSET, FakeOps(self._table("enabled"))))
+        self.assertTrue(r["healthy"], [c for c in r["checks"] if not c["ok"]])
+        self.assertEqual(len(r["advisories"]), 1)
+        self.assertIn("wg-quick@wg-ap.service", r["advisories"][0])
+        # No check was invented to carry it.
+        self.assertIsNone(check(r, "boot_ownership"))
+
+    def test_plan_is_approval_tier_disable_only_with_an_enable_rollback(self):
+        r = run(bb.run(self.CONFLICT_ASSET, FakeOps(self._table("enabled"))))
+        plan = r["repair"]
+        self.assertEqual(plan["action"], "service_enable_disable")
+        self.assertEqual([c["name"] for c in plan["commands"]],
+                         ["systemctl_disable_unit"])
+        self.assertEqual(plan["commands"][0]["params"],
+                         {"unit": "wg-quick@wg-ap.service"})
+        self.assertEqual([c["name"] for c in plan["rollback"]],
+                         ["systemctl_enable_unit"])
+        # Stopping the unit would run `wg-quick down` and delete the live wg-ap.
+        self.assertNotIn("systemctl_restart_unit",
+                         [c["name"] for c in plan["commands"]])
+
+    def test_never_auto_applied_even_with_repairs_allowed(self):
+        ops = FakeOps(self._table("enabled"), allow_repairs=True)
+        r = run(bb.run(self.CONFLICT_ASSET, ops))
+        self.assertIsNone(r["repair_result"])
+        self.assertNotIn("systemctl_disable_unit",
+                         [c["name"] for c in ops.commands_run])
+
+    def test_disabled_conflict_produces_nothing(self):
+        # `systemctl is-enabled` exits 1 for "disabled" — the word decides.
+        r = run(bb.run(self.CONFLICT_ASSET, FakeOps(self._table("disabled", rc=1))))
+        self.assertTrue(r["healthy"])
+        self.assertEqual(r["advisories"], [])
+        self.assertIsNone(r["repair"])
+
+    def test_unreadable_enablement_invents_no_conflict(self):
+        ops = FakeOps(self._table("enabled"), missing=("systemctl_is_enabled",))
+        r = run(bb.run(self.CONFLICT_ASSET, ops))
+        self.assertTrue(r["healthy"])
+        self.assertEqual(r["advisories"], [])
+
+    def test_asset_without_conflicting_units_is_unchanged(self):
+        r = run(bb.run(ASSET, FakeOps()))
+        self.assertEqual(r["advisories"], [])
+        self.assertIsNone(r["repair"])
+
+    def test_live_outage_still_outranks_the_boot_advisory(self):
+        t = self._table("enabled")
+        t[("ip_rule_show", None)] = (0, "0:\tfrom all lookup local")
+        r = run(bb.run(self.CONFLICT_ASSET, FakeOps(t)))
+        self.assertFalse(r["healthy"])
+        # The AP is down NOW; the known rule repair keeps the plan slot.
+        self.assertEqual(r["repair"]["action"], "restore_blackboxx_ip_rule")
+        self.assertEqual(len(r["advisories"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

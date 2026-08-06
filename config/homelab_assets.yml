@@ -54,6 +54,15 @@ assets:
       # it here also allows systemctl is-active/restart for it under the
       # existing policy allowlist (registry-derived unit values).
       ap_unit: black-boxx-ap.service
+      # Units that also try to configure vpn_interface at boot and therefore
+      # RACE ap_unit for it. wg-quick@wg-ap loses `ip link add` ("RTNETLINK
+      # answers: File exists"), then runs its own error cleanup —
+      # `ip link delete dev wg-ap` — and takes the working interface down with
+      # it. ap_unit is authoritative; these must not be enabled. Declared here
+      # so the runbook may read their enablement and, with approval, disable
+      # them (never stop them — see maintenance_policy).
+      conflicting_units:
+        - wg-quick@wg-ap.service
 
   jellyfin:
     display_name: Jellyfin

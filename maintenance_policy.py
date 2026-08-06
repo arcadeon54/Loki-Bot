@@ -132,6 +132,9 @@ _COMMANDS: dict[str, dict] = {
     # Machine-readable free bytes, for the pre-update disk-space gate.
     "df_path_bytes":    {"argv": ["df", "-B1", "--output=avail", "{path}"]},
     "systemctl_is_active": {"argv": ["systemctl", "is-active", "{unit}"]},
+    # Boot-time ownership: is a unit wired to start on its own at boot?
+    # Exits non-zero for "disabled"/"static", so callers read the WORD, not rc.
+    "systemctl_is_enabled": {"argv": ["systemctl", "is-enabled", "{unit}"]},
 
     # ── update inventory / pre-flight (all read-only) ──────────────────
     # Resolved image list for a compose project, so the inventory reflects
@@ -239,6 +242,19 @@ _COMMANDS: dict[str, dict] = {
     # systemd's Restart=always owns that.
     "systemctl_restart_unit":
         {"argv": ["sudo", "-n", "systemctl", "restart", "{unit}"],
+         "repair": True},
+    # Boot-time ownership only (service_enable_disable tier, approval-gated).
+    # `disable` changes what starts at the NEXT boot and does not touch the
+    # running system — deliberately. There is NO systemctl stop/down command
+    # here and there must never be one: stopping a wg-quick@ unit runs
+    # `wg-quick down`, which deletes the very interface the AP unit is
+    # currently serving traffic on. Removing a boot-time race must not cause
+    # the outage it exists to prevent.
+    "systemctl_disable_unit":
+        {"argv": ["sudo", "-n", "systemctl", "disable", "{unit}"],
+         "repair": True},
+    "systemctl_enable_unit":   # rollback for systemctl_disable_unit
+        {"argv": ["sudo", "-n", "systemctl", "enable", "{unit}"],
          "repair": True},
 }
 

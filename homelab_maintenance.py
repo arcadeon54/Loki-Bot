@@ -832,8 +832,17 @@ async def _incident_handler(h):
     rr = result.get("repair_result")
     plan = result.get("repair")
     if result.get("healthy"):
-        fields["status"] = "healthy"
-        summary = f"{name}: healthy. {result.get('diagnosis', '')}"
+        # A runbook may report a healthy running path AND a latent fault that
+        # only bites later (e.g. a boot-time ownership race). Saying only
+        # "healthy" there would bury a fix the Boss still has to authorize.
+        if plan and policy.action_tier(plan["action"]) == policy.APPROVAL:
+            fields["status"] = "awaiting_approval"
+            summary = (f"{name}: running path healthy, but "
+                       f"{result.get('diagnosis', '')} Say the word and I'll "
+                       f"stage the fix for approval.")
+        else:
+            fields["status"] = "healthy"
+            summary = f"{name}: healthy. {result.get('diagnosis', '')}"
     elif rr and rr.get("ok"):
         fields["status"] = "repaired"
         summary = (f"{name}: {result.get('diagnosis', '')} Repaired and "
@@ -977,6 +986,7 @@ async def _tool_status(args: dict, ctx: ToolContext) -> str:
         "ok": True, "asset": asset.get("display_name", asset["key"]),
         "healthy": result.get("healthy", False),
         "diagnosis": redact(result.get("diagnosis", ""))[:400],
+        "advisories": [redact(a)[:300] for a in result.get("advisories") or []],
         "checks": [f"{'OK' if c['ok'] else 'FAIL'} {c['name']}: "
                    f"{redact(c['detail'])[:120]}"
                    for c in result.get("checks", [])]})
@@ -1382,15 +1392,33 @@ async def _apply_repair_handler(payload: dict, ctx: ToolContext) -> str:
                                  {"ok": False, "steps": steps}))
             raise RuntimeError(f"approved repair step failed: {cmd['name']}")
     await ops.record_attempt(plan["action"], inc["asset"])
-    # Verify by re-running the runbook read-only.
+    # Verify by re-running the runbook read-only. An outstanding advisory
+    # counts as not-fixed: for a latent fault (boot ownership) `healthy` was
+    # already true before the repair, so it proves nothing on its own — the
+    # advisory clearing is the actual evidence.
     result, _ = await run_runbook(asset, allow_repairs=False)
-    ok = result.get("healthy", False)
-    _incident_update(inc["incident_id"],
-                     status="repaired" if ok else "escalated",
+    live_ok = bool(result.get("healthy", False))
+    advisories = result.get("advisories") or []
+    ok = live_ok and not advisories
+    if ok:
+        status, note = "repaired", "repair applied and verified healthy"
+    elif live_ok:
+        # The running path is fine and the commands succeeded; only the latent
+        # finding survived. Calling that "unhealthy" would be a false claim
+        # about traffic that is flowing, and escalating it would hand a
+        # non-outage to Hermes.
+        status = "awaiting_approval"
+        note = ("repair applied, but the latent finding is still open: "
+                + redact(advisories[0])[:200])
+    else:
+        status, note = "escalated", ("repair applied but the asset is still "
+                                     "unhealthy — escalating")
+    _incident_update(inc["incident_id"], status=status,
                      repair_result_json=json.dumps(
-                         {"ok": ok, "steps": steps, "verified": ok}))
-    return ("repair applied and verified healthy" if ok else
-            "repair applied but the asset is still unhealthy — escalating")
+                         {"ok": ok, "steps": steps, "verified": ok,
+                          "live_path_healthy": live_ok,
+                          "advisories_remaining": len(advisories)}))
+    return note
 
 
 # ── Registration ───────────────────────────────────────────────────────────

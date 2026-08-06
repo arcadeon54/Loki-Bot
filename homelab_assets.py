@@ -151,7 +151,10 @@ class Registry:
                 vals["path"].add(str(docker["env_file"]))
             systemd = asset.get("systemd") or {}
             for v in systemd.values():
-                vals["unit"].add(str(v))
+                # A systemd key may declare one unit or a list of them
+                # (e.g. conflicting_units); both contribute unit values.
+                for u in (v if isinstance(v, list) else [v]):
+                    vals["unit"].add(str(u))
             mounts = asset.get("mounts") or {}
             for v in mounts.values():
                 for p in (v if isinstance(v, list) else [v]):

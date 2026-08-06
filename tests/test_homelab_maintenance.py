@@ -629,6 +629,57 @@ class ApprovalBoundaryTests(Base):
             {"incident_id": iid, "plan_hash": "deadbeef"}, ctx(BOSS_ID))
         self.assertTrue(err)
 
+    def _run_apply(self, verify_result):
+        """Execute an approved repair with the commands stubbed, and the
+        post-repair verification runbook returning `verify_result`."""
+        iid, plan = self._incident_with_plan("service_enable_disable")
+        payload = {"incident_id": iid, "plan_hash": hm._plan_hash(plan)}
+        ran = []
+
+        async def fake_run(self, name, **p):
+            ran.append(name)
+            return 0, ""
+
+        async def fake_runbook(asset, allow_repairs):
+            return verify_result, hm.Ops(allow_repairs=False)
+
+        orig_run, orig_rb = hm.Ops.run, hm.run_runbook
+        hm.Ops.run, hm.run_runbook = fake_run, fake_runbook
+        try:
+            out = run(hm._apply_repair_handler(payload, ctx(BOSS_ID)))
+        finally:
+            hm.Ops.run, hm.run_runbook = orig_run, orig_rb
+        return out, hm.get_incident(iid), ran
+
+    def test_approved_repair_clearing_everything_is_repaired(self):
+        out, inc, ran = self._run_apply(
+            {"healthy": True, "advisories": [], "checks": []})
+        self.assertIn("verified healthy", out)
+        self.assertEqual(inc["status"], "repaired")
+        self.assertIn("docker_restart", ran)
+
+    def test_latent_finding_surviving_is_not_called_unhealthy(self):
+        """A live path that is still fully green must never be reported as
+        unhealthy or escalated just because a latent finding remains — that is
+        the false-symptom failure mode this controller exists to avoid."""
+        out, inc, _ = self._run_apply(
+            {"healthy": True, "advisories": ["boot ownership still open"],
+             "checks": []})
+        self.assertNotIn("unhealthy", out)
+        self.assertIn("latent finding", out)
+        self.assertEqual(inc["status"], "awaiting_approval")
+        self.assertNotEqual(inc["status"], "escalated")
+        rr = json.loads(inc["repair_result_json"])
+        self.assertFalse(rr["ok"])
+        self.assertTrue(rr["live_path_healthy"])
+        self.assertEqual(rr["advisories_remaining"], 1)
+
+    def test_genuinely_broken_after_repair_still_escalates(self):
+        out, inc, _ = self._run_apply(
+            {"healthy": False, "advisories": [], "checks": []})
+        self.assertIn("still unhealthy", out)
+        self.assertEqual(inc["status"], "escalated")
+
     def test_immich_updates_always_need_approval(self):
         self.assertEqual(IM.get("update_policy"), "approval_always")
         self.assertEqual(policy.action_tier("immich_update"), policy.APPROVAL)

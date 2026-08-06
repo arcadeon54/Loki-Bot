@@ -76,7 +76,7 @@ async def run(asset: dict, ops) -> dict:
     if not transport_ok:
         add("diagnostic_transport", False, out, status=UNAVAILABLE)
         return {"checks": checks, "healthy": False, "repair": None,
-                "repair_result": None, "escalate": False,
+                "repair_result": None, "escalate": False, "advisories": [],
                 "diagnosis": (
                     "Diagnostic transport failed — Loki could not run its "
                     "read-only inspection commands on dex247, so BLACK-BOXX's "
@@ -180,13 +180,22 @@ async def run(asset: dict, ops) -> dict:
     add("dns_resolution", dns_ok, "resolver answered" if dns_ok else "DNS lookup failed")
 
     healthy = all(c["ok"] for c in checks)
+    boot_advisory, boot_plan = await _boot_ownership_advisory(ops, asset, ap_unit, wg)
     result = {"checks": checks, "healthy": healthy, "repair": None,
-              "repair_result": None, "escalate": False}
+              "repair_result": None, "escalate": False,
+              "advisories": [boot_advisory] if boot_advisory else []}
 
     if healthy:
         result["diagnosis"] = ("BLACK-BOXX path fully healthy: AP up, tunnel "
                                "handshaking, marking/routing/NAT all in place, "
                                "internet reachable through the tunnel.")
+        if boot_advisory:
+            # A live path that works today can still be wired to break on the
+            # next boot. Report it as what it is — never by failing a check
+            # about the running system, which would be a false statement about
+            # traffic that is flowing right now.
+            result["repair"] = boot_plan
+            result["diagnosis"] += " " + boot_advisory
         return result
 
     # The ONE known auto-repairable state: policy rule missing while the
@@ -234,6 +243,61 @@ async def run(asset: dict, ops) -> dict:
     return result
 
 
+async def _boot_ownership_advisory(ops, asset: dict, ap_unit: str, wg: str):
+    """Is any OTHER unit still enabled to configure `wg` at boot?
+
+    ap_unit brings up wg-ap itself. A second enabled unit racing it means
+    whichever loses `ip link add` runs its own error cleanup —
+    `ip link delete dev wg-ap` — and destroys the interface the winner just
+    built, leaving ap_unit failed and the AP with no tunnel.
+
+    This is a BOOT-time fault and nothing else: it is invisible in every check
+    of the running path, and it must never mark a working AP unhealthy. It is
+    returned as (advisory_text, approval_tier_plan) instead.
+
+    The plan only DISABLES. Stopping a wg-quick@ unit runs `wg-quick down`,
+    which would delete the wg-ap that ap_unit is currently serving traffic on;
+    the conflict is dormant until the next boot, so leaving the already-started
+    unit alone is both sufficient and the only safe order.
+    """
+    units = (asset.get("systemd") or {}).get("conflicting_units") or []
+    if isinstance(units, str):
+        units = [units]
+    conflicts = []
+    for unit in units:
+        if unit == ap_unit:
+            continue
+        # `systemctl is-enabled` exits non-zero for "disabled"/"static", so the
+        # WORD is the answer and rc is not. A transport failure here says
+        # nothing about the unit — stay silent rather than invent a conflict.
+        rc, out, transport_ok = await _probe(ops, "systemctl_is_enabled", unit=unit)
+        if not transport_ok:
+            continue
+        state = ((out or "").strip().splitlines() or [""])[-1].strip()
+        if state == "enabled":
+            conflicts.append(unit)
+    if not conflicts:
+        return None, None
+
+    listed = ", ".join(conflicts)
+    plan = {
+        "action": "service_enable_disable",
+        "description": (f"disable {listed} at boot so {ap_unit} is the only "
+                        f"owner of {wg} (disable only — no stop, nothing "
+                        f"running is touched)"),
+        "commands": [{"name": "systemctl_disable_unit", "params": {"unit": u}}
+                     for u in conflicts],
+        "rollback": [{"name": "systemctl_enable_unit", "params": {"unit": u}}
+                     for u in conflicts],
+    }
+    advisory = (f"Boot-time ownership conflict: {listed} is still enabled and "
+                f"also configures {wg} at boot, racing {ap_unit} for it. The "
+                f"loser's cleanup deletes {wg}, so the AP can come up dead "
+                f"after a reboot even though it is fine right now. Fix needs "
+                f"your approval ({plan['action']}).")
+    return advisory, plan
+
+
 async def _ap_unit_down_result(ops, checks, ap_unit: str, state: str, net) -> dict:
     """The AP unit owns wg-ap, hostapd, dnsmasq and the routing, so a dead unit
     is ONE fault, not fourteen. Restarting a stopped/crashed stateless service
@@ -246,7 +310,7 @@ async def _ap_unit_down_result(ops, checks, ap_unit: str, state: str, net) -> di
         "rollback": [],
     }
     result = {"checks": checks, "healthy": False, "repair": plan,
-              "repair_result": None, "escalate": False,
+              "repair_result": None, "escalate": False, "advisories": [],
               "diagnosis": (
                   f"Root cause: {ap_unit} is {state}. That unit owns the whole "
                   f"BLACK-BOXX stack (wg-ap, hostapd, dnsmasq, marking, table, "
