@@ -80,25 +80,35 @@ Verify anything time-sensitive against live state (systemctl, journalctl,
 read-only DB queries) before trusting a document.
 ```
 
-## 5. Using the Loki Builder agent
+## 5. Using the Loki Builder role
 
-```bash
-agy --agent loki-builder
-```
+**`--agent loki-builder` does not work on agy 1.1.10.** Verified live: the flag
+is accepted silently and the session keeps the default Antigravity persona.
+`agy agents` lists only account/server-side agents and returns nothing for
+`.agents/agents/`, which is not a discovered customization type in this build
+(the shipped `json_configs.md` documents `skills.json` and `plugins.json` only).
 
-Defined at `.agents/agents/loki-builder/agent.md`. Use it for implementation
-work on Loki: it reads the handoff first, works completion-first, owns one
-active task, preserves the security architecture, and does not push git.
-
-If `--agent loki-builder` is not resolved by your build, the same behaviour is
-available by opening a normal session and saying:
+The role is therefore reached through a **skill**, which this build does
+discover:
 
 ```
-Adopt the role defined in .agents/agents/loki-builder/agent.md for this session.
+Use the loki-builder skill.
 ```
 
-The agent file is plain markdown, so this fallback is exact, not approximate.
-`agy agents` lists agents available to your account and requires sign-in.
+or simply ask for it by name — "work as Loki Builder". Either way the agent
+reads `.agents/skills/loki-builder/SKILL.md`, which points at the canonical
+definition in `.agents/agents/loki-builder/agent.md` and adopts it.
+
+The explicit fallback, exact rather than approximate, is:
+
+```
+Read .agents/agents/loki-builder/agent.md and adopt that role for this session.
+```
+
+`agent.md` is retained as the canonical role definition — it is the single
+source the skill and the fallback both point at, and it is what a future agy
+version (or another Antigravity surface) would consume if `--agent` gains
+workspace support.
 
 ## 6. How context, rules and skills load
 
@@ -137,16 +147,47 @@ authenticate first before scripting anything.
 
 ## 8. Permission policy on dex247
 
-Enforced by `.agents/hooks.json` → `.agents/scripts/permission-guard.sh`, and
-documented in `.agents/rules/production-safety.md`.
+Two layers. The settings file opens the gate; the hook is the actual policy.
+
+### Layer 1 — `~/.gemini/antigravity-cli/settings.json`
+
+User-level, outside the repo, so it is not committed. Without a
+`permissions.allow` block, headless (`-p`) runs fail immediately with *"a tool
+required the read_file permission that headless mode cannot prompt for"*.
+
+Rule syntax verified empirically against 1.1.10 — the docs do not specify it:
+
+- Globs are used: `read_file(**)`, `command(*)`.
+- **`**` does not cross directory separators.** `read_file(**)` matches
+  root-level files only; nested paths need their own entries
+  (`read_file(docs/**)`, `read_file(docs/agent-context/**)`, `read_file(*/**)`).
+  This is the single most confusing failure here — a nested read is denied while
+  a root read succeeds under the same config.
+- A plain directory rule (`read_file(/home/g2k247/loki-bot)`) does **not** grant
+  recursive access despite the shipped note suggesting it does.
+- Both workspace-relative and absolute forms are accepted; the installed config
+  lists both.
+
+`command(*)` is allowed at this layer deliberately, because the hook below is
+where command policy is actually decided.
+
+### Layer 2 — `.agents/hooks.json` → `.agents/scripts/permission-guard.sh`
+
+Tracked in the repo, so the policy travels with the project. Matches
+`run_command|read_file|write_file|edit_file`.
 
 - **ALLOW** — repository reads and edits, `git status`/`diff`/`log`, focused
   tests, read-only service and log diagnostics.
-- **ASK** — service restarts, container mutation, privileged NAS deployment,
-  destructive cleanup, anything writing outside the repo.
-- **DENY** — `git push`, unrestricted `sudo`, root SSH, `.ssh` modification,
-  reading `.env`/secrets, `rm -rf`-style destruction, Docker prune or volume
-  deletion.
+- **ASK** — service restarts, container mutation, git state changes, package
+  installs, `sudo`, NAS/razr actions, recursive deletes.
+- **DENY** — `git push`, Docker prune, volume removal, `.env`/`.ssh`/credential
+  reads by *any* tool, root SSH, `sshpass`, disabling host-key verification,
+  `chmod 777`, docker-group membership, `rm -rf` of a root or home path.
 
-Antigravity is **not** configured as an unrestricted autonomous root agent, and
-must not be reconfigured as one.
+Unparseable input falls through to agy's own prompting, so a hook bug can never
+silently widen permissions. In headless mode an **ASK** cannot be answered and
+is auto-denied — it fails closed.
+
+**Never use `--dangerously-skip-permissions` on dex247.** It bypasses layer 1
+entirely. Antigravity is not configured as an unrestricted autonomous root
+agent and must not be reconfigured as one.

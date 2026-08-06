@@ -2,7 +2,7 @@
   "loki-permission-guard": {
     "PreToolUse": [
       {
-        "matcher": "run_command",
+        "matcher": "run_command|read_file|write_file|edit_file",
         "hooks": [
           {
             "type": "command",

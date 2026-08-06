@@ -1,0 +1,29 @@
+{
+  "_note": "Reference copy of the verified permissions block from ~/.gemini/antigravity-cli/settings.json (user-level, not loaded from here). Recreate it after a reinstall or on a new machine. Glob '**' does NOT cross directory separators, so nested paths need their own entries.",
+  "permissions": {
+    "allow": [
+      "command(*)",
+      "read_file(*)",
+      "read_file(**)",
+      "read_file(*/**)",
+      "read_file(*/*/**)",
+      "read_file(docs/**)",
+      "read_file(docs/agent-context/**)",
+      "read_file(.agents/**)",
+      "read_file(.agents/*/**)",
+      "read_file(/home/g2k247/loki-bot/*)",
+      "read_file(/home/g2k247/loki-bot/**)",
+      "read_file(/home/g2k247/loki-bot/*/**)",
+      "read_file(/home/g2k247/loki-bot/*/*/**)",
+      "read_file(/home/g2k247/loki-bot/docs/**)",
+      "read_file(/home/g2k247/loki-bot/docs/agent-context/**)",
+      "read_file(/home/g2k247/loki-bot/.agents/**)",
+      "read_file(/home/g2k247/loki-bot/.agents/*/**)"
+    ],
+    "deny": [
+      "read_file(/home/g2k247/loki-bot/.env)",
+      "read_file(/home/g2k247/.ssh)",
+      "command(git push)"
+    ]
+  }
+}

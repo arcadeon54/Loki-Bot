@@ -12,21 +12,39 @@ set -uo pipefail
 
 payload="$(cat)"
 
-# Pull the command line out of the tool call without requiring jq.
-cmd="$(printf '%s' "$payload" | python3 -c '
+parsed="$(printf '%s' "$payload" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print(""); raise SystemExit
-args = (d.get("toolCall") or {}).get("args") or {}
+    print("\t"); raise SystemExit
+call = d.get("toolCall") or {}
+args = call.get("args") or {}
+cmd = ""
 for k in ("CommandLine", "commandLine", "command", "Command"):
     v = args.get(k)
     if isinstance(v, str) and v.strip():
-        print(v); break
-else:
-    print("")
+        cmd = v; break
+# Any path-shaped argument, for file-reading/writing tools.
+paths = []
+for k, v in args.items():
+    if isinstance(v, str) and ("/" in v or v.startswith("~")) and "\n" not in v:
+        paths.append(v)
+print(cmd.replace("\t", " ") + "\t" + " ".join(paths).replace("\t", " "))
 ' 2>/dev/null)"
+
+cmd="${parsed%%$'\t'*}"
+paths="${parsed#*$'\t'}"
+
+# ── Secret protection, independent of which tool asked ──────────────────────
+# The file tools bypass the shell entirely, so .env must be blocked here too
+# and not only in the command patterns below.
+case "$paths" in
+    *".env.example"*) : ;;
+    *"/.env"*|*".env."*|*".ssh/"*|*"id_rsa"*|*"id_ed25519"*|*"authorized_keys"*|*"credentials"*)
+        printf '{"decision":"deny","reason":"Secret material is not readable; use variable names only. See .agents/rules/secrets-policy.md."}\n'
+        exit 0 ;;
+esac
 
 # Nothing parseable: defer to agy rather than guessing.
 if [ -z "$cmd" ]; then

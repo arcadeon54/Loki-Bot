@@ -4,6 +4,15 @@
 
 ## Just completed
 
+**Antigravity migration — DONE 2026-08-06.** `agy` 1.1.10 installed at
+`~/.local/bin/agy` (as `g2k247`, coexisting with Claude Code), authenticated,
+and validated live: a read-only session recovers the handoff, the 10 workspace
+skills, and the Loki Builder role from this repository alone. Durable context
+lives in `docs/agent-context/` and `.agents/`. Two conventions had to be
+corrected against the installed build — `--agent` does not resolve workspace
+agents, and permission globs do not cross directory separators; both are
+documented in `ANTIGRAVITY_BOOTSTRAP.md`. No production behaviour changed.
+
 **BLACK-BOXX boot-race persistence — DONE.** `wg-quick@wg-ap` was enabled
 alongside `black-boxx-ap.service`; both raced to `ip link add wg-ap` at boot and
 the loser's cleanup (`ip link delete dev wg-ap`) destroyed the winner's
