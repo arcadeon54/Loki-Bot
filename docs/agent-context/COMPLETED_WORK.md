@@ -84,6 +84,11 @@ specifically so a major release cannot be applied by accident.
 Redis and Postgres sit at 0. App-side, cause unproven, deliberately **no
 automatic repair**.
 
+## Work Tracker
+
+**DONE — Google Sheets export defect fixed** (2026-08-06).
+The `_write_sheets_row` function was a fire-and-forget HTTP call at the moment of session close. Any network drop, timeout, or HA integration failure resulted in permanent data loss for the Sheets mirror. Re-architected to a durable `_sync_pending_sheets` queue processor reading from the SQLite `work_sessions` table (`sheets_ok = 0`). Sync runs asynchronously on session close and is triggered every 5 minutes by `poll()`. Idempotency and retry-safety guaranteed. Validated live; historically dropped sessions successfully recovered and exported to Sheets.
+
 ## Joplin
 
 **DONE — authoritative runtime** (`f89e503`, then `dc479a6`, 2026-08-05).

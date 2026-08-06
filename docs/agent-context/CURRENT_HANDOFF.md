@@ -4,6 +4,8 @@
 
 ## Just completed
 
+**Google Sheets export defect — DONE 2026-08-06.** `work_tracker.py` was silently dropping Sheets exports if the Home Assistant HTTP POST failed or timed out during the exact second the session closed. Rewrote the export path as a background queue processor (`_sync_pending_sheets`) that reads `sheets_ok=0` directly from the durable SQLite DB. Validated live: all previously failed/dropped sessions naturally retried and reached Google Sheets successfully. No unit tests broken.
+
 **Antigravity migration — DONE 2026-08-06.** `agy` 1.1.10 installed at
 `~/.local/bin/agy` (as `g2k247`, coexisting with Claude Code), authenticated,
 and validated live: a read-only session recovers the handoff, the 10 workspace
@@ -36,14 +38,10 @@ presence notification passthrough (`ede172d`).
 
 ## Next active task
 
-**None assigned.** The BLACK-BOXX objective is closed and no successor has been
-started. Do not invent one.
+**None assigned.** The Google Sheets export objective is closed.
 
 If the Boss wants the next thing from the backlog, `docs/NEXT_STEPS.md` is the
-ordered list. The two genuinely broken items at the top are the **Google Sheets
-work-session export** (`sheets_ok` 2/15, `work_tracker.py`) and the **weekly
-Discord export 403** (bot lacks channel permission — needs a Boss-side Discord
-change, not code). Neither is authorized to start without the Boss saying so.
+ordered list. The **weekly Discord export 403** (bot lacks channel permission — needs a Boss-side Discord change, not code) is the last remaining broken item. It is not authorized to start without the Boss saying so.
 
 ## DONE condition for whatever you pick up
 

@@ -11,7 +11,7 @@
 | Surfaces | Discord (public persona + serious DMs), Telegram `@Leauxki_Bot` (always serious), Home Assistant notifications, voice |
 | Host | dex247, account `g2k247` |
 | Repo = deployment | `/home/g2k247/loki-bot`, branch `master` |
-| Push state | **46 commits ahead of origin. Nothing pushed.** |
+| Push state | **47 commits ahead of origin. Nothing pushed.** |
 
 ## Live startup state (restart 2026-08-06 11:19 UTC)
 
@@ -24,7 +24,7 @@ Proactive — ON, 0/5 used today, quiet 23:00–09:00 ET
 RAG online — 3529 conversation chunks
 Joplin memory online — Data API sidecar reachable
 Semantic memory online — 17 memories indexed
-Work tracker online — 90-min rule → SQLite + Joplin + Sheets
+Work tracker online — 90-min rule → SQLite + Joplin + Sheets (queued sync)
 Presence monitor online — Boss: home, Rob: home
 Career-Ops liaison online — bridge at configured URL
 Task supervisor online

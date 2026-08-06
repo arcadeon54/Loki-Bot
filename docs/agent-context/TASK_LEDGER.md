@@ -14,12 +14,12 @@ result and the local commit.
 | 6 | Tracearr update path | **DONE** 2026-08-05 | Approval-gated, pinned, backed up, verified, rollback-capable; v1.5.0 live | `b075780`, `251807b` |
 | 7 | Joplin note read-back | **DONE** 2026-08-05 | Loki can read back notes it writes to the Boss's own notebooks | `dc479a6` |
 | 8 | Presence notification style | **DONE** 2026-08-05 | Concise legacy style; roommate state retained on welcome-home | `ede172d`, 20 tests |
+| 9 | Google Sheets export | **DONE** 2026-08-06 | Reliable sync queue, no data loss on failure, idempotency maintained | Durable queue reading `sheets_ok=0` from SQLite |
 
 ## Backlog — not started, not authorized
 
 | Objective | State | Note |
 |---|---|---|
-| Google Sheets work-session export | UNFINISHED | `sheets_ok` 2/15; SQLite + Joplin fine, no data loss |
 | Weekly Discord export 403 | UNFINISHED | Needs a Boss-side Discord permission, not code |
 | watchtower → monitor-only | UNFINISHED | Production change, needs approval; bypasses Loki's gate today |
 | Tracearr restart churn | UNFINISHED | 268 restarts, cause unproven, no auto-repair by design |

@@ -141,6 +141,8 @@ _state = _load_state()
 # keys: phase (idle|candidate|confirmed), lat, lon, arrived_at,
 #       location, away_strikes
 
+_syncing_sheets = False
+
 
 def _dist_m(lat1, lon1, lat2, lon2):
     import math
@@ -213,35 +215,55 @@ async def _write_joplin_row(session_id: int, loc: str,
         log.error(f"Joplin work-log write failed: {e}")
 
 
-async def _write_sheets_row(session_id: int, loc: str,
-                            arrived: datetime.datetime,
-                            departed: datetime.datetime, minutes: float):
-    """Legacy Google Sheets export via HA google_sheets.append_sheet."""
+async def _sync_pending_sheets():
+    """Retry-safe export to Google Sheets based on the SQLite source of truth."""
+    global _syncing_sheets
     if not SHEETS_CONFIG_ENTRY or "ha_call_service" not in _hooks:
         return
+    if _syncing_sheets:
+        return
+    
+    _syncing_sheets = True
     try:
-        hours = minutes / 60.0
-        payload = {
-            "config_entry": SHEETS_CONFIG_ENTRY,
-            "worksheet": SHEETS_WORKSHEET,
-            "data": {
-                "Pay Period": pay_period(arrived.date()),
-                "Date": arrived.strftime("%Y-%m-%d"),
-                "Job Location": loc,
-                "Arrival": arrived.strftime("%-I:%M %p"),
-                "Departure": departed.strftime("%-I:%M %p"),
-                "Hours Worked": f"{hours:.2f}",
-                "Total Earned": f"${hours * WORK_HOURLY_RATE:.2f}",
-            },
-        }
-        ok = await _hooks["ha_call_service"]("google_sheets", "append_sheet",
-                                             extra=payload)
-        if ok:
-            _mark(session_id, "sheets_ok")
-        else:
-            log.warning("Sheets append returned not-ok")
-    except Exception as e:
-        log.error(f"Sheets append failed: {e}")
+        with sqlite3.connect(DB_PATH) as c:
+            rows = c.execute(
+                "SELECT id, location, arrived_at, departed_at, duration_minutes "
+                "FROM work_sessions WHERE sheets_ok = 0 ORDER BY id ASC LIMIT 5"
+            ).fetchall()
+            
+        for row in rows:
+            session_id, loc, arr_str, dep_str, minutes = row
+            if not dep_str or minutes is None:
+                continue
+                
+            try:
+                arrived = datetime.datetime.fromisoformat(arr_str)
+                departed = datetime.datetime.fromisoformat(dep_str)
+                hours = minutes / 60.0
+                payload = {
+                    "config_entry": SHEETS_CONFIG_ENTRY,
+                    "worksheet": SHEETS_WORKSHEET,
+                    "data": {
+                        "Pay Period": pay_period(arrived.date()),
+                        "Date": arrived.strftime("%Y-%m-%d"),
+                        "Job Location": loc,
+                        "Arrival": arrived.strftime("%-I:%M %p"),
+                        "Departure": departed.strftime("%-I:%M %p"),
+                        "Hours Worked": f"{hours:.2f}",
+                        "Total Earned": f"${hours * WORK_HOURLY_RATE:.2f}",
+                    },
+                }
+                ok = await _hooks["ha_call_service"]("google_sheets", "append_sheet",
+                                                     extra=payload)
+                if ok:
+                    _mark(session_id, "sheets_ok")
+                    log.info(f"Sheets append successful for session {session_id}")
+                else:
+                    log.warning(f"Sheets append returned not-ok for session {session_id}")
+            except Exception as e:
+                log.error(f"Sheets append failed for session {session_id}: {e}")
+    finally:
+        _syncing_sheets = False
 
 
 async def _close_session(departed: datetime.datetime):
@@ -266,13 +288,14 @@ async def _close_session(departed: datetime.datetime):
             log.error(f"announce failed: {e}")
 
     await _write_joplin_row(session_id, loc, arrived, departed, minutes)
-    await _write_sheets_row(session_id, loc, arrived, departed, minutes)
+    asyncio.create_task(_sync_pending_sheets())
 
 
 # ─── The poll ────────────────────────────────────────────────────────────────
 
 async def poll(person_entity: str = "person.kavaris"):
     """Advance the state machine one tick. Called every ~5 min by loki_bot."""
+    asyncio.create_task(_sync_pending_sheets())
     if "ha_get_state" not in _hooks:
         return
     st = await _hooks["ha_get_state"](person_entity)
