@@ -4,6 +4,21 @@
 
 ## Just completed
 
+**RAZR Phase-1 Storage Capacity Recovery — DONE 2026-08-08.** Root at 78%
+(72/98 GB) after +21% growth from Aug 1 Gemma4 model import. Investigation
+proven: 135.42 GiB was already free inside `ubuntu-vg` (Samsung NVMe LVM PV);
+no partition/PV surgery needed. Actions (all online, zero downtime):
+`lvextend -l +100%FREE` + `resize2fs` on live root: 100 GiB LV → 235.42 GiB,
+98 GB filesystem → 232 GB, usage 78% → 29%, free 22 GB → 157 GB.
+Orphan Ollama blob `sha256-5965…` (6.9 GB, Python-manifest-walk confirmed
+unreferenced) removed; all 7 models intact. Caches cleaned: npm _cacache (409 MB),
+hermes build caches (394 MB), snapd (708 MB), apt (143 MB). Crucial 1TB NVMe
+(carry-forward NTFS) untouched.
+
+**Storage architecture note (do not regress):** RAZR has two NVMe SSDs, not
+SATA. Samsung 238 GB = Linux OS/LVM. Crucial 1TB = NTFS carry-forward, unmounted,
+not in fstab, no Linux service depends on it.
+
 **qBittorrent recurring connectivity — DONE 2026-08-06.** Root cause was
 `mem_limit: 1g` in `/home/g2k247/PrivacyServer/docker-compose.yml`. The kernel
 cgroup OOM killer fired every 20-30 minutes against libtorrent peer-connection
@@ -50,7 +65,7 @@ presence notification passthrough (`ede172d`).
 
 ## Next active task
 
-**None assigned.** The qBittorrent objective is closed.
+**None assigned.** The RAZR Phase-1 storage capacity recovery is complete.
 
 If the Boss wants the next thing from the backlog, `docs/NEXT_STEPS.md` is the
 ordered list. The **weekly Discord export 403** (bot lacks channel permission — needs a Boss-side Discord change, not code) is the last remaining broken item. It is not authorized to start without the Boss saying so.

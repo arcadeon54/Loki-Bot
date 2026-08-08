@@ -7,6 +7,42 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## RAZR Phase-1 Storage Capacity Recovery
+
+**DONE — 2026-08-08.**
+
+Full read-only investigation established that RAZR's `ubuntu-vg` had 135.42 GiB free
+inside the VG (`/dev/nvme1n1p3`, Samsung NVMe) with the root LV fixed at 100 GiB.
+No partition/PV surgery was needed.
+
+**Changes made (all online, zero downtime):**
+
+1. **Root LV extended**: `lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv` →
+   LV grew from 100 GiB to 235.42 GiB.
+2. **ext4 filesystem grown online**: `resize2fs` on the live mounted root →
+   filesystem expanded from 98 GB to 232 GB.
+3. **Proven orphan Ollama blob removed**: `sha256-5965…` (6.9 GB) confirmed
+   unreferenced by Python manifest walk. Active Gemma4 blob `sha256-8ebc…` untouched.
+   All 7 Ollama models remain intact.
+4. **Safe cache cleanup**:
+   - npm `_cacache` (409 MB)
+   - hermes uv cache (219 MB), electron cache (110 MB), node-gyp cache (65 MB)
+   - snapd download cache (708 MB)
+   - apt cache (143 MB)
+
+**Result:**
+- Root filesystem: 98 GB → 232 GB
+- Usage: 78% → 29%
+- Free space: 22 GB → 157 GB
+- Total reclaimed by cleanup: ~7.5 GB (orphan blob 6.9 GB + caches)
+- All services (Ollama, Docker open-webui, nextchat, Hermes) verified healthy post-change
+- Crucial 1TB NVMe untouched
+
+**Storage architecture clarification:**
+RAZR has two NVMe SSDs (not SATA). The Samsung 238 GB is the Linux OS/LVM drive.
+The Crucial 1TB (`nvme0n1`) is carry-forward NTFS data, unmounted, not in fstab,
+no Linux service depends on it.
+
 ## qBittorrent
 
 **DONE — recurring connectivity failure fixed** (2026-08-06).

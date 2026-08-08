@@ -1,7 +1,7 @@
 # Homelab Inventory
 
 Three machines plus a NAS. Everything below is verified against live state or
-current config as of 2026-08-06.
+current config as of 2026-08-08.
 
 ## DEX247 — primary host
 
@@ -77,6 +77,38 @@ plus MASQUERADE for the client subnet. Config lives in `/etc/wireguard/wg-ap.con
   `~/career-ops-users/{boss,roommate}`.
 - **Browser research worker** — razr serves `browser_research` for Loki.
 - Local models / Ollama live here rather than on dex247.
+
+### RAZR storage architecture (verified 2026-08-08)
+
+Two NVMe SSDs, **neither is a rotational SATA disk**:
+
+| Device | Model | Size | Role |
+|---|---|---|---|
+| `nvme1n1` | Samsung MZVLB256HBHQ | 238.5 GB | Linux OS/LVM drive |
+| `nvme0n1` | Crucial CT1000P1SSD8 | 931.5 GB | Carry-forward NTFS data — **not used by Linux services, not in fstab** |
+
+**Samsung LVM layout:**
+- PV `/dev/nvme1n1p3` — 235.42 GiB, fully partitioned
+- VG `ubuntu-vg` — 235.42 GiB (VG fully allocated to LV after 2026-08-08 expansion)
+- LV `ubuntu-lv` — **235.42 GiB** (was 100 GiB, expanded online 2026-08-08)
+- Root filesystem `/`: ext4, **232 GB total, ~29% used (~64 GB)**
+
+**Crucial NVMe** — single NTFS partition (`/dev/nvme0n1p1`), 932 GB, 56% used
+(521 GB carry-forward Windows data, 412 GB free). Not mounted at boot. No Linux
+service depends on it. Do **not** describe it as a SATA drive.
+
+### RAZR Ollama (verified 2026-08-08)
+
+- Ollama v0.30.9, service user `ollama`, home `/usr/share/ollama`
+- Model store: `/usr/share/ollama/.ollama/models/` (default `$HOME/.ollama/models`)
+- No `OLLAMA_MODELS` env override
+- 7 registered models: `gemma4-12b-balanced:latest`, `llama3.2:latest`,
+  `gemma4-uncensored:custom`, `fredrezones55/Gemma-4-Uncensored-HauhauCS-Aggressive:e2b`,
+  `fredrezones55/Gemma-4-Uncensored-HauhauCS-Aggressive:e4b`, `gemma2:9b`, `qwen2.5:7b`
+- Source GGUF `/home/razr/gguf-models/Gemma4-12B-QAT…Q4_K_M.gguf` (6.9 GB) —
+  NOT the same bytes as the active Ollama blob; archival source only
+- Active Gemma4 blob: `sha256-8ebc…` (6.9 GB, referenced)
+- Orphan blob `sha256-5965…` (6.9 GB) **removed 2026-08-08** — was unreferenced
 
 ## UGREEN NAS — storage and Tracearr
 

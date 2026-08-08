@@ -33,6 +33,7 @@ Homelab maintenance online — 10 assets
 Hermes escalation client online — bridge configured
 Hermes provider guard online — circuit closed 0/6/h 0/20/24h $0.00/$5.00
 Container updates online
+RAZR root filesystem: 232 GB ext4 (expanded 2026-08-08, 29% used)
 Homelab monitor online — polling every 300s
 Career-Ops monitor online — poll every 60s
 ```
