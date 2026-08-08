@@ -122,6 +122,38 @@ via `executescript()` **before** the `ALTER TABLE` that adds the column, which
 breaks import against a pre-existing production DB. Always test schema changes
 against a copy of the live `homelab_incidents.db` before restarting.
 
+## `monitor_incidents` is the authoritative outage source; a fault is a key
+
+The Daily Briefing counts outages from Loki's `homelab_incidents.db`
+`monitor_incidents`, deduped by `key` — the same identity `homelab_monitor`
+uses when it asks `WHERE key=? AND closed_at IS NULL` before opening an
+incident. One persistent fault is **one** incident no matter how many rows it
+logged: the live DB holds 297 `escalated` rows across just three faults.
+Liveness is `closed_at IS NULL`, never the status string — `escalated` rows are
+*closed* Hermes handoffs.
+
+skillkit's own `logs/incidents.db` is solve-path bookkeeping: a row means the
+agent worked on something, not that the homelab broke. It is reported
+separately and weighted lower (3 each, capped at 15) so stale records cannot
+read as outages. Do not merge the two schemas.
+
+## Briefing severity is deterministic; the LLM only narrates it
+
+`reporting.disk_status()` classifies each host once against the monitor's real
+threshold (`MONITOR_DISK_MIN_FREE_PCT`, default 10 free → **90%** used) and the
+synthesis prompt forbids exceeding the `max_severity` it returns. This existed
+because the healthy-line renderer hard-coded `disk_pct < 80` while the monitor
+alerted at 90%, so one 78% disk was printed as "under 80% — no action required"
+and called "P1 — Act now" in the same report. Any new briefing metric must ship
+its verdict the same way rather than handing raw numbers to the narrator.
+
+## Image age is never evidence of an available update
+
+`_c_image_ages` reads local `docker image inspect .Created` and queries no
+registry, so it sets `upstream_checked: False` and leaves `update_available`
+empty. Old local images are a maintenance-review signal only. Claiming an
+update exists requires something that actually looked upstream.
+
 ## Antigravity is an alternative implementation agent, not a replacement
 
 agy runs as `g2k247` on dex247 alongside Claude Code; neither owns the project.

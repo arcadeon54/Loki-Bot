@@ -4,6 +4,21 @@
 
 ## Just completed
 
+**Daily Briefing semantics repair — DONE 2026-08-08 (skillkit repo).** The
+briefing was contradicting itself: Reliability was amplified by repeat
+detections, the incident trend diffed raw DB rows ("Incident count: 15 ▲ +9"
+from one known fault), the healthy line hard-coded `disk_pct < 80` while the
+monitor alerts at 90% (so 78% read as "no action required" *and* "P1 — Act
+now"), and local image age was presented as proof an update existed. Fixed in
+`skillkit/advisor.py` + `skillkit/reporting.py`: incidents fold into canonical
+faults by `key`, `reporting.disk_status()` decides severity once for both the
+renderers and the LLM, Reliability prints its own arithmetic, and image age
+carries an explicit "upstream NOT checked". 27 regression tests in
+`tests/test_daily_briefing.py`. A `preview=True` path on `advisor.review()` /
+the `advise` skill builds a report without writing Joplin, Telegram or the
+metric-history snapshot. Live preview verified: razr 30%, Reliability
+60 = 100 − 12×1 − 3×4 − 8×2. See DECISIONS.md for the settled semantics.
+
 **RAZR Phase-1 Storage Capacity Recovery — DONE 2026-08-08.** Root at 78%
 (72/98 GB) after +21% growth from Aug 1 Gemma4 model import. Investigation
 proven: 135.42 GiB was already free inside `ubuntu-vg` (Samsung NVMe LVM PV);
