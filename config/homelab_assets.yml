@@ -243,6 +243,13 @@ assets:
       without recreating the container. Clearing a stale endpoint needs root
       fusermount3 — filesystem_repair tier, so the runbook escalates instead
       of restarting into a bind that cannot succeed.
+      The /srv/unicron share comes from the asus box over sshfs. That box was
+      rebuilt (Zorin OS 18.1): its tailnet address moved off 100.115.240.16 to
+      100.101.112.55, its SSH host key changed, and the rebuild dropped its
+      data disk from fstab, so /mnt/Disk1/downloads did not exist. Both were
+      repaired 2026-08-09. Always target it by MagicDNS
+      (asus.tail3744e0.ts.net), never by tailnet IP — the IP already moved once.
+      An empty /srv/unicron means the share is down, NOT that filebrowser is.
 
   loki-interfaces:
     display_name: Loki interfaces

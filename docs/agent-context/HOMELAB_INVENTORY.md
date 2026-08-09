@@ -1,7 +1,7 @@
 # Homelab Inventory
 
-Three machines plus a NAS. Everything below is verified against live state or
-current config as of 2026-08-08.
+Four machines plus a NAS. Everything below is verified against live state or
+current config as of 2026-08-09.
 
 ## DEX247 — primary host
 
@@ -149,10 +149,55 @@ network `tracearr_tracearr-network`:
 - `/home/unimatrix_001` is mode `0777` — a real security issue needing a tested
   remediation.
 
+## ASUS / "unicron" — download storage host
+
+**Rebuilt.** It is a different install from the one the docs described, and
+that rebuild is what broke the Filebrowser share.
+
+| | |
+|---|---|
+| Tailnet | `100.101.112.55` · MagicDNS `asus.tail3744e0.ts.net` |
+| LAN | `192.168.1.247` |
+| **Old tailnet address (dead — no node has it)** | ~~`100.115.240.16`~~ |
+| OS | Zorin OS 18.1 (Ubuntu-based), `OpenSSH_9.6p1` |
+| Account | `asus` (uid 1000), `NOPASSWD` sudo, groups include `sudo` |
+| SSH host key | `SHA256:j64/r3A/SMFEMDzbsVWOeCJ1khiaBKmkdu7zj1fn/9w` (ed25519) — **changed by the rebuild**; pinned in dex247's `known_hosts` for all three endpoints |
+| Authorized keys | `razr@razr` (RSA, pre-existing) + `g2k247@dex247` (ed25519, added 2026-08-09) |
+
+### Storage
+
+- `/dev/sda2` 118.7 G ext4 → `/` (OS)
+- `/dev/sdb1` 931.5 G ext4, **UUID `32d26174-8f15-4db3-8b7e-d584fc55bd7f`** →
+  `/mnt/Disk1`. Holds `downloads`, `backups`, `nextcloud`, `frigate`,
+  `jellyfin-metadata`, `yt-dlp`. ~470 G used.
+- CIFS mounts from the UGREEN NAS under `/media/nas/*`.
+
+**The rebuild dropped `/dev/sdb1` from `/etc/fstab` entirely**, so
+`/mnt/Disk1/downloads` did not exist — the data was intact but unmounted. It is
+now pinned by UUID with `nofail,x-systemd.device-timeout=15` (a missing data
+disk must never block boot). Do not re-add it by `/dev/sdX`; the device letters
+are not stable.
+
+**Pre-existing defect, deliberately not fixed:** `/etc/fstab` lines 15 and 19
+fail to parse (`//192.168.1.63/Zion Cinema` and `//192.168.1.63/Folder 1` —
+unescaped spaces; CIFS needs `\040`). Those two shares therefore never mount at
+boot. It is asus-side media, unrelated to the Unicron share, and touching it
+risks asus's own services.
+
+### The sshfs share dex247 depends on
+
+`sshfs-unicron.service` on dex247 mounts
+`asus@asus.tail3744e0.ts.net:/mnt/Disk1/downloads` → `/mnt/unicron-downloads`,
+which Docker binds into filebrowser as `/srv/unicron` with `rslave`
+propagation. Chain: **asus fstab → /mnt/Disk1 → sshfs → /mnt/unicron-downloads
+→ /srv/unicron**. Any link breaking empties `/srv/unicron` without taking
+filebrowser down. Target the machine by MagicDNS, never by tailnet IP — the IP
+already changed once.
+
 ## Registry
 
-Ten assets in `config/homelab_assets.yml`: `black-boxx`, `qbittorrent`,
-`jellyfin`, `joplin`, `cloudflare-ddns`, `loki-interfaces`, `immich`,
-`ugreen-nas`, `tracearr`, `plex`.
+Eleven assets in `config/homelab_assets.yml`: `black-boxx`, `qbittorrent`,
+`jellyfin`, `joplin`, `cloudflare-ddns`, `filebrowser`, `loki-interfaces`,
+`immich`, `ugreen-nas`, `tracearr`, `plex`.
 Plus one tombstone: `ivn-site`, decommissioned 2026-07-26, archive at
 `/home/g2k247/backups/decommission/ivn-site-20260726-014813`.

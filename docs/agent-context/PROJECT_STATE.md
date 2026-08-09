@@ -48,7 +48,7 @@ Career-Ops monitor online — poll every 60s
 | `black-boxx-ap.service` | **enabled + active**, sole boot owner of `wg-ap` |
 | `canada-ap.service` | disabled + inactive (correct) |
 | `wg-quick@wg-ap` | **disabled** (still `active (exited)` until next boot — intended) |
-| `sshfs-unicron.service` | enabled; **failing on auth**, backing off to 5 min. Owns `/mnt/unicron-downloads`. Not a filebrowser fault — see below |
+| `sshfs-unicron.service` | active (running), `NRestarts=0`. Mounts `asus.tail3744e0.ts.net:/mnt/Disk1/downloads` → `/mnt/unicron-downloads`, host key pinned, `StrictHostKeyChecking=yes` |
 
 ## Asset health
 
@@ -57,8 +57,8 @@ Career-Ops monitor online — poll every 60s
 - **Immich** — v3.0.3, which IS the latest stable. Nothing to update.
 - **Joplin** — desktop sidecar authoritative; CLI container obsolete/stopped.
 - **Filebrowser** — running + healthy since 2026-08-09, `media.ivn-group.cc`
-  HTTP 200. Three of four shares populated; `/srv/unicron` empty because sshfs
-  cannot authenticate to the rebuilt asus box.
+  HTTP 200. **All four shares populated** (`/srv/unicron` restored 2026-08-09
+  after the rebuilt asus box got dex247's key back and its data disk remounted).
 
 ## Filebrowser storage topology (dex247)
 

@@ -7,6 +7,75 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## Unicron sshfs share — rebuilt host, missing key, missing disk
+
+**DONE — 2026-08-09.** Follow-on to the Filebrowser repair below.
+
+`/srv/unicron` was empty. The prior handoff recorded one blocker (the SSH key)
+and expected it to need the Boss. Both parts of that turned out to be wrong.
+
+**Fault 1 — the key.** The `asus`/unicron box was rebuilt to Zorin OS 18.1, so
+dex247's `id_ed25519` was no longer in `asus@`'s `authorized_keys`, and the
+tailnet address had moved from `100.115.240.16` (now a dead address, no node
+holds it) to `100.101.112.55` / LAN `192.168.1.247`.
+
+**Fault 2 — the disk, which nobody had noticed.** `/mnt/Disk1/downloads` **did
+not exist on the rebuilt box**. The rebuild dropped `/dev/sdb1` — the 931 GB
+ext4 data disk, UUID `32d26174-8f15-4db3-8b7e-d584fc55bd7f` — from `/etc/fstab`
+entirely. The data was intact and simply unmounted (`downloads`, `backups`,
+`nextcloud`, `frigate`, `jellyfin-metadata`, `yt-dlp`; ~470 G used). **A working
+key alone would have mounted an empty directory** and looked like success.
+
+**No Boss action was needed.** razr already held authorized access to
+`asus@192.168.1.247` — its RSA key was in that box's `authorized_keys` from
+before the rebuild. That existing, legitimate path was used to append dex247's
+public key, preserving razr's key and backing up `authorized_keys` first.
+
+**Host identity was verified before trusting the new key**, three independent
+ways: the tailnet's WireGuard-authenticated node identity for `asus`; **razr's
+own `known_hosts`, which recorded the same ed25519 key back in June**; and the
+live login reporting hostname `asus` with the expected disk contents.
+Fingerprint `SHA256:j64/r3A/SMFEMDzbsVWOeCJ1khiaBKmkdu7zj1fn/9w`.
+
+**Changes.**
+
+1. `asus:~/.ssh/authorized_keys` — appended `g2k247@dex247` (ed25519).
+   Idempotent, backed up, `razr@razr` untouched, mode 600.
+2. `asus:/etc/fstab` — `/dev/sdb1` pinned **by UUID** at `/mnt/Disk1` with
+   `nofail,x-systemd.device-timeout=15`, so a missing data disk can never block
+   boot on that desktop OS. Backed up first. Mounted and confirmed readable as
+   the `asus` user (the identity sshfs connects as).
+3. `dex247:~/.ssh/known_hosts` — removed **only** the obsolete
+   `100.115.240.16` entry; pinned the verified key for
+   `asus.tail3744e0.ts.net`, `100.101.112.55` and `192.168.1.247`. No global
+   `StrictHostKeyChecking` change.
+4. `sshfs-unicron.service` — tightened `StrictHostKeyChecking=accept-new` →
+   `=yes`. With the key pinned this is the same for normal operation, but a
+   *changed* key now fails loudly instead of silently re-trusting a rebuilt
+   host. An unnoticed rebuild is exactly how this share died quietly.
+
+**Verification.** Unit `active (running)`, `NRestarts=0`, one sshfs process, no
+ENOTCONN. Two full stop/start cycles (the safe proxy for a reboot) each
+unmounted cleanly and remounted with all 53 entries — no stale endpoint, no
+loop. 10 rounds of stat/list stable; a real MP4 read back a correct `ftyp`
+header both on the host and inside the container.
+
+**The `rslave` propagation proved itself in production**: filebrowser started
+03:04:58 and the mount landed 03:43:30, and the running container picked up all
+53 entries with no restart and no recreate — the exact behaviour that binding
+was changed for. All four shares now populated (`/srv/dex247` 28,
+`/srv/unicron` 53, `/srv/nextcloud` 1, `/srv/nas` 7). HTTP 200 local/LAN/proxy
+throughout. The `filebrowser_health` runbook now reports plain "running and
+serving HTTP 200" with no degraded-share note. Reliability stays 95.
+
+**Found, deliberately not fixed:** `asus:/etc/fstab` lines 15 and 19 fail to
+parse — `//192.168.1.63/Zion Cinema` and `//192.168.1.63/Folder 1` have
+unescaped spaces (CIFS needs `\040`), so those two NAS shares never mount at
+boot on asus. It is asus-side media, unrelated to the Unicron share, and
+touching it risks that machine's own services. Logged in the backlog.
+
+---
+
 ## Filebrowser production failure — stale FUSE mountpoint
 
 **DONE — 2026-08-09.**
