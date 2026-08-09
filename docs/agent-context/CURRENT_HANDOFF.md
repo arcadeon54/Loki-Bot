@@ -1,8 +1,47 @@
 # CURRENT HANDOFF
 
-*Updated 2026-08-06 12:0x UTC. Keep this under a minute to read.*
+*Updated 2026-08-09 02:4x UTC. Keep this under a minute to read.*
 
 ## Just completed
+
+**Reliability reconciled against real production state — DONE 2026-08-09.**
+Reliability **60 → 87**, and every remaining point is a real impairment.
+
+*Four unclosed solve-path records — all stale, none unfinished.* #12/#13/#14
+were three copies of one 2026-07-27 intent ("Tracearr Redis backend down"), all
+concluding "none performed" because Loki had no NAS access then; that gap was
+closed the same day (16b2178) and read-only `tracearr_dependencies` now shows
+tracearr/redis/postgres all healthy, restart_count 0, UI HTTP 200. #15 was the
+qBittorrent WebUI run that timed out; the real cause (`mem_limit`, cgroup OOM)
+was found and fixed the next day in 8f1f511, WebUI HTTP 200. All four closed
+through `skillkit resolve-incident` with written evidence. Zero open records.
+
+*Two stopped containers — one deliberate, one genuinely broken.*
+`loki-joplin-api` is `restart: no`, the obsolete CLI sidecar; it no longer
+costs anything. **`filebrowser` is a real open failure** and keeps its 8
+points: `restart: unless-stopped`, down since 2026-08-03, and it has failed to
+start across two reboots with `error while creating mount source path
+'/mnt/unicron-downloads': mkdir ... file exists`. NOT fixed here — out of
+scope, and starting it to green the score was explicitly off the table.
+
+*Hermes provider — expected protective degradation, not an outage.* Verified
+non-billably (bridge `GET /health` = ok; OpenRouter `/credits` = 20 granted /
+20.028 used). The account really is out of credit; the 402 from 2026-08-07 is
+current, not stale. The circuit's cooldown expired 2026-08-07 07:17 UTC, so it
+blocks nothing now — it simply has not been probed, and only a real submit can
+probe a billing-class open. **This needs a Boss billing decision, not a
+repair.** Costs 5, not 12.
+
+Code: `advisor.classify_stopped` / `_retired_container_names` /
+`is_protective_fault`, `reporting.stopped_split`, new `terms` split, and
+`incidents.resolve_superseded()` wired into `orchestrator.report()` so a solved
+run closes the records it finished. 25 tests in
+`tests/test_reliability_state.py`; `test_daily_briefing` still green (27).
+See DECISIONS.md — the semantics are settled.
+
+Noticed, not acted on: the NAS runs **Tracearr v2.0.1** while
+`config/homelab_assets.yml` still pins v1.5.0 (watchtower). Registry drift, not
+a fault.
 
 **Daily Briefing semantics repair — DONE 2026-08-08 (skillkit repo).** The
 briefing was contradicting itself: Reliability was amplified by repeat
@@ -80,7 +119,11 @@ presence notification passthrough (`ede172d`).
 
 ## Next active task
 
-**None assigned.** The RAZR Phase-1 storage capacity recovery is complete.
+**None assigned.** The Reliability reconciliation is complete.
+
+Two things it surfaced and deliberately left alone: `filebrowser`'s
+`/mnt/unicron-downloads` mount conflict on dex247, and the OpenRouter credit
+top-up. Neither is authorized to start.
 
 If the Boss wants the next thing from the backlog, `docs/NEXT_STEPS.md` is the
 ordered list. The **weekly Discord export 403** (bot lacks channel permission — needs a Boss-side Discord change, not code) is the last remaining broken item. It is not authorized to start without the Boss saying so.

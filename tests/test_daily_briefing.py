@@ -277,7 +277,10 @@ class TestOccurrencesDoNotAmplify(unittest.TestCase):
         self.assertNotIn("recent", [t["name"] for t in b["terms"]])
 
         text = reporting.reliability_explainer(facts)
-        self.assertIn("12×1 open monitor faults", text)
+        # 'open service faults', not 'open monitor faults': the term now
+        # excludes protective degradation, which is charged separately.
+        # See tests/test_reliability_state.py.
+        self.assertIn("12×1 open service faults", text)
         self.assertIn(str(b["score"]), text)
 
     def test_stale_solve_path_records_cannot_sink_reliability(self):

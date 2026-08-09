@@ -137,6 +137,41 @@ agent worked on something, not that the homelab broke. It is reported
 separately and weighted lower (3 each, capped at 15) so stale records cannot
 read as outages. Do not merge the two schemas.
 
+## Reliability penalises impairment, not state that merely looks bad
+
+Three penalties were firing for things that were not impairments, so the score
+had to learn the difference between "not running" and "broken":
+
+**Desired state is read, never guessed.** A stopped container costs 8 points
+only if the deployment expects it up. Evidence is the container's own Docker
+`RestartPolicy` (`always`/`unless-stopped`/`on-failure` = expected) plus the
+asset lifecycle registry's `expected_running` and `cleanup_scope_json.container`
+(a retired asset is excused). `restart: no` + exit 0 is a finished one-shot;
+`restart: no` + non-zero is intentionally stopped. This replaced a hard-coded
+`"ivn-site" not in s` exclusion. When desired state is unavailable the container
+counts as expected-to-run — a collector failure must never erase a penalty.
+
+**Protective degradation is charged, but not as an outage.** An open
+`hermes-provider` fault whose diagnosis matches the billing vocabulary
+(quota/insufficient/credit/billing/payment/402 — the same words
+`hermes_guard.classify()` uses) is the cost circuit doing its job: escalation
+capability really is lost, so it costs 5, but nothing is broken and no repair
+applies. A provider that is *unreachable* is not protective and keeps the full
+12. `advisor.is_protective_fault()` owns this and the synthesis prompt forbids
+recommending a repair for it.
+
+**Bookkeeping closes itself.** `incidents.resolved` was written once, at record
+time, from the status of the run that wrote it — so a run that timed out left an
+open row forever, even after a later run fixed the same thing. A `solved` run
+now closes earlier open records with the same repair *signature* via
+`incidents.resolve_superseded()`. Signature, never service or symptom text: a
+signature only exists when real mutating steps ran, so an empty one closes
+nothing. Records from runs that mutated nothing stay open for an operator and
+`skillkit resolve-incident`.
+
+Guarded by `tests/test_reliability_state.py`. The number does not need to be
+100; it needs every deduction to name a real impairment.
+
 ## Briefing severity is deterministic; the LLM only narrates it
 
 `reporting.disk_status()` classifies each host once against the monitor's real
