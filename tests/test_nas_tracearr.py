@@ -1190,3 +1190,117 @@ class OwnerIdMisconfigurationIsNotBoss(unittest.TestCase):
             self.assertEqual(t.user_level(""), "everyone")
         finally:
             t.OWNER_USER_ID = real_owner
+
+
+# ── Registry reconciliation: the drift itself, and what it would have broken ─
+class RegistryMatchesLiveTracearrVersion(unittest.TestCase):
+    """`config/homelab_assets.yml` pinned v1.5.0 while production was verified
+    live (via the dispatcher, independently of this repo) on v2.0.1 — a MAJOR
+    version watchtower applied outside Loki's approval gate. Reconciled
+    2026-08-09. These pin the two things that actually mattered:
+
+    check_upstream() reads `asset.get("version")` directly for every
+    downgrade/update-available decision. Left stale, it would have reported a
+    false 'update available' against an already-current deployment, and could
+    have failed to flag a genuine downgrade proposal as one. Neither is
+    hypothetical — both are exercised below against the REAL registry entry
+    (the test module's isolated copy, per the class docstring on `PINNED`
+    above), not a fixture standing in for it.
+    """
+
+    def _installed(self):
+        asset = nm._reg().get("tracearr") or {}
+        self.assertTrue(asset, "tracearr not found in the loaded registry")
+        return asset
+
+    def test_registry_no_longer_reports_the_stale_v1_5_0(self):
+        asset = self._installed()
+        self.assertEqual(asset.get("version"), "v2.0.1",
+                         "registry drifted again — reconcile against live "
+                         "tracearr_status before editing this back")
+        self.assertNotEqual(asset.get("version"), "v1.5.0")
+
+    def test_a_verified_upstream_match_reports_no_false_drift(self):
+        """Registry says v2.0.1; upstream's newest stable is also v2.0.1 (the
+        exact scenario that existed before reconciliation). Must not claim an
+        update is available for a deployment that is already current."""
+        asset = self._installed()
+
+        async def http_json(session, url, headers, timeout=12):
+            return [{"tag_name": "v2.0.1", "prerelease": False, "draft": False},
+                    {"tag_name": "v1.5.0", "prerelease": False, "draft": False}]
+
+        async def digest(session, repo, tag):
+            return asset["image_digest"]
+
+        with mock.patch.object(nm, "_http_json", http_json), \
+             mock.patch.object(nm, "_registry_digest", digest):
+            out = run(nm.check_upstream(asset, None))
+        self.assertEqual(out["latest_stable_version"], "v2.0.1")
+        self.assertFalse(out["update_available"],
+                         "false drift: reported an update for an "
+                         "already-current v2.0.1 deployment")
+        self.assertNotIn("is_downgrade", out)
+
+    def test_a_genuine_newer_release_is_still_detected_from_v2_x(self):
+        """The generic comparison must keep working forward from v2.x, not
+        just at the exact version this reconciliation landed on."""
+        asset = dict(self._installed())
+
+        async def http_json(session, url, headers, timeout=12):
+            return [{"tag_name": "v2.1.0", "prerelease": False, "draft": False},
+                    {"tag_name": "v2.0.1", "prerelease": False, "draft": False}]
+
+        async def digest(session, repo, tag):
+            return "sha256:" + "c" * 64
+
+        with mock.patch.object(nm, "_http_json", http_json), \
+             mock.patch.object(nm, "_registry_digest", digest):
+            out = run(nm.check_upstream(asset, None))
+        self.assertEqual(out["latest_stable_version"], "v2.1.0")
+        self.assertTrue(out["update_available"])
+        self.assertFalse(out.get("is_downgrade"))
+
+    def test_v2_x_installed_never_yields_a_silent_v1_5_0_proposal(self):
+        """v1.5.0 appears in this codebase only as illustrative example text
+        in tool parameter descriptions (see nas_maint.py's `tracearr_update`
+        registration) — never as comparison logic. With v2.0.1 installed and
+        v1.5.0 sitting upstream as an old tag, taking 'latest' must resolve to
+        the newest release, never fall back to v1.5.0; and if v1.5.0 is ever
+        named explicitly as a target, it must come back flagged as a
+        downgrade, not a plain update, so it can never be approved by
+        accident."""
+        import tools
+        spec = tools.REGISTRY["tracearr_update"]
+        version_param = spec.parameters["properties"]["version"]
+        self.assertNotIn("version", spec.parameters.get("required") or [],
+                         "'version' must stay optional — a required v1.5.0-"
+                         "shaped default would silently pin an old release")
+        self.assertNotIn("default", version_param,
+                         "the version param must carry no default at all, "
+                         "let alone the v1.5.0 used only as example text")
+
+        asset = dict(self._installed())
+
+        async def http_json(session, url, headers, timeout=12):
+            return [{"tag_name": "v2.0.1", "prerelease": False, "draft": False},
+                    {"tag_name": "v1.5.0", "prerelease": False, "draft": False},
+                    {"tag_name": "v1.4.27", "prerelease": False, "draft": False}]
+
+        async def digest(session, repo, tag):
+            return asset["image_digest"] if tag.lstrip("v") == "2.0.1" \
+                else "sha256:" + "d" * 64
+
+        with mock.patch.object(nm, "_http_json", http_json), \
+             mock.patch.object(nm, "_registry_digest", digest):
+            unpinned = run(nm.check_upstream(asset, None))
+            self.assertEqual(unpinned["latest_stable_version"], "v2.0.1",
+                             "taking 'latest' must never resolve to the old "
+                             "v1.5.0 tag while a newer v2.x release exists")
+
+            pinned = run(nm.check_upstream(asset, None, "v1.5.0"))
+        self.assertTrue(pinned["update_available"])
+        self.assertTrue(pinned.get("is_downgrade"),
+                        "a v1.5.0 target against v2.0.1 installed MUST be "
+                        "flagged as a downgrade, never proposed as a plain "
+                        "update the Boss could approve without noticing")

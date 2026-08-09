@@ -127,9 +127,14 @@ Loki has **no shell** on the NAS. Every operation goes through the dispatcher:
 Compose project `tracearr`, file `/volume2/tracearr/docker-compose.yml`,
 network `tracearr_tracearr-network`:
 
-- `tracearr` — app, **v1.5.0**, `172.19.0.4`, port 3000→3001
-- `tracearr-redis` — service `redis`, `172.19.0.2`… `172.19.0.3`
-- `tracearr-db` — TimescaleDB, service `timescale`, `172.19.0.2`
+- `tracearr` — app, **v2.0.1**, `172.19.0.4`, port 3000→3001
+- `tracearr-redis` — service `redis`, `172.19.0.2`
+- `tracearr-db` — TimescaleDB, service `timescale`, `172.19.0.3`
+
+Watchtower on the NAS updates Tracearr independently of Loki's approval-gated
+path (`updates.applied_by: watchtower-on-nas`); v1.5.0 → v2.0.1 happened this
+way on 2026-08-07. Registry reconciled to match 2026-08-09 — see
+`docs/agent-context/COMPLETED_WORK.md`.
 
 ### Two NAS traps
 

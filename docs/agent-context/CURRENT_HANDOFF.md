@@ -1,11 +1,49 @@
 # CURRENT HANDOFF
 
-*Updated 2026-08-09 04:2x UTC. Keep this under a minute to read.*
+*Updated 2026-08-09 04:4x UTC. Keep this under a minute to read.*
 
 ## Just completed
 
-**Nextcloud private-download links — DONE 2026-08-09. NEEDS A RESTART TO GO
-LIVE** (not taken; `loki.service` restarts are approval-gated).
+**Tracearr registry drift reconciled — DONE 2026-08-09.** Not an upgrade —
+production was already on v2.0.1; only `config/homelab_assets.yml` still
+claimed v1.5.0. Verified live and independently through the dispatcher before
+touching anything: `tracearr_status` and `tracearr_dependencies` both confirm
+`org.opencontainers.image.version: v2.0.1`, digest
+`sha256:3d57d9b032b4a...`, container recreated 2026-08-07T18:46:50Z,
+`health: healthy`, `restart_count: 0` on all three containers (app, redis,
+timescale). `watchtower_enabled` labels weren't readable, but watchtower is
+confirmed running on the NAS (`up 3 days`) and the registry already recorded
+`updates.applied_by: watchtower-on-nas` — this is the already-tracked
+`watchtower → monitor-only` backlog item doing exactly what it's known to do:
+auto-updating outside Loki's approval gate. Not reopened, not re-litigated.
+
+Registry updated to match: `version: v2.0.1`, digest confirmed correct (this
+value was already sitting uncommitted in the working tree since before this
+session — verified independently rather than trusted). Also found and fixed
+while in this block: `dependencies.redis.container_ip` and
+`dependencies.postgres.container_ip` were **swapped** (`.3`/`.2` reversed vs.
+live `.2`/`.3`) — not used by any code path, cosmetic-only, but wrong. Added a
+dated addendum to `known_issues.restart_churn` noting all its forensic
+evidence predates the v2.0.1 recreate and that `restart_count` resetting to 0
+is not proof the app-side defect is fixed — just that the counter restarted.
+
+`check_upstream()` in `nas_maint.py` reads `asset.get("version")` directly for
+downgrade/update-available comparisons — this is *why* the drift mattered
+beyond cosmetics: uncorrected, it would have reported a false "update
+available" against an already-current deployment, or failed to flag a real
+downgrade. `_parse_stable`/`_registry_tag`/`check_upstream` themselves are
+version-generic and needed no code change; confirmed with 4 new tests that a
+v2.x installed version compares correctly and never proposes a v1.5.0
+rollback. 110 tests in `tests/test_nas_tracearr.py`.
+
+Docs updated: `HOMELAB_INVENTORY.md`, `PROJECT_STATE.md`, the
+`nas-maintenance` skill (version + IPs + restart-churn caveat +
+"v2.x already live" note), and the two "not acted on" mentions in this file's
+older entries — pointers added, history not rewritten.
+
+**Nextcloud private-download links — DONE 2026-08-09, LIVE.** Restart approved
+and taken (PID 519704 → 549054, 04:21:20 UTC); config confirmed bound
+correctly under the live process's own bare-environment import order.
 
 Recipients were DM'd `http://192.168.1.63:8082/s/<token>` — RFC1918, unopenable
 outside the LAN. Two root causes, and the second was worse than the reported
@@ -175,9 +213,9 @@ run closes the records it finished. 25 tests in
 `tests/test_reliability_state.py`; `test_daily_briefing` still green (27).
 See DECISIONS.md — the semantics are settled.
 
-Noticed, not acted on: the NAS runs **Tracearr v2.0.1** while
-`config/homelab_assets.yml` still pins v1.5.0 (watchtower). Registry drift, not
-a fault.
+Noticed, not acted on at the time: the NAS runs **Tracearr v2.0.1** while
+`config/homelab_assets.yml` still pinned v1.5.0 (watchtower). Registry drift,
+not a fault. **Reconciled 2026-08-09 — see the top of this file.**
 
 **Daily Briefing semantics repair — DONE 2026-08-08 (skillkit repo).** The
 briefing was contradicting itself: Reliability was amplified by repeat
@@ -251,7 +289,8 @@ presence notification passthrough (`ede172d`).
 - `loki-joplin-desktop.service` — active, Data API on 127.0.0.1:41184.
 - `loki-homelab-api.service` — active (read-only Hermes interface).
 - Hermes guard — circuit closed, 0/6 per hour, 0/20 per day, $0.00/$5.00.
-- Tracearr — v1.5.0 on the NAS, pinned by digest in `config/homelab_assets.yml`.
+- Tracearr — v2.0.1 on the NAS, pinned by digest in `config/homelab_assets.yml`
+  (watchtower-applied 2026-08-07, registry reconciled 2026-08-09).
 
 ## Next active task
 

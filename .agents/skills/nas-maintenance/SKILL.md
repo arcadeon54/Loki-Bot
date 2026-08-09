@@ -57,9 +57,18 @@ as precise errors from `_classify_ssh_failure` — read them rather than guessin
 Compose project `tracearr`, `/volume2/tracearr/docker-compose.yml`, network
 `tracearr_tracearr-network`:
 
-- `tracearr` — app, **v1.5.0**, `172.19.0.4`, port 3000→3001
-- `tracearr-redis` — service `redis`
-- `tracearr-db` — TimescaleDB, service `timescale`
+- `tracearr` — app, **v2.0.1**, `172.19.0.4`, port 3000→3001
+- `tracearr-redis` — service `redis`, `172.19.0.2`
+- `tracearr-db` — TimescaleDB, service `timescale`, `172.19.0.3`
+
+Version drift is expected, not a bug: **watchtower on the NAS auto-updates
+Tracearr independently of Loki's approval-gated path** (registry:
+`updates.applied_by: watchtower-on-nas`; see the tracked backlog item
+`watchtower → monitor-only`). v1.5.0 → v2.0.1 happened this way on
+2026-08-07 — a MAJOR bump watchtower applied without approval. Reconciled in
+`config/homelab_assets.yml` 2026-08-09; verify against live
+`tracearr_status`/`tracearr_dependencies` rather than trusting this file if
+they ever disagree (source-of-truth precedence in `AGENTS.md`).
 
 ### The update path — DONE, do not redesign
 
@@ -100,12 +109,18 @@ against `docker buildx imagetools inspect`'s `Digest:` line.
 
 ## Open, deliberately unfixed
 
-- **Tracearr restart churn** — `restart_count` 268 and climbing (bursty, ~2
-  restarts in 78s at times) while Redis and Postgres sit at 0. App-side, cause
-  unproven, **no automatic repair by design**.
+- **Tracearr restart churn** — evidence (`restart_count` 268, bursty, ~2
+  restarts in 78s at times, Redis/Postgres steady at 0) is from the v1.5.0
+  deployment. watchtower's 2026-08-07 recreate onto v2.0.1 reset
+  `restart_count` to 0; that is not proof the app-side defect is fixed, only
+  that the counter restarted. App-side, cause unproven, **no automatic repair
+  by design**. Re-open with fresh evidence if churn resumes.
 - **`/home/unimatrix_001` is mode 0777** — a real security issue needing a
   tested remediation.
-- **Tracearr v2.x** — a separate evaluation, deliberately not scheduled.
+- **Tracearr is already on v2.x** (v2.0.1, applied by watchtower, not by any
+  Loki-orchestrated evaluation) — a deliberate compatibility/feature review of
+  v2.x is still not scheduled; this only reconciles the registry to match what
+  is actually running.
 
 ## Completion criteria
 

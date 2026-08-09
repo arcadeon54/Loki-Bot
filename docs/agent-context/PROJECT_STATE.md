@@ -53,7 +53,9 @@ Career-Ops monitor online — poll every 60s
 ## Asset health
 
 - **BLACK-BOXX** — 17/17 checks green, 0 advisories.
-- **Tracearr** — v1.5.0, pinned by digest. Restart churn open and unrepaired.
+- **Tracearr** — v2.0.1, pinned by digest (watchtower applied 2026-08-07,
+  registry reconciled 2026-08-09). Restart churn evidence predates v2.0.1 and
+  is unrepaired/unreconfirmed.
 - **Immich** — v3.0.3, which IS the latest stable. Nothing to update.
 - **Joplin** — desktop sidecar authoritative; CLI container obsolete/stopped.
 - **Filebrowser** — running + healthy since 2026-08-09, `media.ivn-group.cc`

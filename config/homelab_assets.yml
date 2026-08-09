@@ -371,9 +371,9 @@ assets:
       network: tracearr_tracearr-network
       container_ip: 172.19.0.4
       restart_policy: unless-stopped
-    version: v1.5.0
+    version: v2.0.1
     # Digest actually running as of discovery; an update must change this.
-    image_digest: sha256:2b6aca8d86126bb57211f54f1a34e9d8292ad0d783dbc48015452b2af1b9fe3c
+    image_digest: sha256:3d57d9b032b4a57919c48c919c16c3d6640b83f9116feb2c2cdf907747702ec8
     updates:
       # Authoritative upstream feed. A digest match against the CONFIGURED pin
       # proves deployment consistency only — never that the pin is current.
@@ -385,6 +385,12 @@ assets:
       applied_by: watchtower-on-nas
     known_issues:
       restart_churn:
+        # All evidence below is from the v1.5.0 deployment (2026-07-27). The
+        # app was recreated on v2.0.1 by watchtower on 2026-08-07, which
+        # resets restart_count to 0 regardless of whether the app-side defect
+        # was fixed upstream — 0 restarts since is NOT proof of a fix, it is
+        # too short a window and too coarse a signal to conclude anything.
+        # Re-open this record with fresh evidence if churn resumes on v2.0.1.
         status: root_cause_identified
         classification: application_bug
         confidence: high
@@ -489,14 +495,14 @@ assets:
         container: tracearr-redis
         compose_service: redis
         image: redis:8-alpine
-        container_ip: 172.19.0.3
+        container_ip: 172.19.0.2
         network_aliases: [redis, tracearr-redis]
         health_field: redis        # key in Tracearr's /health payload
       postgres:
         container: tracearr-db
         compose_service: timescale
         image: timescale/timescaledb-ha:pg18.1-ts2.25.0
-        container_ip: 172.19.0.2
+        container_ip: 172.19.0.3
         network_aliases: [timescale, tracearr-db]
         health_field: db
 

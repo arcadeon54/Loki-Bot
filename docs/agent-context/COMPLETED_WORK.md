@@ -7,6 +7,80 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## Tracearr registry version drift
+
+**DONE — 2026-08-09.** Not an upgrade — no update, restart, recreate, or pull
+was performed. Tracearr was already healthy on v2.0.1; only
+`config/homelab_assets.yml` still described it as v1.5.0.
+
+**Verification came first, and independently.** `config/homelab_assets.yml`
+already had an uncommitted edit to `v2.0.1`/the correct digest sitting in the
+working tree (present since before this session — visible in every earlier
+`git status` this session as "pre-existing drift"). That value was **not**
+trusted on sight. Queried live through the restricted NAS dispatcher instead:
+
+- `tracearr_status` — `org.opencontainers.image.version: v2.0.1`, image
+  `ghcr.io/connorgallopo/tracearr@sha256:3d57d9b032b4a...`, `state: running`,
+  `health: healthy`, `restart_count: 0`, container created
+  `2026-08-07T18:46:50Z`.
+- `tracearr_dependencies` — redis (`tracearr-redis`) and postgres
+  (`tracearr-db`, TimescaleDB) both `running`/`healthy`/`restart_count: 0`.
+- `container_inventory` — confirms `watchtower` running on the NAS
+  (`up 3 days`), long enough to have performed the 2026-08-07 recreate.
+
+The uncommitted value matched exactly. **Why it happened**, without reopening
+the closed v1.5.0 investigation: the registry already recorded
+`updates.applied_by: watchtower-on-nas` — Tracearr updates on the NAS are
+watchtower's job, not Loki's approval-gated path. This is the already-tracked
+`watchtower → monitor-only` backlog item behaving exactly as documented: a
+MAJOR version bump landed without going through approval. Not new, not
+re-investigated — just the explanation for how a v1.5.0 registry became stale.
+
+**Why this was not merely cosmetic.** `check_upstream()` in `nas_maint.py`
+derives "installed version" straight from `asset.get("version")` for every
+downgrade/update-available decision. Left uncorrected, a future
+`tracearr_update_check` would have compared upstream releases against the
+stale v1.5.0 and reported a false "update available" for an already-current
+deployment — or, worse, failed to flag a real downgrade if someone ever
+proposed reverting toward v1.5.0, because the registry would have shown no
+apparent version change.
+
+**Changes to `config/homelab_assets.yml`** (tracearr block only):
+
+1. `version`/`image_digest` — confirmed correct, left as `v2.0.1` /
+   `sha256:3d57d9b032b4a...`.
+2. `dependencies.redis.container_ip` and `dependencies.postgres.container_ip`
+   were **swapped** relative to live state (`.3`/`.2` reversed vs. actual
+   `.2`/`.3`) — a separate, unrelated inaccuracy found while verifying this
+   same block. Not used by any code path (grepped clean), so zero functional
+   impact, but wrong is wrong. Corrected.
+3. `known_issues.restart_churn` — added a dated addendum, not a rewrite: all
+   the forensic evidence in that block is from the v1.5.0 deployment
+   (2026-07-27), and `restart_count` resetting to 0 at the 2026-08-07 recreate
+   is not proof the app-side defect was fixed — only that the counter
+   restarted. The original evidence is untouched.
+
+**Update-workflow logic required no code change.** `_parse_stable`,
+`_registry_tag`, and `check_upstream` already reason generically from
+semver-parsed tuples, not from any hardcoded target version — the v1.5.0
+strings that do appear in `nas_maint.py` are illustrative examples in tool
+parameter descriptions, never comparison logic. Confirmed rather than assumed:
+4 new tests in `tests/test_nas_tracearr.py` prove a v2.x installed version (a)
+is detected as current against a v2.x upstream release, (b) correctly flags a
+genuine v1.x target as a downgrade, and (c) never proposes a v1.5.0 rollback
+just because that string appears elsewhere in the codebase as an example.
+110 tests total in the module, all green.
+
+Docs updated to match: the `nas-maintenance` skill (version, corrected IPs,
+restart-churn caveat, "v2.x already live via watchtower, not evaluation"),
+`HOMELAB_INVENTORY.md`, `PROJECT_STATE.md`, and the two "noticed, not acted
+on" mentions already sitting in `CURRENT_HANDOFF.md` — pointed forward to this
+entry rather than rewritten. `TASK_LEDGER.md` backlog row for "Tracearr v2.x"
+corrected to reflect that v2.0.1 is already running, not merely a possible
+future evaluation.
+
+---
+
 ## Nextcloud private-download delivery — public share links
 
 **DONE — 2026-08-09.** Requires a `loki.service` restart to take effect; not
