@@ -1,8 +1,62 @@
 # CURRENT HANDOFF
 
-*Updated 2026-08-09 02:4x UTC. Keep this under a minute to read.*
+*Updated 2026-08-09 03:2x UTC. Keep this under a minute to read.*
 
 ## Just completed
+
+**Filebrowser restored — DONE 2026-08-09.** Reliability **87 → 95**; the
+8-point deduction cleared because the container is up, not because anything
+was reclassified.
+
+*Root cause: a stale FUSE endpoint, not a path conflict.* sshfs to unicron
+died without unmounting on 2026-08-03, leaving `/mnt/unicron-downloads` as a
+dead mountpoint — the dentry still resolves but every syscall returns
+`ENOTCONN`. Docker creates missing bind sources with `mkdir`, `mkdir` on a
+dead mountpoint returns `EEXIST`, and that is the whole of the misleading
+`mkdir /mnt/unicron-downloads: file exists`. Nothing was "in the way".
+
+*Why it never self-healed.* `sshfs-unicron.service` remounts the same path, so
+its own mount hit the identical `ENOTCONN` and it looped — **111,286 failed
+starts in the previous boot, 2,861 more since**. The mountpoint stayed wedged,
+so every reboot re-failed the bind. Two independent faults, both real:
+the stale endpoint (deadlock) and a **dead address** — the unit pointed at
+tailnet IP `100.115.240.16`, which no longer exists. The `asus`/unicron box was
+rebuilt: it is now `100.101.112.55` (LAN 192.168.1.247) with a **different SSH
+host key**, and `~/.ssh/id_ed25519` is no longer in its `authorized_keys`.
+
+*Durable repair.* Cleared the endpoint (`fusermount3 -u -z`; the underlying
+directory was empty, nothing preserved). `sshfs-unicron.service` now runs
+`ExecStartPre=-/bin/fusermount3 -u -z` so a dropped connection self-heals
+instead of wedging, targets MagicDNS `asus.tail3744e0.ts.net` instead of a
+hardcoded IP, is ordered `Before=docker.service`, and backs off
+(`RestartSteps=5`, `RestartMaxDelaySec=300` — verified: retries went 10s →
+5min). The three network binds in `docker/filebrowser/docker-compose.yml` are
+now `rslave`, proven end-to-end: a mount appearing on the host shows up inside
+the running container with no recreate.
+
+*Verified.* Container up + healthy, `RestartCount=0`, survives
+`--force-recreate`. HTTP 200 on localhost:8090, LAN 192.168.1.155, tailnet, and
+`https://media.ivn-group.cc` (valid TLS, HTTP→HTTPS 301). Auth intact: bad
+creds 403, unauthenticated API 401. `/srv/dex247` 28 entries, `/srv/nas` all 7
+cifs shares populated, `/srv/nextcloud` mounted.
+
+**One thing needs the Boss, and only one.** `/srv/unicron` is empty because
+sshfs cannot authenticate to the rebuilt asus box. Re-adding
+`~/.ssh/id_ed25519.pub` to `asus@`'s `authorized_keys` needs password or
+console access to that machine — a credential I do not have. **This does not
+affect filebrowser's health**: the bind succeeds against an empty directory,
+the service is up, and the runbook reports it as degraded-share, not outage.
+The moment the key works the share appears (rslave) with no restart.
+
+New: `maintenance_runbooks/filebrowser_health.py` + registry entry, and
+`Ops.path_meta()` now returns `errno`/`stale_mount` so ENOTCONN is
+distinguishable from a missing path. The runbook **refuses to restart into a
+stale mountpoint** (clearing one is `filesystem_repair`, MANUAL) and never
+scores an unmounted share as a service outage. 23 tests in
+`tests/test_filebrowser_runbook.py`; verified live read-only against the real
+deployment.
+
+## Previously completed
 
 **Reliability reconciled against real production state — DONE 2026-08-09.**
 Reliability **60 → 87**, and every remaining point is a real impairment.
@@ -18,11 +72,12 @@ through `skillkit resolve-incident` with written evidence. Zero open records.
 
 *Two stopped containers — one deliberate, one genuinely broken.*
 `loki-joplin-api` is `restart: no`, the obsolete CLI sidecar; it no longer
-costs anything. **`filebrowser` is a real open failure** and keeps its 8
-points: `restart: unless-stopped`, down since 2026-08-03, and it has failed to
-start across two reboots with `error while creating mount source path
-'/mnt/unicron-downloads': mkdir ... file exists`. NOT fixed here — out of
-scope, and starting it to green the score was explicitly off the table.
+costs anything. **`filebrowser` was a real open failure** and kept its 8
+points: `restart: unless-stopped`, down since 2026-08-03, failing to start
+across two reboots with `error while creating mount source path
+'/mnt/unicron-downloads': mkdir ... file exists`. Not fixed in that pass — out
+of scope, and starting it to green the score was explicitly off the table.
+*Repaired 2026-08-09; see the top of this file for the root cause.*
 
 *Hermes provider — expected protective degradation, not an outage.* Verified
 non-billably (bridge `GET /health` = ok; OpenRouter `/credits` = 20 granted /
@@ -122,8 +177,13 @@ presence notification passthrough (`ede172d`).
 **None assigned.** The Reliability reconciliation is complete.
 
 Two things it surfaced and deliberately left alone: `filebrowser`'s
-`/mnt/unicron-downloads` mount conflict on dex247, and the OpenRouter credit
-top-up. Neither is authorized to start.
+`/mnt/unicron-downloads` mount conflict on dex247 (**repaired 2026-08-09**),
+and the OpenRouter credit top-up (still open — a Boss billing decision).
+
+One item is waiting on the Boss and cannot be done from here: re-authorizing
+`~/.ssh/id_ed25519.pub` on the rebuilt `asus`/unicron box (100.101.112.55) so
+the `/mnt/unicron-downloads` sshfs share can mount again. Filebrowser is
+healthy without it; only `/srv/unicron` is empty.
 
 If the Boss wants the next thing from the backlog, `docs/NEXT_STEPS.md` is the
 ordered list. The **weekly Discord export 403** (bot lacks channel permission — needs a Boss-side Discord change, not code) is the last remaining broken item. It is not authorized to start without the Boss saying so.

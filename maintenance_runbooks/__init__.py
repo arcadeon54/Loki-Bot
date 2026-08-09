@@ -14,12 +14,13 @@ Registration is by module name — the asset registry's `runbook:` field names
 the module here. Adding a runbook = adding a module + listing it in RUNBOOKS.
 """
 
-from . import (black_boxx_connectivity, jellyfin_health, immich_status,
-               joplin_sync, loki_interfaces, stateless_container,
-               qbittorrent_health)
+from . import (black_boxx_connectivity, filebrowser_health, jellyfin_health,
+               immich_status, joplin_sync, loki_interfaces,
+               stateless_container, qbittorrent_health)
 
 RUNBOOKS = {
     black_boxx_connectivity.NAME: black_boxx_connectivity.run,
+    filebrowser_health.NAME: filebrowser_health.run,
     jellyfin_health.NAME: jellyfin_health.run,
     immich_status.NAME: immich_status.run,
     joplin_sync.NAME: joplin_sync.run,

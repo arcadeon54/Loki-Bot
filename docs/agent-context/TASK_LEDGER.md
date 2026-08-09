@@ -17,6 +17,7 @@ result and the local commit.
 | 9 | Google Sheets export | **DONE** 2026-08-06 | Reliable sync queue, no data loss on failure, idempotency maintained | Durable queue reading `sheets_ok=0` from SQLite |
 | 10 | qBittorrent recurring connectivity | **DONE** 2026-08-06 | Root cause proven, durable fix applied, LAN+proxy+nzb360 stable beyond recurrence window | Removed `mem_limit: 1g` from compose; `qbittorrent_health` runbook added |
 | 11 | RAZR disk growth / Phase-1 capacity recovery | **DONE** 2026-08-08 | Root at 78%→29%; LV extended online (100→235 GiB), orphan blob removed, caches cleaned | `lvextend`+`resize2fs` online; no downtime |
+| 12 | Filebrowser production failure | **DONE** 2026-08-09 | Root cause proven, durable repair, container up, storage accessible, HTTP/LAN/proxy verified, survives recreate, Loki sees it healthy, 8-point Reliability penalty clears naturally | Stale FUSE endpoint at `/mnt/unicron-downloads`, not a path conflict; `ExecStartPre` unmount + MagicDNS + `Before=docker.service` + backoff; `rslave` binds; `filebrowser_health` runbook, 23 tests. Reliability 87→95 |
 
 ## Backlog — not started, not authorized
 
@@ -29,6 +30,7 @@ result and the local commit.
 | Telegram voice messages | UNFINISHED | `_handle()` reads text/caption only |
 | Centralized Model Router | PLANNED | Design only. Requires explicit approval to start |
 | `/home/unimatrix_001` mode 0777 | UNFINISHED | NAS security issue, needs tested remediation |
+| unicron sshfs key re-authorization | BLOCKED ON BOSS | The `asus`/unicron box was rebuilt (new tailnet IP + host key); `~/.ssh/id_ed25519.pub` must be re-added to its `authorized_keys` from password/console access. Filebrowser is healthy without it — only `/srv/unicron` is empty |
 
 ## How to use this
 

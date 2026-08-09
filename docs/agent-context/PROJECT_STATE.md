@@ -48,6 +48,7 @@ Career-Ops monitor online — poll every 60s
 | `black-boxx-ap.service` | **enabled + active**, sole boot owner of `wg-ap` |
 | `canada-ap.service` | disabled + inactive (correct) |
 | `wg-quick@wg-ap` | **disabled** (still `active (exited)` until next boot — intended) |
+| `sshfs-unicron.service` | enabled; **failing on auth**, backing off to 5 min. Owns `/mnt/unicron-downloads`. Not a filebrowser fault — see below |
 
 ## Asset health
 
@@ -55,6 +56,33 @@ Career-Ops monitor online — poll every 60s
 - **Tracearr** — v1.5.0, pinned by digest. Restart churn open and unrepaired.
 - **Immich** — v3.0.3, which IS the latest stable. Nothing to update.
 - **Joplin** — desktop sidecar authoritative; CLI container obsolete/stopped.
+- **Filebrowser** — running + healthy since 2026-08-09, `media.ivn-group.cc`
+  HTTP 200. Three of four shares populated; `/srv/unicron` empty because sshfs
+  cannot authenticate to the rebuilt asus box.
+
+## Filebrowser storage topology (dex247)
+
+`filebrowser` publishes four host paths, and three of them are mounted by
+*other* units — which is the entire reason it broke:
+
+| Container path | Host source | Mounted by |
+|---|---|---|
+| `/srv/dex247` | `/home/g2k247/downloads` | local disk |
+| `/srv/unicron` | `/mnt/unicron-downloads` | `sshfs-unicron.service` (fuse.sshfs → `asus.tail3744e0.ts.net:/mnt/Disk1/downloads`) |
+| `/srv/nextcloud` | `/mnt/nextcloud-webdav` | davfs (fuse) |
+| `/srv/nas` | `/mnt/nas` | 7 cifs mounts from `/etc/fstab`, mounted *beneath* the bind |
+
+The three network shares use `bind.propagation: rslave`, so the container
+follows the host mount table instead of snapshotting it at create time. Root is
+`shared`, which is what makes that work. **Do not revert these to short-syntax
+binds** — without propagation, `/srv/nas` cannot see the per-share cifs mounts
+under it, and a share that reconnects stays invisible until the container is
+recreated.
+
+A dead FUSE daemon leaves the mountpoint resolvable but `ENOTCONN`, and
+Docker's `mkdir` on it returns `EEXIST` — reported as the misleading
+`mkdir <path>: file exists`. `sshfs-unicron.service` clears any stale endpoint
+in `ExecStartPre` before mounting; that is what stops it recurring.
 
 ## Working tree
 

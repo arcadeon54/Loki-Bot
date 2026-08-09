@@ -24,6 +24,7 @@ Boundaries (all enforced in code, not by prompt):
 """
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -366,7 +367,14 @@ class Ops:
                         "uid": st.st_uid, "gid": st.st_gid,
                         "entries": entries, "empty": empty}
             except OSError as e:
-                return {"exists": False, "error": type(e).__name__}
+                # ENOTCONN means the path IS a mountpoint whose FUSE daemon
+                # died — the dentry still exists, so every mkdir on it fails
+                # EEXIST and Docker refuses to create the bind. That reads
+                # nothing like a missing path and must never be repaired like
+                # one, so name it rather than flattening it to "error".
+                return {"exists": False, "error": type(e).__name__,
+                        "errno": e.errno,
+                        "stale_mount": e.errno == errno.ENOTCONN}
         return await asyncio.get_event_loop().run_in_executor(None, _stat)
 
     async def lease_meta(self, path: str) -> dict:

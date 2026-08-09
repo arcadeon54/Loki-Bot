@@ -7,6 +7,92 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## Filebrowser production failure — stale FUSE mountpoint
+
+**DONE — 2026-08-09.**
+
+Filebrowser was down from 2026-08-03 and re-failed identically across every
+reboot with:
+
+```
+error while creating mount source path '/mnt/unicron-downloads':
+mkdir /mnt/unicron-downloads: file exists
+```
+
+**Root cause — not a path conflict.** Nothing was occupying the path. sshfs to
+unicron died *without unmounting*, leaving a stale FUSE endpoint: the directory
+entry still resolves, but every syscall on it returns `ENOTCONN` ("Transport
+endpoint is not connected"). Docker creates missing bind sources with `mkdir`;
+`mkdir` on a dead mountpoint returns `EEXIST`. Docker reports `EEXIST` as
+"file exists". The container exited 128 at *create* time, so
+`restart: unless-stopped` never applied — `RestartCount` stayed 0.
+
+**Why it could never self-heal.** `sshfs-unicron.service` mounts that same
+path, so its mount hit the identical `ENOTCONN` and failed in ~2 ms. With
+`Restart=on-failure` / `RestartSec=10` it looped: **111,286 failed starts in the
+previous boot and 2,861 more since the 2026-08-08 reboot**. The mountpoint
+stayed wedged, so the bind failed again on every boot.
+
+**A second, independent fault.** The unit targeted tailnet IP
+`100.115.240.16`, where no node exists any more. The `asus`/unicron box was
+rebuilt: it is now `100.101.112.55` (LAN `192.168.1.247`) with a **different
+SSH host key**, and `~/.ssh/id_ed25519` is no longer in its `authorized_keys`.
+So even a clean mountpoint could not connect.
+
+**Repairs.**
+
+1. Cleared the stale endpoint with `fusermount3 -u -z`. The underlying
+   directory was empty (`g2k247:g2k247`, ext4) — nothing to preserve.
+2. `/etc/systemd/system/sshfs-unicron.service`:
+   - `ExecStartPre=-/bin/fusermount3 -u -z /mnt/unicron-downloads` — a dropped
+     connection now self-heals instead of wedging the mountpoint. **This is the
+     fix that stops the recurrence.**
+   - target changed from the dead IP to MagicDNS `asus.tail3744e0.ts.net`, so
+     tailnet IP churn cannot break it again.
+   - `Before=docker.service` — containers no longer bind the bare mountpoint
+     before the share lands. Ordering only; a failed mount never blocks Docker.
+   - `RestartSteps=5` / `RestartMaxDelaySec=300`. Verified: retries went from
+     every 10 s to every 5 min.
+3. `/home/g2k247/docker/filebrowser/docker-compose.yml` — the three network
+   binds converted to long syntax with `bind.propagation: rslave`. Proven
+   end-to-end with a throwaway tmpfs: a mount appearing on the host became
+   visible inside the *running* container, and vanished cleanly on unmount.
+
+**Verification.** Container running + healthy, `RestartCount=0`, survives
+`docker compose up -d --force-recreate` (previously impossible). HTTP 200 on
+`127.0.0.1:8090`, LAN `192.168.1.155:8090`, tailnet `100.68.187.69:8090`, and
+`https://media.ivn-group.cc` (valid TLS; HTTP→HTTPS 301). Auth intact: bad
+credentials 403, unauthenticated `/api/resources` 401. `/srv/dex247` 28
+entries, `/srv/nas` all 7 cifs shares populated, `/srv/nextcloud` mounted.
+Live Reliability recomputed **87 → 95**; `stopped_expected` is now empty and
+the only remaining deduction is the Hermes protective circuit. No incident
+existed in `homelab_incidents.db` to close.
+
+**New capability.** `maintenance_runbooks/filebrowser_health.py` plus a
+registry entry in `config/homelab_assets.yml`. `Ops.path_meta()` now returns
+`errno` and `stale_mount`, because without an errno a dead mountpoint is
+indistinguishable from a deleted directory and the two need opposite
+responses. The runbook:
+
+- **never restarts into a stale mountpoint** — the bind fails identically every
+  time, and clearing one needs root `fusermount3` (`filesystem_repair`,
+  MANUAL). It escalates naming the path, and does not spend its auto-repair.
+- **never scores an unmounted share as a service outage.** sshfs being down
+  leaves an empty directory that binds fine; filebrowser is healthy and
+  `/srv/unicron` is merely empty. Treating that as failed would re-earn the
+  8-point deduction for a *remote* host being offline.
+
+23 tests in `tests/test_filebrowser_runbook.py`; also verified live read-only
+against the real deployment.
+
+**Open, needs the Boss.** `/srv/unicron` stays empty until
+`~/.ssh/id_ed25519.pub` is re-added to `asus@`'s `authorized_keys` on the
+rebuilt box — that needs password or console access to it. Filebrowser's health
+does not depend on it, and when the key works the share appears via `rslave`
+with no restart.
+
+---
+
 ## RAZR Phase-1 Storage Capacity Recovery
 
 **DONE — 2026-08-08.**
