@@ -43,6 +43,15 @@ import aiohttp
 import google.generativeai as genai
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+# MUST run before any project module is imported. Several of them read their
+# configuration with os.getenv AT IMPORT TIME, and systemd starts this unit
+# with a bare environment (no EnvironmentFile), so a later load_dotenv() leaves
+# them pinned to their hard-coded fallbacks forever. That is exactly how
+# nextcloud_integration ended up talking to 192.168.1.247:8082 — the old
+# pre-rebuild asus box — instead of the NEXTCLOUD_URL in .env, and how
+# jd_integration ended up with empty MyJDownloader credentials.
+load_dotenv()
+
 from grammar_roast import maybe_grammar_roast
 import social_link_dedup
 try:
@@ -89,6 +98,8 @@ async def get_http_session() -> "aiohttp.ClientSession":
     return _http_session
 
 # ─── Load environment variables ───────────────────────────────────────────────
+# Already loaded above, before the project imports that read env at import time.
+# Kept as a no-op safety net for anything imported between here and there.
 load_dotenv()
 
 import sys as _sys
@@ -3603,19 +3614,19 @@ async def run_dm_download(url: str, message: discord.Message):
     count = len(local_files)
     await status_msg.edit(content=f"Got {count} file(s) -- uploading to Nextcloud...")
 
-    share_url, nc_folder = await nc_integration.upload_and_share(local_files, requester_name, date_str)
+    share = await nc_integration.upload_and_share(local_files, requester_name, date_str)
 
-    if not share_url:
+    if not share:
         await status_msg.edit(content="Nextcloud upload failed. Files may still be on dex247.")
         return
 
     file_word = "file" if count == 1 else f"{count} files"
     await status_msg.delete()
     await dm_channel.send(
-        f"Your {file_word} are ready:\n{share_url}\n\n"
+        f"Your {file_word} are ready:\n{share['url']}\n\n"
         "Want me to **delete** this from Nextcloud when you're done, or **keep** it?"
     )
-    _pending_nc_deletion[message.author.id] = {"nc_path": nc_folder, "count": count}
+    _pending_nc_deletion[message.author.id] = share
 
 
 async def run_download(url: str, requester: str, trigger_message: discord.Message | None = None, private: bool = False):
@@ -5912,12 +5923,20 @@ async def on_message(message: discord.Message):
         text_lower = message.content.lower().strip()
         if any(w in text_lower for w in ("delete", "remove", "yes", "yeah", "yep", "gone", "get rid", "kill it")):
             info = _pending_nc_deletion.pop(message.author.id)
-            ok = await nc_integration.delete_nc_path(info["nc_path"])
-            reply = "Deleted from Nextcloud. Gone." if ok else "Couldn't delete it -- remove it manually from Nextcloud."
+            result = await nc_integration.revoke_and_delete(info)
+            if result["ok"]:
+                reply = "Deleted from Nextcloud, and the link is dead. Gone."
+            elif result["share_revoked"]:
+                # The link is dead, which is the part that matters publicly.
+                reply = ("Link revoked, but the file wouldn't delete -- "
+                         "clear it from Nextcloud when you get a chance.")
+            else:
+                reply = "Couldn't revoke that link -- remove it manually from Nextcloud."
             await message.channel.send(reply)
             return
         elif any(w in text_lower for w in ("keep", "no", "nah", "leave it", "save it", "hold")):
-            _pending_nc_deletion.pop(message.author.id)
+            info = _pending_nc_deletion.pop(message.author.id)
+            await nc_integration.keep_share(info)
             await message.channel.send("Got it -- staying in Nextcloud.")
             return
 

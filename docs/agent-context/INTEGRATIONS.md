@@ -54,6 +54,33 @@ Served by `loki-joplin-desktop.service`. See the `joplin` skill.
 | Jellyfin | `JELLYFIN_URL`, `JELLYFIN_API_KEY` |
 | Overseerr/Jellyseerr | `SEERR_URL`, `SEERR_API_KEY` |
 | Cobalt (downloads) | `COBALT_URL`, `DOWNLOAD_DIR` |
+| Nextcloud (private DM delivery) | `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASS`, `NEXTCLOUD_PUBLIC_BASE_URL`, `NEXTCLOUD_SHARE_EXPIRY_DAYS`, `NEXTCLOUD_KEEP_CLEARS_EXPIRY` |
+
+### Nextcloud: two URLs, never interchangeable
+
+`NEXTCLOUD_URL` is the **internal** endpoint Loki talks to (`192.168.1.63:8082`,
+the NAS). `NEXTCLOUD_PUBLIC_BASE_URL` is the **public** origin a recipient's
+browser opens (`https://cloud.ivn-group.cc`, via nginx-proxy-manager). Confusing
+them is what made this feature ship dead links.
+
+**Using the OCS response's own `url` field is not sufficient.** This server has
+no `overwritehost`/`overwrite.cli.url` set behind the proxy, so it reports
+`https://192.168.1.63:8082/s/<token>` in its own API output. Loki therefore
+takes the *token* from the API — never invents one — and re-bases only the
+origin onto the public base. If Nextcloud's config is ever corrected, the
+returned URL is already public and the re-basing becomes a no-op.
+
+Public links are read-only (`permissions=1`, `publicUpload=false`), scoped to a
+single file or to that request's own batch folder, and expire after
+`NEXTCLOUD_SHARE_EXPIRY_DAYS` (default 3 = 72 h; `0` disables). "Keep" clears
+the expiry so the link persists, matching the historical behaviour; set
+`NEXTCLOUD_KEEP_CLEARS_EXPIRY=false` to leave the expiry in place.
+
+**`.env` is the only source of configuration** — `loki.service` sets no
+`EnvironmentFile`, so the process starts with a bare environment.
+`load_dotenv()` therefore MUST run before any project module is imported;
+several read `os.getenv` at import time and would otherwise be pinned to their
+hard-coded fallbacks forever. Pinned by `tests/test_nextcloud_share.py`.
 
 ## Hermes escalation (razr)
 

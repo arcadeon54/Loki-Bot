@@ -1,8 +1,46 @@
 # CURRENT HANDOFF
 
-*Updated 2026-08-09 04:0x UTC. Keep this under a minute to read.*
+*Updated 2026-08-09 04:2x UTC. Keep this under a minute to read.*
 
 ## Just completed
+
+**Nextcloud private-download links — DONE 2026-08-09. NEEDS A RESTART TO GO
+LIVE** (not taken; `loki.service` restarts are approval-gated).
+
+Recipients were DM'd `http://192.168.1.63:8082/s/<token>` — RFC1918, unopenable
+outside the LAN. Two root causes, and the second was worse than the reported
+one:
+
+*1 — the URL was built from the internal base.* Fixed to take the **token from
+the OCS API** and re-base only its origin onto `NEXTCLOUD_PUBLIC_BASE_URL`.
+Note that simply "using the API's `url` field" would NOT have worked: this
+server has no `overwritehost` behind the proxy, so it reports
+`https://192.168.1.63:8082/s/...` in its own output too.
+
+*2 — the module never read `.env` at all.* `loki.service` sets no
+`EnvironmentFile`, and `nextcloud_integration` was imported at loki_bot.py:64
+while `load_dotenv()` ran at line 92 — so `NC_URL` was pinned to its fallback
+`http://192.168.1.247:8082`, **the pre-rebuild asus box, unreachable since**.
+The feature could not reach Nextcloud at all. `jd_integration` had the same bug
+(empty MyJDownloader credentials). `load_dotenv()` now runs before every
+project import; a test pins that ordering.
+
+*Verified live end-to-end* against the real Nextcloud with a throwaway fixture:
+upload → public share → `https://cloud.ivn-group.cc/s/<token>` → **anonymous
+GET and download both 200** → Keep preserves it → Delete revokes + removes →
+revoked link **404**. The DAV tree stays 401 anonymously. Cleanup verified: back
+to the same 3 pre-existing shares.
+
+Also fixed in the same path: each request now gets its own batch folder. The
+dated folder was shared across every download a requester made that day, so one
+public link exposed all of them and "delete" removed all of them. Shares are
+read-only with a 72 h default expiry (configurable; Keep clears it). 32 tests in
+`tests/test_nextcloud_share.py`.
+
+**Nextcloud's own `overwritehost` is still unset** — its API keeps reporting the
+internal address. Loki no longer cares, but fixing it at source needs root or
+docker on the NAS, both permanently prohibited by `docs/NAS_MAINTENANCE.md`. Not
+attempted.
 
 **asus fstab CIFS escaping — DONE 2026-08-09.** Two NAS shares on asus
 (`Zion Cinema`, `Folder 1`) had never mounted since the rebuild. fstab is

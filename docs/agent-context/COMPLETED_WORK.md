@@ -7,6 +7,79 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## Nextcloud private-download delivery — public share links
+
+**DONE — 2026-08-09.** Requires a `loki.service` restart to take effect; not
+taken (restarts are approval-gated).
+
+DM Loki a TikTok/Instagram link and it downloads privately, uploads to
+Nextcloud, and DMs back a link with a Keep/Delete prompt. The link was
+`http://192.168.1.63:8082/s/<token>` — private address space, so no external
+recipient could open it.
+
+**Root cause 1 — presentation.** `_create_share_sync` built the URL as
+`f"{NC_URL}/s/{token}"`, i.e. from the internal endpoint. The share itself was
+fine; only the address was wrong.
+
+The non-obvious part: **using the OCS response's own `url` field would not have
+fixed it.** This Nextcloud has no `overwritehost` / `overwrite.cli.url` set
+behind nginx-proxy-manager, so it generates `https://192.168.1.63:8082/s/...`
+in its own API output. The token is therefore taken from the API — never
+constructed — and only the *origin* is re-based onto
+`NEXTCLOUD_PUBLIC_BASE_URL`. If Nextcloud's config is corrected later the
+returned URL is already public and re-basing is a no-op, so this stays correct
+either way.
+
+**Root cause 2 — configuration never loaded.** More serious, and it meant the
+feature was not merely mislinking but **entirely non-functional**.
+`loki.service` sets no `EnvironmentFile`, so the process starts with a bare
+environment (12 vars, none of them `NEXTCLOUD_*`) and `.env` is the only source
+of config. But `nextcloud_integration` was imported at `loki_bot.py:64` while
+`load_dotenv()` ran at line 92 — so every module-level `os.getenv` fell back to
+its default, pinning `NC_URL` to `http://192.168.1.247:8082`: the **pre-rebuild
+asus box**, unreachable since that machine was rebuilt. Nothing logged an
+error. `jd_integration` (the JDownloader last resort in the same download
+chain) had the identical bug, running with empty MyJDownloader credentials.
+`load_dotenv()` now runs before every project import, and a test pins that
+ordering because the failure is completely silent.
+
+**Root cause 3 — blast radius.** Uploads went to
+`Loki Downloads/{requester}/{date}`, reused for every download that day. For a
+multi-file request the *folder* was shared, so one public link exposed every
+file that requester had fetched that day — and "delete" removed all of them.
+Each request now gets its own `…/{date}/{batch}` folder, so both the share and
+the deletion cover exactly one request.
+
+**Security.** Public links are read-only (`permissions=1`,
+`publicUpload=false`), scoped to a single file (or that batch's folder), carry
+no filesystem path or credentials in the URL, and are independently revocable
+by share id. `_assert_public` refuses to emit a link on a private host, and a
+share that cannot be presented safely is revoked rather than left published —
+a failed share never yields a fabricated URL.
+
+**Expiration.** `NEXTCLOUD_SHARE_EXPIRY_DAYS`, default 3 (72 h), `0` disables.
+Keep historically meant the link lasted indefinitely, so Keep clears the expiry;
+`NEXTCLOUD_KEEP_CLEARS_EXPIRY=false` preserves it instead.
+
+**Live end-to-end verification** against the real Nextcloud with a throwaway
+text fixture: upload OK → share created with a 2026-08-12 expiry → URL
+`https://cloud.ivn-group.cc/s/<token>` → **anonymous GET 200 and anonymous
+download returned the exact bytes** → DAV tree 401 to the same anonymous client
+→ Keep left it serving 200 → Delete revoked the share and removed the files,
+both verified → revoked link **404**. Share count returned to the 3 that existed
+before, selftest tree gone.
+
+32 tests in `tests/test_nextcloud_share.py`, covering share creation, the
+internal-vs-public split, no-private-IP-leak, no-fabricated-URL on failure,
+Keep, Delete/revoke with verification, expiry configuration, read-only
+permissions, per-batch scoping, and the `load_dotenv` ordering invariant.
+
+**Not attempted:** correcting Nextcloud's own `overwritehost` at source. That
+needs root or docker on the UGREEN NAS, and `docs/NAS_MAINTENANCE.md` prohibits
+both permanently. Loki no longer depends on it.
+
+---
+
 ## asus fstab — CIFS share names with spaces
 
 **DONE — 2026-08-09.**
