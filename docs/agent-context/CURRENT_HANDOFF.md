@@ -1,8 +1,19 @@
 # CURRENT HANDOFF
 
-*Updated 2026-08-09 03:5x UTC. Keep this under a minute to read.*
+*Updated 2026-08-09 04:0x UTC. Keep this under a minute to read.*
 
 ## Just completed
+
+**asus fstab CIFS escaping — DONE 2026-08-09.** Two NAS shares on asus
+(`Zion Cinema`, `Folder 1`) had never mounted since the rebuild. fstab is
+whitespace-delimited, so the literal spaces made the parser abandon both lines —
+and the giveaway was an absence, not an error: **systemd had generated no
+`.mount`/`.automount` unit for either path**, so nothing was ever attempted.
+Escaped to `Zion\040Cinema` / `Folder\0401`, matching how dex247 has always
+spelled the same shares. Parse errors 2 → 0; both now mounted and readable (15
+and 7 entries). Nothing else in the file changed. `/mnt/Disk1`,
+`sshfs-unicron.service` (`NRestarts=0`) and Filebrowser (all four shares, HTTP
+200) all verified unaffected.
 
 **Unicron sshfs share restored — DONE 2026-08-09.** `/srv/unicron` now shows
 all 53 entries. Filebrowser is fully healthy with no degraded share; the

@@ -7,6 +7,52 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## asus fstab — CIFS share names with spaces
+
+**DONE — 2026-08-09.**
+
+Two `/etc/fstab` entries on asus had never mounted since the rebuild:
+
+```
+//192.168.1.63/Zion Cinema /media/nas/Zion_Cinema cifs ...
+//192.168.1.63/Folder 1    /media/nas/Folder_1    cifs ...
+```
+
+**Root cause.** fstab is whitespace-delimited. With the space written
+literally, the parser reads `Cinema` as the mount point, `/media/nas/Zion_Cinema`
+as the filesystem type, and gives up on the line. The decisive evidence was not
+a mount error but an *absence*: **systemd had generated no `.mount` or
+`.automount` unit for either path at all**, while the other five NAS entries had
+both. Nothing was ever attempted, so nothing ever failed loudly.
+
+The NAS genuinely exports the names with spaces (`smbclient -L` confirms
+`Zion Cinema` and `Folder 1`), so the fix is to escape the fstab field, never to
+rename the share. dex247 has always spelled the same two shares `\040`-escaped —
+this was asus drifting from a working precedent, not a new question.
+
+**Change.** Only the source field of those two lines:
+`Zion\040Cinema` and `Folder\0401`. Credentials, `uid`/`gid`, `iocharset`,
+`_netdev`, `x-systemd.automount`, both mount points, every other entry, and the
+newly restored `/mnt/Disk1` line were left byte-for-byte identical — the edit
+script asserted that by reversing its own substitution and diffing against the
+original before writing. `/etc/fstab` backed up with `cp -a` (mode 664
+root:root preserved).
+
+**Verification.** `findmnt --verify`: **2 parse errors → 0**. After
+`daemon-reload` both unit pairs appeared; starting only those two automount
+units (rather than `mount -a`, which would have exercised unrelated entries)
+mounted both shares. `Zion_Cinema` 15 entries, `Folder_1` 7 entries, with real
+files stat'd through each. All three previously-working CIFS mounts
+(Blockbusters, Plex, Tera) untouched; `Docker` and `Personal` still sit
+`waiting` — normal automount laziness, unchanged. `/mnt/Disk1` still mounted
+(53 entries under `downloads`), `sshfs-unicron.service` active with
+`NRestarts=0`, Filebrowser `healthy` with all four shares populated and HTTP 200
+local + proxy. Both automount units are dependencies of `remote-fs.target`, so
+they come up at boot. The remaining `[W] /swapfile` warning is pre-existing and
+normal for a swapfile.
+
+---
+
 ## Unicron sshfs share — rebuilt host, missing key, missing disk
 
 **DONE — 2026-08-09.** Follow-on to the Filebrowser repair below.

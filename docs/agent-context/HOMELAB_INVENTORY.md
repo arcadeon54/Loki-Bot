@@ -178,11 +178,19 @@ now pinned by UUID with `nofail,x-systemd.device-timeout=15` (a missing data
 disk must never block boot). Do not re-add it by `/dev/sdX`; the device letters
 are not stable.
 
-**Pre-existing defect, deliberately not fixed:** `/etc/fstab` lines 15 and 19
-fail to parse (`//192.168.1.63/Zion Cinema` and `//192.168.1.63/Folder 1` —
-unescaped spaces; CIFS needs `\040`). Those two shares therefore never mount at
-boot. It is asus-side media, unrelated to the Unicron share, and touching it
-risks asus's own services.
+**CIFS share names with spaces must be escaped `\040` — repaired 2026-08-09.**
+`/etc/fstab` lines 15 and 19 carried the share names literally
+(`//192.168.1.63/Zion Cinema`, `//192.168.1.63/Folder 1`). fstab is
+whitespace-delimited, so the parser read `Cinema` as the mount point and
+abandoned both lines: **systemd generated no `.mount`/`.automount` unit for
+them at all**, which is why they never mounted at boot. They now read
+`Zion\040Cinema` and `Folder\0401`, matching how dex247 has always spelled the
+same two shares. The NAS exports the names *with* real spaces — escape the
+fstab field, never rename the share.
+
+All seven `/media/nas/*` automounts are now generated and active.
+`Docker` and `Personal` sit `waiting`/`dead` until first access; that is normal
+`x-systemd.automount` laziness, not a fault.
 
 ### The sshfs share dex247 depends on
 
