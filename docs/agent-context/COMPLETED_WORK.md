@@ -735,6 +735,41 @@ this is wording-only, one notification in, one reply out, same as before.
 pre-existing tests updated because they pinned the old (buggy) behavior of
 letting roommate-named messages fall through to the rewriter.
 
+**DONE — unnamed ("a person") presence detections resolved to a name —
+2026-08-10.** The roommate-name fix above only caught messages that named
+Rob. Some HA presence automations don't name either resident at all —
+"Boss, a person has been detected at home." — which fell through to the
+Groq rewriter with nowhere near enough information to say who, and often
+stayed generic in the output too. Two real bugs found on the way, both
+fixed:
+
+1. The rewriter's own presence context line only ever queried
+   `person.kavaris` — Rob's state was never included, so even a message
+   genuinely about Rob had no way to be attributed correctly by the LLM
+   fallback. Now includes both known residents.
+2. The `HA_NOTIFICATION` system prompt's own example text used the phrase
+   "a person detected" — the exact wording later showing up unwanted in
+   real output. Reworded, and the prompt now explicitly says there are only
+   two monitored residents and names them.
+
+The real fix, though, is the same non-guessing principle as the roommate-name
+fix: a new `personality.GENERIC_PRESENCE` kind matches generic phrasing ("a
+person", "someone", "a household member" + a presence-shaped word, so a
+doorbell/camera "someone" doesn't get swept in). Resolution happens in
+`ha_integration._resolve_generic_presence()`, which compares each resident's
+**current live state** against `presence_monitor`'s last-polled state (a new
+public `presence_monitor.last_known()` accessor — presence_monitor's own
+detection logic is untouched, this only reads its already-tracked state) to
+find which one actually changed. Exactly one changed → that resident's
+existing preferred wording (Rob's `roommate_presence_text()`, or the Boss's
+own four phrases if it's actually about him). Zero or both changed, or HA is
+unreachable → relay HA's raw text rather than misattribute the event to the
+wrong person.
+
+12 new tests in `tests/test_presence_notifications.py` (now 48), including a
+direct regression pin on the exact reported message. No detection logic,
+entities, triggers, or notification volume changed.
+
 ## Homelab platform
 
 **DONE — maintenance controller** (`53aebbb`, `6bae20d`, live 2026-07-25).

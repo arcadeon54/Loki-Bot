@@ -4,6 +4,27 @@
 
 ## Just completed
 
+**Generic ("a person") presence wording fix — DONE 2026-08-10, code-only
+(needs a `loki.service` restart, not taken).** Follow-on to the roommate
+wording fix below: that fix only caught HA messages that *named* Rob. Some
+HA presence automations don't name either resident at all — "Boss, a person
+has been detected at home." — so they had nothing to bypass on and fell
+through to the Groq rewriter, which had its own real bug: the presence
+context line it builds only ever queried `person.kavaris`, never Rob, so it
+couldn't have said who even if asked to. Fixed: `personality.GENERIC_PRESENCE`
+matches generic phrasing ("a person"/"someone"/"a household member" + a
+presence-shaped word, so an unrelated "someone's at the door" camera event
+isn't swept in) and `ha_integration._resolve_generic_presence()` resolves
+*who* by diffing each resident's live state against a new
+`presence_monitor.last_known()` accessor — `presence_monitor`'s own poll/
+detection logic is untouched, this only reads its already-tracked state.
+Also fixed the presence-context bug itself (now includes both residents) as
+defense-in-depth for the rare message neither classifier recognizes. 12 new
+tests, `tests/test_presence_notifications.py` now 48, including a direct
+regression pin on the exact reported message. Files: `personality.py`,
+`ha_integration.py`, `presence_monitor.py` (new `last_known()` accessor
+only — no behavior change), `tests/test_presence_notifications.py`.
+
 **Roommate presence wording cleanup — DONE 2026-08-10, code-only (needs a
 `loki.service` restart to go live, not taken).** Rob's arrival/departure
 wasn't pre-voiced by Home Assistant the way the Boss's four transitions are

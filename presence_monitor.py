@@ -129,3 +129,12 @@ async def poll():
 def status() -> str:
     return (f"Boss: {_state.get('boss', '?')}, Rob: {_state.get('rob', '?')}"
             f" (last warning: {_state.get('last_fire', 'never')})")
+
+
+def last_known() -> dict:
+    """The state each resident was in as of the last poll (~2 min cadence),
+    i.e. their state immediately before whatever just happened. Read-only —
+    for callers that need to tell WHICH resident a generic, unnamed
+    notification is actually about (see ha_integration.get_smart_notification)
+    without duplicating this module's own poll/state-diff logic."""
+    return {"boss": _state.get("boss"), "rob": _state.get("rob")}

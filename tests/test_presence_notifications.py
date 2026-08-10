@@ -28,6 +28,7 @@ os.environ.setdefault("OWNER_USER_ID", "111111111111111111")
 
 import personality
 import ha_integration as ha
+import presence_monitor
 
 
 def run(coro):
@@ -73,15 +74,25 @@ BANNED = (
     "while you are still at home",
     "while you remain home",
     "you are still at the premises",
+    "a person",
+    "a household member",
 )
 
 
 class Base(unittest.TestCase):
     def setUp(self):
         self.rob_state = "home"
+        self.boss_state = "home"
+        # presence_monitor's last-polled state — the "previous" state a
+        # generic, unnamed notification's direction is resolved against.
+        # None means "no prior poll yet", matching a fresh boot.
+        self.prev_boss = "home"
+        self.prev_rob = "home"
         self.llm_calls = []
 
         async def fake_get_state(entity_id):
+            if entity_id == ha.BOSS_ENTITY:
+                return {"state": self.boss_state}
             return {"state": self.rob_state}
 
         async def trapped_get_all_states():
@@ -89,17 +100,23 @@ class Base(unittest.TestCase):
             self.llm_calls.append("get_all_states")
             return []
 
+        def fake_last_known():
+            return {"boss": self.prev_boss, "rob": self.prev_rob}
+
         self._real_get_state = ha.get_state
         self._real_get_all = ha.get_all_states
         ha.get_state = fake_get_state
         ha.get_all_states = trapped_get_all_states
         self._real_key = ha.GROQ_API_KEY
         ha.GROQ_API_KEY = ""      # any rewrite attempt is then obvious
+        self._real_last_known = presence_monitor.last_known
+        presence_monitor.last_known = fake_last_known
 
     def tearDown(self):
         ha.get_state = self._real_get_state
         ha.get_all_states = self._real_get_all
         ha.GROQ_API_KEY = self._real_key
+        presence_monitor.last_known = self._real_last_known
 
     def notify(self, message, title=""):
         return run(ha.get_smart_notification(title, message))
@@ -308,6 +325,130 @@ class RoommatePresenceTests(Base):
         self.assertEqual(out.count("\n"), 0)
 
 
+# ── Generic, unnamed presence detections ────────────────────────────────────
+# "Boss, a person has been detected at home." — HA sending a presence event
+# without naming which of the exactly-two monitored residents it's about.
+# Resolved from state (presence_monitor's last poll vs. live now), never
+# from wording, so the reply always names a specific resident.
+HA_GENERIC_HOME = "A person has been detected at home."
+HA_GENERIC_LEFT = "A person has left home."
+HA_GENERIC_REPORTED_BUG = "Boss, a person has been detected at home."
+
+
+class GenericPresenceTests(Base):
+    def test_rob_arrives_while_boss_is_home(self):
+        self.prev_rob, self.rob_state = "not_home", "home"
+        self.prev_boss = self.boss_state = "home"
+        out = self.notify(HA_GENERIC_HOME)
+        self.assertEqual(out, "Rob is home.")
+
+    def test_rob_arrives_while_boss_is_away(self):
+        self.prev_rob, self.rob_state = "not_home", "home"
+        self.prev_boss = self.boss_state = "not_home"
+        out = self.notify(HA_GENERIC_HOME)
+        self.assertEqual(out, "Rob is home.")
+
+    def test_rob_leaves_while_boss_is_home(self):
+        self.prev_rob, self.rob_state = "home", "not_home"
+        self.prev_boss = self.boss_state = "home"
+        out = self.notify(HA_GENERIC_LEFT)
+        self.assertEqual(out, "Rob stepped out.")
+
+    def test_rob_leaves_while_boss_is_away(self):
+        self.prev_rob, self.rob_state = "home", "not_home"
+        self.prev_boss = self.boss_state = "not_home"
+        out = self.notify(HA_GENERIC_LEFT)
+        self.assertEqual(out, "Rob stepped out.")
+
+    def test_boss_own_arrival_via_generic_message_uses_preferred_wording(self):
+        """My own arrival path: a generic message that's actually about the
+        Boss must still use his existing preferred phrase, not a generic
+        rewrite and not Rob's wording."""
+        self.prev_boss, self.boss_state = "not_home", "home"
+        self.prev_rob = self.rob_state = "home"
+        out = self.notify(HA_GENERIC_HOME)
+        self.assertEqual(out.split("\n")[0], "🏠 - Welcome home, Boss - 🏠")
+
+    def test_boss_own_departure_via_generic_message_uses_preferred_wording(self):
+        self.prev_boss, self.boss_state = "home", "not_home"
+        self.prev_rob = self.rob_state = "home"
+        out = self.notify(HA_GENERIC_LEFT)
+        self.assertEqual(out, "✌ - Peace out, Homie! I'll hold things down til you get back 💯")
+
+    def test_the_exact_reported_bug_message(self):
+        """Regression pin for the literal message from the bug report."""
+        self.prev_rob, self.rob_state = "not_home", "home"
+        self.prev_boss = self.boss_state = "home"
+        out = self.notify(HA_GENERIC_REPORTED_BUG)
+        self.assertEqual(out, "Rob is home.")
+        self.assertNotIn("a person", out.lower())
+
+    def test_no_known_event_ever_says_a_person_or_someone(self):
+        cases = [
+            ("not_home", "home", "home", "home", HA_GENERIC_HOME),
+            ("home", "not_home", "home", "home", HA_GENERIC_LEFT),
+            ("home", "home", "not_home", "home", HA_GENERIC_HOME),
+            ("home", "home", "home", "not_home", HA_GENERIC_LEFT),
+        ]
+        for prev_rob, rob_now, prev_boss, boss_now, msg in cases:
+            self.prev_rob, self.rob_state = prev_rob, rob_now
+            self.prev_boss, self.boss_state = prev_boss, boss_now
+            out = self.notify(msg)
+            self.assertConcise(out)
+            for msg2 in (HA_ROB_LEFT_VARIANTS + HA_ROB_HOME_VARIANTS
+                        + (HA_LEAVE_HOME, HA_OFFICE_IN, HA_OFFICE_OUT, HA_ARRIVE_HOME)):
+                self.assertConcise(self.notify(msg2))
+
+    def test_ambiguous_when_both_residents_changed_relays_rather_than_guesses(self):
+        """Both changed between polls — genuinely ambiguous which one this
+        specific notification is about. Relay rather than misattribute."""
+        self.prev_rob, self.rob_state = "not_home", "home"
+        self.prev_boss, self.boss_state = "not_home", "home"
+        out = self.notify(HA_GENERIC_HOME)
+        self.assertEqual(out, HA_GENERIC_HOME)
+
+    def test_no_prior_state_relays_rather_than_guesses(self):
+        """Fresh boot, presence_monitor hasn't polled yet — no baseline to
+        diff against."""
+        self.prev_rob = self.prev_boss = None
+        self.rob_state = self.boss_state = "home"
+        out = self.notify(HA_GENERIC_HOME)
+        self.assertEqual(out, HA_GENERIC_HOME)
+
+    def test_unreachable_home_assistant_relays_rather_than_guesses(self):
+        async def broken(entity_id):
+            raise RuntimeError("HA down")
+        ha.get_state = broken
+        self.prev_rob, self.prev_boss = "not_home", "home"
+        out = self.notify(HA_GENERIC_HOME)
+        self.assertEqual(out, HA_GENERIC_HOME)
+
+    def test_never_reaches_the_llm(self):
+        async def trap():
+            raise ReachedRewriter()
+        ha.get_all_states = trap
+        ha.GROQ_API_KEY = "test-key-not-used"
+        self.prev_rob, self.rob_state = "not_home", "home"
+        for msg in (HA_GENERIC_HOME, HA_GENERIC_LEFT, HA_GENERIC_REPORTED_BUG):
+            try:
+                self.notify(msg)
+            except ReachedRewriter:
+                self.fail(f"{msg!r} was sent to the rewriter")
+
+    def test_camera_style_someone_without_presence_shape_still_goes_to_rewriter(self):
+        """Scope check: 'someone' alone, with no home/detected/arrived/left/
+        away word nearby (e.g. a doorbell/camera event), must not be swept
+        into presence handling — Loki doesn't track who rang a doorbell."""
+        self._real_get_all = ha.get_all_states
+
+        async def trap():
+            raise ReachedRewriter()
+        ha.get_all_states = trap
+        ha.GROQ_API_KEY = "test-key-not-used"
+        with self.assertRaises(ReachedRewriter):
+            self.notify("Someone is at the front door.", title="Doorbell")
+
+
 # ── The formatter itself ───────────────────────────────────────────────────
 class FormatterTests(unittest.TestCase):
     def test_kinds_are_recognised(self):
@@ -346,6 +487,27 @@ class FormatterTests(unittest.TestCase):
         self.assertEqual(personality.roommate_presence_text("away"), "Rob stepped out.")
         self.assertEqual(personality.roommate_presence_text("unknown"), "")
         self.assertEqual(personality.roommate_presence_text(None), "")
+
+    def test_generic_unnamed_presence_is_recognised(self):
+        for msg in ("A person has been detected at home.",
+                    "Boss, a person has been detected at home.",
+                    "Someone has arrived home.",
+                    "A household member has left home."):
+            self.assertEqual(personality.presence_kind(msg),
+                             personality.GENERIC_PRESENCE, repr(msg))
+
+    def test_generic_reference_without_presence_shape_is_not_presence(self):
+        """'Someone'/'a person' alone, with no home/detected/arrived/left/
+        away word, isn't enough — e.g. a doorbell camera event."""
+        for msg in ("Someone is at the front door.",
+                    "A person was seen on the porch camera."):
+            self.assertIsNone(personality.presence_kind(msg), repr(msg))
+
+    def test_named_reference_takes_priority_over_generic(self):
+        """A message naming Rob is ROOMMATE_PRESENCE, not GENERIC_PRESENCE,
+        even though it would also match the generic pattern."""
+        msg = "Ammiel, a household member, has arrived home."
+        self.assertEqual(personality.presence_kind(msg), personality.ROOMMATE_PRESENCE)
 
 
 if __name__ == "__main__":

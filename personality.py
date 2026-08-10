@@ -75,8 +75,11 @@ HA_NOTIFICATION = (
     "Professional, brief, and clear — never humorous: no jokes, no sarcasm, no "
     "roleplay, no personality flourishes. Keep every fact from the original "
     "notification. Use the presence information only to judge urgency: if the event "
-    "is routine (e.g. a person detected while they are home), one short sentence is "
-    "enough; if it matters, state plainly what happened and what to check. "
+    "is routine (e.g. a routine sensor reading while the Boss is home), one short "
+    "sentence is enough; if it matters, state plainly what happened and what to "
+    "check. There are only two monitored residents, Boss and Rob — the presence "
+    "line always names them; never write 'a person', 'someone', or 'a household "
+    "member' when the presence data already says which one. "
     "Address the recipient as 'Boss' and do not mention or address anyone else. "
     "Output a single short message, ready for Discord."
 )
@@ -128,6 +131,24 @@ ROOMMATE_PRESENCE = "roommate_presence"
 
 _ROOMMATE_REFERENCE = re.compile(r"\bammiel\b|\broommate\b|\brob\b", re.IGNORECASE)
 
+# ── Generic, unnamed presence detections ────────────────────────────────────
+# There are exactly two monitored residents (person.kavaris, person.ammiel).
+# Some Home Assistant presence automations don't name either one in the text
+# they send — "a person has been detected at home" — which used to reach the
+# rewriter with no more identifying information than the raw message itself
+# and come back just as generic ("Boss, a person has been detected at
+# home."). The identity is never actually unknown to Loki, only to that one
+# message: only one of two known entities can have changed, so the caller
+# resolves it from live state (see ha_integration.get_smart_notification),
+# never by guessing from wording. This is deliberately broader than
+# _ROOMMATE_REFERENCE — it exists for the case where NEITHER name is present.
+GENERIC_PRESENCE = "generic_presence"
+
+_GENERIC_PRESENCE_REFERENCE = re.compile(
+    r"\ba person\b|\bsomeone\b|\ba household member\b", re.IGNORECASE)
+_PRESENCE_SHAPED = re.compile(
+    r"\bhome\b|\bdetected\b|\barrived\b|\bleft\b|\baway\b", re.IGNORECASE)
+
 
 def presence_kind(message: str):
     """Which presence transition this notification is, or None if it is an
@@ -138,6 +159,9 @@ def presence_kind(message: str):
             return kind
     if message and _ROOMMATE_REFERENCE.search(message):
         return ROOMMATE_PRESENCE
+    if (message and _GENERIC_PRESENCE_REFERENCE.search(message)
+            and _PRESENCE_SHAPED.search(message)):
+        return GENERIC_PRESENCE
     return None
 
 

@@ -10,6 +10,7 @@ import aiohttp
 from aiohttp import web
 
 import personality
+import presence_monitor
 
 log = logging.getLogger(__name__)
 
@@ -18,8 +19,11 @@ HA_URL              = os.getenv("HA_URL", "https://ha.ivn-group.cc")
 HA_TOKEN            = os.getenv("HA_TOKEN", "")
 HA_NOTIFY_CHANNEL_ID = int(os.getenv("HA_NOTIFY_CHANNEL_ID", "0"))
 HA_WEBHOOK_PORT     = int(os.getenv("HA_WEBHOOK_PORT", "9100"))
-# Same entity presence_monitor watches — the roommate whose home/away state
-# rides along with the Boss's welcome-home notification.
+# Same entities presence_monitor watches — the two, and only two, monitored
+# residents. BOSS_ENTITY is needed here (not just in presence_monitor) to
+# resolve a generic, unnamed presence notification back to whichever of the
+# two actually changed state; see _resolve_generic_presence below.
+BOSS_ENTITY         = os.getenv("PRESENCE_BOSS_ENTITY", "person.kavaris")
 ROOMMATE_ENTITY     = os.getenv("PRESENCE_ROOMMATE_ENTITY", "person.ammiel")
 
 
@@ -92,6 +96,37 @@ async def call_service(domain: str, service: str, entity_id: str = None, extra: 
     return False
 
 
+async def _resolve_generic_presence() -> str | None:
+    """A generic, unnamed HA presence notification ("a person has been
+    detected at home") doesn't say who. There are only two monitored
+    residents, so this is always answerable from state, never from
+    guessing at wording: compare each resident's CURRENT live state
+    against presence_monitor's last-polled state (the same signal
+    presence_monitor's own poll() uses to detect an arrival — read via its
+    public last_known(), not by reaching into its private state) to find
+    which one actually changed. Returns None when that comparison is
+    ambiguous (HA unreachable, no prior state yet, or — rare — both
+    residents' states changed between polls) so the caller can fall back
+    rather than misattribute the event."""
+    prev = presence_monitor.last_known()
+    try:
+        boss_now = (await get_state(BOSS_ENTITY) or {}).get("state")
+        rob_now = (await get_state(ROOMMATE_ENTITY) or {}).get("state")
+    except Exception as e:
+        log.warning(f"generic presence resolution: HA unreachable: {e}")
+        return None
+
+    boss_changed = prev.get("boss") is not None and prev.get("boss") != boss_now
+    rob_changed = prev.get("rob") is not None and prev.get("rob") != rob_now
+
+    if rob_changed and not boss_changed:
+        return personality.roommate_presence_text(rob_now)
+    if boss_changed and not rob_changed:
+        kind = personality.ARRIVE_HOME if boss_now == "home" else personality.LEAVE_HOME
+        return personality.presence_text(kind, rob_state=rob_now)
+    return None
+
+
 async def get_smart_notification(title: str, message: str) -> str:
     log.info(f"Processing smart notification: {title}")
 
@@ -125,6 +160,19 @@ async def get_smart_notification(title: str, message: str) -> str:
             log.warning("roommate state unresolved — relaying HA's own text")
             return message
 
+        if kind == personality.GENERIC_PRESENCE:
+            # Neither name is in the text ("a person has been detected at
+            # home") — resolve who from live state instead of narrating the
+            # ambiguity, same non-guessing principle as ROOMMATE_PRESENCE.
+            text = await _resolve_generic_presence()
+            if text:
+                log.info("Generic presence event resolved to a named "
+                        "resident (no rewrite)")
+                return text
+            log.warning("generic presence event could not be attributed "
+                       "to a resident — relaying HA's own text")
+            return message
+
         log.info(f"Presence transition '{kind}' delivered verbatim (no rewrite)")
         return personality.presence_text(kind, rob_state=rob_state)
 
@@ -134,7 +182,13 @@ async def get_smart_notification(title: str, message: str) -> str:
     states = await get_all_states()
     presence = "unknown"
     if states:
-        persons = [s for s in states if s["entity_id"] == "person.kavaris"]
+        # Both known residents, not just the Boss — an incomplete presence
+        # context is exactly how a message genuinely about Rob (that didn't
+        # match ROOMMATE_PRESENCE/GENERIC_PRESENCE above, e.g. a differently
+        # worded notification neither classifier recognizes) reached the
+        # rewriter with no way to know he existed, and came back saying "a
+        # person" instead of naming him.
+        persons = [s for s in states if s["entity_id"] in (BOSS_ENTITY, ROOMMATE_ENTITY)]
         presence = ", ".join([f"{p['entity_id'].split('.')[1]} is {p['state']}" for p in persons])
 
     system_prompt = personality.HA_NOTIFICATION
