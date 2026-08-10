@@ -705,6 +705,36 @@ rewriter was narrating them. Four Boss presence transitions
 (`person.ammiel`) home/away state for the top-lock decision. 20 tests in
 `tests/test_presence_notifications.py`.
 
+**DONE — roommate presence gets the same treatment — 2026-08-10.** The four
+transitions above only covered the Boss's own presence. Rob's arrival/
+departure wasn't pre-voiced by Home Assistant at all — a plain factual
+message (e.g. "Ammiel is home. You are free to lock the top lock.") still
+went through the Groq rewriter and came back narrating the Boss's own
+already-known presence on top of Rob's: "Boss, your roommate has left the
+premises while you are still at home."
+
+Fix, in `personality.py`: any notification that names the roommate
+(`ammiel`/`roommate`/`rob` as a whole word — regex, not an exact-fragment
+match, since HA's wording for this event isn't fixed the way the Boss's four
+are) is now classified as `ROOMMATE_PRESENCE` and bypasses the rewriter the
+same way. The reply is built from **Rob's actual live state** at delivery
+time, never from parsing HA's phrasing — `roommate_presence_text()` returns
+`"Rob is home."` or `"Rob stepped out."` Three differently-worded raw HA
+messages for the same event consolidate to the identical canonical output
+(pinned by test). If Rob's state can't be resolved (HA unreachable), the
+raw HA text is relayed rather than guessing a direction or narrating one.
+
+Boss's own presence is never mentioned in this message — that was the whole
+bug. The `roommate_line()` used inside the Boss's own welcome-home message
+(the top-lock decision, e.g. "Rob's home — top lock's good.") was already
+concise and correct and is unchanged.
+
+No trigger conditions, HA automations, or notification volume changed —
+this is wording-only, one notification in, one reply out, same as before.
+12 new tests added to `tests/test_presence_notifications.py` (now 32); two
+pre-existing tests updated because they pinned the old (buggy) behavior of
+letting roommate-named messages fall through to the rewriter.
+
 ## Homelab platform
 
 **DONE — maintenance controller** (`53aebbb`, `6bae20d`, live 2026-07-25).

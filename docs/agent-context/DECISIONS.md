@@ -241,3 +241,20 @@ confidence. (Fable, investigated as a possible provider, was rejected by the
 Boss on cost grounds before this ever mattered for it specifically — the
 decision generalizes to any unpriced model, which is exactly what DeepSeek
 now is.)
+
+## Any HA notification not pre-voiced by HA needs its own deterministic path — not a prompt tweak
+
+The Boss's four presence transitions bypass the Groq rewriter because Home
+Assistant already sends them in Loki's voice. Rob's presence notifications
+don't get that treatment from the HA side, and tightening the
+`HA_NOTIFICATION` system prompt to ask the model to stop restating the
+recipient's own presence would still be a *request*, not a guarantee — LLM
+wording drifts, and the completion bar here is an exact string ("Rob stepped
+out."). The fix generalizes the same bypass pattern instead of leaning on
+prompting: classify the notification deterministically (regex on the
+roommate's name, since HA's wording for this event isn't fixed the way the
+Boss's four are), then answer from Loki's own live knowledge (Rob's actual
+HA state) rather than from parsing HA's arbitrary phrasing. Any future
+"Loki keeps narrating something it already knows structurally" complaint
+should get the same treatment: classify → answer from state, not
+prompt-tune the rewriter and hope.

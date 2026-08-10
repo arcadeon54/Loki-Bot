@@ -23,6 +23,7 @@ profiles build on it. Edit tone here, not in the interface modules.
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -111,14 +112,32 @@ _PRESENCE_MATCHES = (
     ("welcome home", ARRIVE_HOME),
 )
 
+# ── Roommate presence transitions (Rob arriving/leaving) ───────────────────
+# Unlike the four transitions above, Home Assistant does NOT send these
+# already in Loki's voice — it sends plain factual text (e.g. "Ammiel is
+# home. You are free to lock the top lock."), which used to go straight to
+# the HA_NOTIFICATION rewriter and come back as "Boss, your roommate has
+# left the premises while you are still at home" — narrating a fact the
+# Boss already knows (his own presence) on top of the one that matters
+# (Rob's). Rather than pin an exact HA-side fragment (unknown/unstable for
+# this event, unlike the four above), any notification that names the
+# roommate is treated as a presence event and rebuilt from Rob's actual
+# live state — never from parsing HA's wording — so the direction can't be
+# misread from an unfamiliar phrasing.
+ROOMMATE_PRESENCE = "roommate_presence"
+
+_ROOMMATE_REFERENCE = re.compile(r"\bammiel\b|\broommate\b|\brob\b", re.IGNORECASE)
+
 
 def presence_kind(message: str):
-    """Which Boss presence transition this notification is, or None if it is
-    an ordinary smart-home notification that still gets rewritten."""
+    """Which presence transition this notification is, or None if it is an
+    ordinary smart-home notification that still gets rewritten."""
     low = (message or "").strip().lower()
     for needle, kind in _PRESENCE_MATCHES:
         if needle in low:
             return kind
+    if message and _ROOMMATE_REFERENCE.search(message):
+        return ROOMMATE_PRESENCE
     return None
 
 
@@ -130,6 +149,18 @@ def roommate_line(rob_state) -> str:
         return f"{ROOMMATE_NAME}'s home — top lock's good."
     if st in ("not_home", "away", "not home"):
         return f"{ROOMMATE_NAME}'s out — don't lock the top lock."
+    return ""
+
+
+def roommate_presence_text(rob_state) -> str:
+    """Rob's own arrival/departure, focused on Rob — never restates the
+    Boss's own presence, which he already knows. Empty when Rob's state is
+    unknown, so the caller can fall back rather than guess a direction."""
+    st = (rob_state or "").strip().lower()
+    if st == "home":
+        return f"{ROOMMATE_NAME} is home."
+    if st in ("not_home", "away", "not home"):
+        return f"{ROOMMATE_NAME} stepped out."
     return ""
 
 

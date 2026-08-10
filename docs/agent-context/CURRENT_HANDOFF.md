@@ -4,6 +4,26 @@
 
 ## Just completed
 
+**Roommate presence wording cleanup — DONE 2026-08-10, code-only (needs a
+`loki.service` restart to go live, not taken).** Rob's arrival/departure
+wasn't pre-voiced by Home Assistant the way the Boss's four transitions are
+(`ede172d`, 2026-08-05) — a plain factual HA message still went through the
+Groq rewriter and came back as "Boss, your roommate has left the premises
+while you are still at home," restating the Boss's own already-known
+presence. Fixed the same way the four transitions were: `personality.py`
+gained `ROOMMATE_PRESENCE` (matched on the roommate's name via regex, not an
+exact fragment, since HA's wording here isn't fixed) and
+`roommate_presence_text()`, which answers from **Rob's live state**, not
+from parsing HA's phrasing. Exact output: `"Rob stepped out."` /
+`"Rob is home."` — nothing about the Boss's own presence. The welcome-home
+top-lock line (`roommate_line()`, e.g. "Rob's home — top lock's good.") was
+already correct and untouched. No trigger conditions, HA automations, or
+notification volume changed. 12 new tests, `tests/test_presence_notifications.py`
+now 32, all green; full suite baseline unaffected (same 4 fail/4 error
+`discover`-mode pollution documented below, none in the touched files —
+confirmed each passes 100% in isolation). Files: `personality.py`,
+`ha_integration.py`, `tests/test_presence_notifications.py`.
+
 **Hermes provider resilience — DONE 2026-08-10, live on razr.** OpenRouter
 was confirmed exhausted (402, read-only via `hermes auth list` — no paid
 probe), correctly represented as protective degradation

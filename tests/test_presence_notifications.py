@@ -1,12 +1,18 @@
 """
-Focused tests for the four Boss presence notifications.
+Focused tests for presence notifications — the Boss's own four transitions,
+plus Rob's (roommate) arrival/departure.
 
-Home Assistant already sends these in Loki's voice; Loki's LLM rewriter was
-turning them into narrated sentences that restated what the Boss already knew
-("Boss, you are not home and the office has been checked out", "Boss, someone
-has been detected in the office while you are at work"). These tests pin the
-exact concise wording, prove the rewriter is bypassed, and prove unrelated
-smart-home notifications still go through it untouched.
+Home Assistant sends the Boss's four already in Loki's voice; Loki's LLM
+rewriter was turning them into narrated sentences that restated what the
+Boss already knew ("Boss, you are not home and the office has been checked
+out", "Boss, someone has been detected in the office while you are at
+work"). Rob's presence isn't pre-voiced by HA at all — a plain factual
+message like "Ammiel is home. You are free to lock the top lock." went
+through the same rewriter and came back as "Boss, your roommate has left
+the premises while you are still at home", restating the Boss's own
+(already-known) presence on top of Rob's. These tests pin the exact concise
+wording for both, prove the rewriter is bypassed for both, and prove
+unrelated smart-home notifications still go through it untouched.
 
 No network: Home Assistant state lookups are stubbed and the Groq call is
 booby-trapped so any attempt to rewrite a presence message fails the test.
@@ -38,6 +44,22 @@ HA_OFFICE_IN = "💼 - Office check-in - 💼"
 HA_OFFICE_OUT = "💼 - Office check-out - 💼"
 HA_ARRIVE_HOME = "🏠 - Welcome home, Boss - 🏠"
 
+# Rob's presence notifications are NOT pre-voiced by HA — these are the kind
+# of plain, factual text a person-entity automation actually sends. Multiple
+# differently-worded raw messages are used deliberately: the reply must come
+# from Rob's live state, not from parsing HA's exact phrasing, so any of
+# these should consolidate to the same canonical output.
+HA_ROB_LEFT_VARIANTS = (
+    "Ammiel has left home.",
+    "Ammiel is no longer home. Lock the top lock.",
+    "Roommate has left the premises.",
+)
+HA_ROB_HOME_VARIANTS = (
+    "Ammiel is home. You are free to lock the top lock.",
+    "Roommate arrived home 🏠",
+    "Rob is home.",
+)
+
 # The verbose phrasings that must never appear again.
 BANNED = (
     "someone has been detected",
@@ -47,6 +69,10 @@ BANNED = (
     "holding things down until you return",
     "please review the office status",
     "a message has been received",
+    "premises",
+    "while you are still at home",
+    "while you remain home",
+    "you are still at the premises",
 )
 
 
@@ -156,10 +182,10 @@ class NoRewriteTests(Base):
     def test_unrelated_notifications_still_go_through_the_rewriter(self):
         """Scope check: this change must not touch other notifications."""
         self._arm_rewriter_trap()
-        for msg in ("Roommate arrived home 🏠", "The place is empty 🏠",
-                    "Rain expected on your commute"):
+        for msg in ("The place is empty 🏠", "Rain expected on your commute",
+                    "Motion detected in the driveway"):
             with self.assertRaises(ReachedRewriter,
-                                   msg=f"{msg!r} was wrongly treated as a Boss transition"):
+                                   msg=f"{msg!r} was wrongly treated as a presence transition"):
                 self.notify(msg, title="Something")
 
 
@@ -207,6 +233,81 @@ class RoommateInfoTests(Base):
         self.assertEqual(out, "🏠 - Welcome home, Boss - 🏠")
 
 
+# ── Rob's own arrival/departure (Boss stays home throughout) ───────────────
+class RoommatePresenceTests(Base):
+    def test_rob_leaves_while_boss_is_home(self):
+        """The exact completion criterion: Boss home + Rob leaves."""
+        self.rob_state = "not_home"
+        for msg in HA_ROB_LEFT_VARIANTS:
+            out = self.notify(msg)
+            self.assertEqual(out, "Rob stepped out.", repr(msg))
+
+    def test_rob_arrives_while_boss_is_home(self):
+        self.rob_state = "home"
+        for msg in HA_ROB_HOME_VARIANTS:
+            out = self.notify(msg)
+            self.assertEqual(out, "Rob is home.", repr(msg))
+
+    def test_differently_worded_ha_messages_consolidate_to_one_phrasing(self):
+        """Direction comes from Rob's live state, not from parsing HA's
+        wording — three different raw messages, one canonical reply."""
+        self.rob_state = "not_home"
+        outputs = {self.notify(msg) for msg in HA_ROB_LEFT_VARIANTS}
+        self.assertEqual(outputs, {"Rob stepped out."})
+
+    def test_message_never_restates_boss_own_presence(self):
+        """The actual bug report: Boss already knows he's home; the message
+        must not remind him."""
+        self.rob_state = "not_home"
+        out = self.notify(HA_ROB_LEFT_VARIANTS[0])
+        self.assertConcise(out)
+        for phrase in ("while you are", "you are still", "you remain"):
+            self.assertNotIn(phrase, out.lower())
+
+    def test_no_robotic_wording(self):
+        self.rob_state = "not_home"
+        out = self.notify(HA_ROB_LEFT_VARIANTS[0])
+        self.assertNotIn("left the premises", out.lower())
+
+    def test_message_is_one_line(self):
+        self.rob_state = "home"
+        out = self.notify(HA_ROB_HOME_VARIANTS[0])
+        self.assertEqual(out.count("\n"), 0)
+
+    def test_unknown_rob_state_relays_ha_text_rather_than_guessing(self):
+        self.rob_state = "unknown"
+        msg = HA_ROB_LEFT_VARIANTS[0]
+        out = self.notify(msg)
+        self.assertEqual(out, msg)
+
+    def test_unreachable_home_assistant_relays_ha_text(self):
+        async def broken(entity_id):
+            raise RuntimeError("HA down")
+        ha.get_state = broken
+        msg = HA_ROB_LEFT_VARIANTS[0]
+        out = self.notify(msg)
+        self.assertEqual(out, msg)
+
+    def test_never_reaches_the_llm(self):
+        async def trap():
+            raise ReachedRewriter()
+        ha.get_all_states = trap
+        ha.GROQ_API_KEY = "test-key-not-used"
+        for msg in HA_ROB_LEFT_VARIANTS + HA_ROB_HOME_VARIANTS:
+            try:
+                self.notify(msg)
+            except ReachedRewriter:
+                self.fail(f"{msg!r} was sent to the rewriter")
+
+    def test_does_not_increase_notification_count(self):
+        """One HA post about Rob produces exactly one reply — no second
+        message, no duplicate delivery."""
+        self.rob_state = "home"
+        out = self.notify(HA_ROB_HOME_VARIANTS[0])
+        self.assertIsInstance(out, str)
+        self.assertEqual(out.count("\n"), 0)
+
+
 # ── The formatter itself ───────────────────────────────────────────────────
 class FormatterTests(unittest.TestCase):
     def test_kinds_are_recognised(self):
@@ -220,16 +321,31 @@ class FormatterTests(unittest.TestCase):
                             personality.presence_kind(HA_OFFICE_OUT))
 
     def test_unrelated_messages_are_not_presence(self):
-        for msg in ("Roommate arrived home 🏠", "The place is empty 🏠",
-                    "Ammiel is home. You are free to lock the top lock.",
+        for msg in ("The place is empty 🏠", "Rain expected on your commute",
+                    "Motion detected in the driveway",
+                    "There's a problem with the router",  # 'rob' as a substring, not a word
                     "", None):
             self.assertIsNone(personality.presence_kind(msg), repr(msg))
+
+    def test_roommate_reference_is_recognised_as_presence(self):
+        for msg in ("Ammiel is home. You are free to lock the top lock.",
+                    "Roommate arrived home 🏠",
+                    "Rob is no longer home."):
+            self.assertEqual(personality.presence_kind(msg),
+                             personality.ROOMMATE_PRESENCE, repr(msg))
 
     def test_roommate_line_states(self):
         self.assertIn("Rob", personality.roommate_line("home"))
         self.assertIn("Rob", personality.roommate_line("not_home"))
         self.assertEqual(personality.roommate_line("unknown"), "")
         self.assertEqual(personality.roommate_line(None), "")
+
+    def test_roommate_presence_text_states(self):
+        self.assertEqual(personality.roommate_presence_text("home"), "Rob is home.")
+        self.assertEqual(personality.roommate_presence_text("not_home"), "Rob stepped out.")
+        self.assertEqual(personality.roommate_presence_text("away"), "Rob stepped out.")
+        self.assertEqual(personality.roommate_presence_text("unknown"), "")
+        self.assertEqual(personality.roommate_presence_text(None), "")
 
 
 if __name__ == "__main__":

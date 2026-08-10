@@ -103,15 +103,28 @@ async def get_smart_notification(title: str, message: str) -> str:
     kind = personality.presence_kind(message)
     if kind is not None:
         rob_state = None
-        if kind == personality.ARRIVE_HOME:
-            # Rob's home/away decides the top lock, so it rides along with the
-            # welcome. Best-effort: an unreachable HA drops the line, never
-            # the welcome itself.
+        if kind in (personality.ARRIVE_HOME, personality.ROOMMATE_PRESENCE):
+            # Rob's home/away decides the top lock (welcome-home) or IS the
+            # message (roommate presence), so query it live rather than trust
+            # HA's wording. Best-effort: an unreachable HA drops the welcome's
+            # roommate line, never the welcome itself.
             try:
                 st = await get_state(ROOMMATE_ENTITY)
                 rob_state = (st or {}).get("state")
             except Exception as e:
-                log.warning(f"roommate state unavailable for welcome-home: {e}")
+                log.warning(f"roommate state unavailable: {e}")
+
+        if kind == personality.ROOMMATE_PRESENCE:
+            text = personality.roommate_presence_text(rob_state)
+            if text:
+                log.info("Roommate presence delivered verbatim (no rewrite)")
+                return text
+            # Rob's state couldn't be resolved — no direction to report
+            # without guessing, so relay HA's own text rather than fabricate
+            # one or send it to the rewriter for a narrated guess.
+            log.warning("roommate state unresolved — relaying HA's own text")
+            return message
+
         log.info(f"Presence transition '{kind}' delivered verbatim (no rewrite)")
         return personality.presence_text(kind, rob_state=rob_state)
 
