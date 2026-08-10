@@ -9,97 +9,132 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ## Video-doorbell announcement reliability
 
-**DONE — 2026-08-10, live on the NAS Home Assistant instance (192.168.1.63:8123).**
-Real failure reported: the doorbell rang, the Boss was home, and the Google
-Home speaker never announced it — a visitor was missed. Framed explicitly as
-a reliability problem, not a wording problem. No Loki code is involved
-anywhere in this path (confirmed by grep across the repo) — the entire chain
-lives in Home Assistant: `binary_sensor.front_door_doorbell` (Tapo, device
-class `sound`) → `automation.doorbell_announce_on_bedroom_clock` (config id
+**DONE — 2026-08-10, live on the NAS Home Assistant instance (192.168.1.63:8123),
+confirmed audible by the Boss in person.** Real failure reported: the
+doorbell rang, the Boss was home, and the Google Home speaker never
+announced it — a visitor was missed. Framed explicitly as a reliability
+problem, not a wording problem. No Loki code is involved anywhere in this
+path (confirmed by grep across the repo) — the entire chain lives in Home
+Assistant: `binary_sensor.front_door_doorbell` (Tapo, device class `sound`)
+→ `automation.doorbell_announce_on_bedroom_clock` (config id
 `doorbell_announcement`) → `script.doorbell_announce` → `media_player.clock`
 (Google Home speaker, friendly name "CLOCK") via `media_player.play_media`
 (chime) + `tts.speak` (message).
 
-**Root cause, proven not assumed — two independent, confirmed defects.**
+**This closed in two passes.** The first pass (documented below as "initial
+fix") looked complete from every signal available via the HA API — but a
+live audible test with the Boss physically listening proved it wasn't. The
+second pass found the actual remaining root cause, which the first pass's
+own tooling had no way to detect. Both are recorded here because the gap
+between "HA says success" and "a human actually heard it" is itself the
+lesson: **HA state transitions and logbook entries prove HA dispatched a
+command — they do not prove a physical speaker made sound.** The Boss's
+explicit instruction not to claim success from state/log evidence alone is
+exactly why this didn't ship broken.
 
+**Initial fix — two confirmed defects, real but incomplete.**
 1. Both chime steps in `script.doorbell_announce` hardcoded
-   `media_content_id: http://192.168.1.247:8123/local/doorbell.mp3` —
-   `192.168.1.247` is the decommissioned pre-rebuild asus/unicron address (the
-   same stale-IP bug class already found and fixed twice this session in
-   `nextcloud_integration.py` and the JD integration). A live HEAD request
-   confirmed it: the old host refuses the connection outright
-   (`ClientConnectorError`), while the current NAS host
-   (`192.168.1.63:8123` — matching HA's own `internal_url`, which is *also*
-   still stale, flagged but not touched, out of scope) serves the file with a
-   clean 200. Every chime playback attempt was guaranteed to fail silently
-   (the Cast device fetches the URL itself; HA never sees the failure).
+   `media_content_id: http://192.168.1.247:8123/local/doorbell.mp3` — the
+   decommissioned pre-rebuild asus/unicron address (the same stale-IP bug
+   class already found and fixed twice this session in
+   `nextcloud_integration.py` and the JD integration). Switched to
+   `media-source://media_source/local/doorbell.mp3`, believed at the time to
+   be host-independent.
 2. `automation.doorbell_announce_on_bedroom_clock` had **no condition block
-   at all** — the "announce only if I'm home" behavior the Boss described as
-   expected was never implemented, not broken by a bad condition. Confirmed
-   via `GET /api/config/automation/config/doorbell_announcement`.
+   at all** — added `condition: state person.kavaris == home`.
+3. Added a purely-additive `automation.doorbell_sensor_diagnostics`
+   (logs every raw sensor transition via `logbook.log`, independent of the
+   announce automation's own trigger/condition — still live and useful).
 
-Supporting evidence gathered before concluding: `last_triggered` on both the
-automation and the script was frozen at `2026-07-31T17:36:56`, with zero
-retained history/logbook entries for `binary_sensor.front_door_doorbell`
-transitioning to `on` in the following ~10 days, and zero ERROR/WARNING log
-lines anywhere mentioning the doorbell, script, media player, or TTS entity —
-consistent with the trigger genuinely not having matched, not with the
-automation running and failing silently. A tempting red herring was ruled
-out: a second, already-documented-and-audited (2026-07-25) automation,
-`automation.loki_front_door_person_detected`, is permanently blocked by a
-missing ONVIF push-event subscription on a *different* entity
-(`binary_sensor.front_door_person_detection`) — unrelated to this one.
+Validated via `POST /api/states/binary_sensor.front_door_doorbell` (a real
+state-change event, not a direct TTS call) — trigger fired, condition
+passed, script ran, `media_player.clock` transitioned states correctly, zero
+errors. **This all looked like a clean pass and was reported as fixed.**
 
-**Repair — smallest durable change, HA config only, no restart.**
-- Chime `media_content_id` switched to `media-source://media_source/local/doorbell.mp3`
-  (media_source integration confirmed loaded) — host-independent, so this bug
-  class cannot recur on the next host migration, rather than swapping in
-  another literal address.
-- Added `condition: [{"condition": "state", "entity_id": "person.kavaris",
-  "state": "home"}]` to the automation — reusing the exact presence entity
-  Loki's own presence-wording code already treats as canonical
-  (`ha_integration.BOSS_ENTITY`), not a new one.
-- Added a new, purely-additive `automation.doorbell_sensor_diagnostics`:
-  triggers on *any* state change of the doorbell sensor (no `to:` filter) and
-  writes a `logbook.log` entry ("changed off -> on" / "changed on -> off").
-  This is independent of whether the announce automation's own trigger or
-  condition matches, so a future missed visitor is diagnosable (was the raw
-  sensor even touched?) without guessing. `system_log.write` was tried first
-  for this and dropped — its INFO-level entries never actually appeared in
-  `/api/error_log` under this instance's default logger config, while
-  `logbook.log` and HA's own automatic automation/script logbook entries
-  proved immediately, reliably visible during testing, so the diagnostics
-  lean on the channel that's actually confirmed to work.
-- Applied via the HA REST config API (`POST /api/config/{automation,script}/config/{id}`)
-  followed by `automation.reload` + `script.reload` — no HA restart needed or
-  used.
+**It wasn't. The Boss listened in person and heard nothing.** That live
+audible test is what actually caught the remaining bug — none of the HA-side
+signals (state transitions, logbook, `last_triggered`) had any way to
+surface it, because HA was truthfully reporting what *it* did successfully;
+it just didn't reveal that the fetch/playback in between never worked.
 
-**Validation — real event path, not a direct TTS call.** Per the explicit
-instruction not to fake success by calling `tts.speak` directly: validated by
-`POST /api/states/binary_sensor.front_door_doorbell` with state `on`, a
-genuine state-change event that exercises the actual
-trigger→condition→script chain. Run twice deliberately, both clean: automation
-`last_triggered` updated immediately, script ran its full sequence (chime →
-2.5s delay → TTS → 1.8s delay → chime) and returned to `off` within the
-expected ~4.3–6.5s window, `media_player.clock` observed transitioning to
-`idle` after chime playback, zero errors. A third, *organic* real sensor
-transition happened to occur mid-investigation (unprompted, while the Boss
-was home) and was caught and handled correctly by the already-reloaded fix —
-additional real-world confirmation beyond the synthetic tests. Confirmed no
-other automation was touched: 30 automations before, 31 after (exactly the
-new diagnostic one added).
+**Real root cause, found via direct speaker-side diagnosis:**
+`media-source://` resolution and the `tts_proxy` URL Home Assistant
+generates for every `tts.speak` call are **both** built from
+`hass.config.internal_url` — which was *also* still `http://192.168.1.247:8123`
+(confirmed live in `/api/config`; flagged in the first pass and
+incorrectly judged out of scope). Switching the script to a media-source URI
+never actually decoupled it from the dead host — HA just resolves that URI
+back through the same broken setting before handing a URL to the Cast
+device. Direct proof: `homeassistant.components.cast.media_player` logged
+`Failed to cast media http://192.168.1.247:8123/... from internal_url` as an
+explicit ERROR on every real attempt, chime and TTS alike. A literal,
+correct, already-reachable URL (`http://192.168.1.63:8123/...`) and a fully
+external public test URL both played back with clean Cast telemetry
+(`buffering`→`playing`→`idle`, real `media_duration` reported by the
+device), proving the Cast device, network path, and HA↔device connection
+were never the problem — only `internal_url`-dependent resolution was. HA
+does not expose a way to change `internal_url`/`external_url` via REST; it
+required the WebSocket API's `config/core/update` command. Corrected to
+`http://192.168.1.63:8123` — a value that was fully dead could only be
+improved by fixing it, and it likely affected other local-media/TTS casts
+in this HA instance beyond just the doorbell.
+
+**Volume was a real secondary factor, caught along the way.** The bedside
+clock's volume sits at 33% day-to-day (fine for voice interaction the Boss
+uses daily — timers, alarms, light control, all confirmed working
+natively), but wasn't reliably audible for a one-shot announcement from
+another room. The script now snapshots the current volume into a script
+variable, bumps to 90% before the chime, and restores the original value at
+the end — confirmed by direct read-back after a full run
+(`0.33000004291534424`, matching the pre-run value).
+
+**One more real bug caught live:** a first attempt at repeating the TTS
+message with a requested 1.5s gap used a flat `delay: 1.5s` between the two
+`tts.speak` calls — but `tts.speak` returns as soon as HA *dispatches* the
+command, not when the device finishes playing (~1.4–1.7s for this phrase),
+so the fixed delay mostly overlapped the first message's own playback and
+left almost no audible gap. Fixed by waiting on
+`wait_template: is_state('media_player.clock', 'idle')` (with a timeout)
+before the 1.5s delay, so the gap is measured from actual playback
+completion, not from dispatch — confirmed correct via logbook timing
+(~1.67s from `idle` to the next `buffering`) and by the Boss's own ear.
+
+**Final validated script sequence:** snapshot volume → bump to 90% → settle
+2s → chime → 2.5s → TTS "Someone is at the door" → wait for idle + 1.5s gap
+→ TTS repeat → 1.8s → chime → 1.5s → restore original volume.
+
+**Validation — real event path throughout, never a direct TTS call to fake
+success.** Every test (initial pass and the live debugging session) fired
+`binary_sensor.front_door_doorbell` via the states API to exercise the real
+trigger→condition→script chain. The final, Boss-confirmed-audible run: clean
+trigger, condition pass, `buffering`→`playing`→`idle` Cast cycles for both
+chimes and both TTS repeats with the correct gap, sensor restored to `off`,
+volume restored to its original value, zero errors. Confirmed no other
+automation or entity was touched throughout: 434 entities / 31 automations
+before and after every change (only the one new diagnostic automation
+added, once, in the first pass).
 
 **What couldn't be fully ruled out without a physical press:** the Tapo
 sensor's device class is `sound` (general sound classification), not a
 dedicated button-press signal, so a very quiet or muffled real press could
 still be missed by the camera's own detection threshold — that's Tapo
-hardware/firmware behavior outside HA config and outside this repo's scope to
-tune. The new diagnostic automation makes this observable going forward
+hardware/firmware behavior outside HA config and outside this repo's scope
+to tune. The diagnostic automation makes this observable going forward
 without needing another investigation.
 
-**Files/config changed:** HA config only (`script.doorbell_announce`,
-`automation.doorbell_announcement`, new `automation.doorbell_sensor_diagnostics`)
-— no files in this repository changed except this documentation.
+**Files/config changed:** HA config only — `script.doorbell_announce`,
+`automation.doorbell_announcement`, new `automation.doorbell_sensor_diagnostics`,
+and the HA core `internal_url` setting (`config/core/update` via WebSocket).
+No files in this repository changed except this documentation.
+
+**Lesson recorded because it's likely to recur:** for any future Cast/media
+work in this HA instance, `media_player` state transitions and
+`media_duration` telemetry are not sufficient proof of audible output —
+Home Assistant can report a fully successful-looking cast (correct states,
+real device-reported duration) for a URL the Cast device silently couldn't
+fetch. Only a human listening, or a Cast-protocol-level error line
+(`homeassistant.components.cast.media_player` at ERROR), reveals the
+difference.
 
 ---
 
