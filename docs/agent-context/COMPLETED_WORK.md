@@ -7,6 +7,102 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## Video-doorbell announcement reliability
+
+**DONE — 2026-08-10, live on the NAS Home Assistant instance (192.168.1.63:8123).**
+Real failure reported: the doorbell rang, the Boss was home, and the Google
+Home speaker never announced it — a visitor was missed. Framed explicitly as
+a reliability problem, not a wording problem. No Loki code is involved
+anywhere in this path (confirmed by grep across the repo) — the entire chain
+lives in Home Assistant: `binary_sensor.front_door_doorbell` (Tapo, device
+class `sound`) → `automation.doorbell_announce_on_bedroom_clock` (config id
+`doorbell_announcement`) → `script.doorbell_announce` → `media_player.clock`
+(Google Home speaker, friendly name "CLOCK") via `media_player.play_media`
+(chime) + `tts.speak` (message).
+
+**Root cause, proven not assumed — two independent, confirmed defects.**
+
+1. Both chime steps in `script.doorbell_announce` hardcoded
+   `media_content_id: http://192.168.1.247:8123/local/doorbell.mp3` —
+   `192.168.1.247` is the decommissioned pre-rebuild asus/unicron address (the
+   same stale-IP bug class already found and fixed twice this session in
+   `nextcloud_integration.py` and the JD integration). A live HEAD request
+   confirmed it: the old host refuses the connection outright
+   (`ClientConnectorError`), while the current NAS host
+   (`192.168.1.63:8123` — matching HA's own `internal_url`, which is *also*
+   still stale, flagged but not touched, out of scope) serves the file with a
+   clean 200. Every chime playback attempt was guaranteed to fail silently
+   (the Cast device fetches the URL itself; HA never sees the failure).
+2. `automation.doorbell_announce_on_bedroom_clock` had **no condition block
+   at all** — the "announce only if I'm home" behavior the Boss described as
+   expected was never implemented, not broken by a bad condition. Confirmed
+   via `GET /api/config/automation/config/doorbell_announcement`.
+
+Supporting evidence gathered before concluding: `last_triggered` on both the
+automation and the script was frozen at `2026-07-31T17:36:56`, with zero
+retained history/logbook entries for `binary_sensor.front_door_doorbell`
+transitioning to `on` in the following ~10 days, and zero ERROR/WARNING log
+lines anywhere mentioning the doorbell, script, media player, or TTS entity —
+consistent with the trigger genuinely not having matched, not with the
+automation running and failing silently. A tempting red herring was ruled
+out: a second, already-documented-and-audited (2026-07-25) automation,
+`automation.loki_front_door_person_detected`, is permanently blocked by a
+missing ONVIF push-event subscription on a *different* entity
+(`binary_sensor.front_door_person_detection`) — unrelated to this one.
+
+**Repair — smallest durable change, HA config only, no restart.**
+- Chime `media_content_id` switched to `media-source://media_source/local/doorbell.mp3`
+  (media_source integration confirmed loaded) — host-independent, so this bug
+  class cannot recur on the next host migration, rather than swapping in
+  another literal address.
+- Added `condition: [{"condition": "state", "entity_id": "person.kavaris",
+  "state": "home"}]` to the automation — reusing the exact presence entity
+  Loki's own presence-wording code already treats as canonical
+  (`ha_integration.BOSS_ENTITY`), not a new one.
+- Added a new, purely-additive `automation.doorbell_sensor_diagnostics`:
+  triggers on *any* state change of the doorbell sensor (no `to:` filter) and
+  writes a `logbook.log` entry ("changed off -> on" / "changed on -> off").
+  This is independent of whether the announce automation's own trigger or
+  condition matches, so a future missed visitor is diagnosable (was the raw
+  sensor even touched?) without guessing. `system_log.write` was tried first
+  for this and dropped — its INFO-level entries never actually appeared in
+  `/api/error_log` under this instance's default logger config, while
+  `logbook.log` and HA's own automatic automation/script logbook entries
+  proved immediately, reliably visible during testing, so the diagnostics
+  lean on the channel that's actually confirmed to work.
+- Applied via the HA REST config API (`POST /api/config/{automation,script}/config/{id}`)
+  followed by `automation.reload` + `script.reload` — no HA restart needed or
+  used.
+
+**Validation — real event path, not a direct TTS call.** Per the explicit
+instruction not to fake success by calling `tts.speak` directly: validated by
+`POST /api/states/binary_sensor.front_door_doorbell` with state `on`, a
+genuine state-change event that exercises the actual
+trigger→condition→script chain. Run twice deliberately, both clean: automation
+`last_triggered` updated immediately, script ran its full sequence (chime →
+2.5s delay → TTS → 1.8s delay → chime) and returned to `off` within the
+expected ~4.3–6.5s window, `media_player.clock` observed transitioning to
+`idle` after chime playback, zero errors. A third, *organic* real sensor
+transition happened to occur mid-investigation (unprompted, while the Boss
+was home) and was caught and handled correctly by the already-reloaded fix —
+additional real-world confirmation beyond the synthetic tests. Confirmed no
+other automation was touched: 30 automations before, 31 after (exactly the
+new diagnostic one added).
+
+**What couldn't be fully ruled out without a physical press:** the Tapo
+sensor's device class is `sound` (general sound classification), not a
+dedicated button-press signal, so a very quiet or muffled real press could
+still be missed by the camera's own detection threshold — that's Tapo
+hardware/firmware behavior outside HA config and outside this repo's scope to
+tune. The new diagnostic automation makes this observable going forward
+without needing another investigation.
+
+**Files/config changed:** HA config only (`script.doorbell_announce`,
+`automation.doorbell_announcement`, new `automation.doorbell_sensor_diagnostics`)
+— no files in this repository changed except this documentation.
+
+---
+
 ## Hermes resilient diagnostic capability (provider fallback)
 
 **DONE — 2026-08-10, live on razr and dex247.** Goal: give Hermes a second
