@@ -195,3 +195,42 @@ agy runs as `g2k247` on dex247 alongside Claude Code; neither owns the project.
 Durable context lives in the repository (`AGENTS.md`, `docs/agent-context/`,
 `.agents/`) so no conversation history from any vendor is load-bearing.
 Career-Ops evaluations specifically run on razr's Antigravity, never Claude.
+
+## Provider auth failures are gated the same as billing failures
+
+A bad or revoked provider credential doesn't self-resolve by waiting any more
+than an exhausted quota does. `hermes_guard.py`'s `auth` class therefore opens
+the circuit instantly (skipping the 3-consecutive-failure threshold that
+applies to plain reachability failures) and recovers the same way billing
+does — one controlled submit, never the bridge's non-billable `GET /health`,
+because `/health` never calls the model provider and proves nothing about
+whether a credential was fixed. This exists because `paused_auth` (the
+bridge's own state for exactly this failure) was silently unhandled until
+2026-08-10 — the circuit never opened for it, so Loki kept submitting jobs
+against a credential that could never succeed.
+
+## Provider resilience is Hermes Agent's job, not Loki's to reimplement
+
+Hermes Agent (the actual runtime on razr, v0.19.0) has its own native
+multi-provider support — an Anthropic adapter and a `hermes fallback` chain
+("tried in order when the primary model fails") — built by that project, not
+by Loki. `hermes_guard.py` stays a client-side gate in front of
+*whether a job is submitted at all*; it does not reimplement per-request
+provider selection or retry logic, which would duplicate what Hermes Agent
+already does one layer down and is exactly the "scattered fallback logic"
+this design avoids. Consequence, not separately engineered: once a fallback
+chain exists on razr, the guard's existing single "hermes-provider" circuit
+already means "every provider Hermes Agent tried for this job was
+unavailable" — the bridge only reports `paused_quota`/`paused_auth` after its
+own fallback chain (if any) is exhausted, not after the first provider fails.
+
+## Don't claim cost accuracy the bridge itself doesn't have
+
+`hermes-bridge/lib/budget.mjs`'s rate card and `lib/usage.mjs`'s spend probe
+(razr, not this repo) only price/observe OpenRouter-routed models. A job
+served by any other provider — Fable, once configured — prices at $0 in the
+bridge's own ledger, silently. `hermes_guard.status()` reports
+`last_serving_model_cost_telemetry` as `"unreliable"` for any model outside
+that known-priced set rather than letting a $0 observed spend read as "this
+job was free." The fix belongs in the bridge (razr); this repo's job is to
+not repeat a wrong number with false confidence.

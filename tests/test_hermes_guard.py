@@ -491,5 +491,131 @@ class NotificationPolicyTests(Base):
         self.assertIn("hermes_provider_status", tools.REGISTRY)
 
 
+# ── Auth-class failures, status vocabulary, provider hint ──────────────────
+# Added for the Hermes provider-resilience task: a bad/revoked razr-side
+# credential (bridge job state "paused_auth") was previously never fed to the
+# guard at all — record_failure was only called for paused_quota/failed, so
+# an auth outage left the circuit permanently CLOSED while every submit kept
+# failing the same way. classify()/record_failure() now treat "auth" as its
+# own class, opening immediately like billing (a bad credential doesn't
+# self-resolve by waiting) but reported under its own status_label.
+PAUSED_AUTH_MSG = "provider authentication failed (job 12345678 paused_auth)"
+
+
+class AuthClassTests(Base):
+    def test_classify_distinguishes_auth_from_billing_and_rate_limit(self):
+        self.assertEqual(hg.classify("provider authentication failed — re-authenticate on razr"), "auth")
+        self.assertEqual(hg.classify("401 unauthorized"), "auth")
+        self.assertEqual(hg.classify(QUOTA_MSG), "billing")
+        self.assertEqual(hg.classify("429 too many requests"), "rate_limit")
+
+    def test_paused_auth_job_state_opens_circuit_immediately(self):
+        """The gap this closes: note_job_state used to silently drop
+        paused_auth — the circuit never opened and Loki kept submitting jobs
+        against a credential that could never succeed."""
+        run(hh.note_job_state({"id": "job_badkey", "state": "paused_auth"}))
+        self.assertEqual(hg.status()["circuit"], hg.OPEN)
+        self.assertEqual(hg.status()["reason_class"], "auth")
+        with self.assertRaises(hh.HermesProviderBlocked):
+            self.submit()
+
+    def test_auth_failure_does_not_need_three_consecutive(self):
+        run(hg.record_failure("provider authentication failed — re-authenticate on razr"))
+        self.assertEqual(hg.status()["circuit"], hg.OPEN)
+
+    def test_auth_recovery_is_one_controlled_submit_not_health_probe(self):
+        probed = {"n": 0}
+
+        async def fake_health():
+            probed["n"] += 1
+            return {"ok": True}
+
+        hg.bind(health_probe=fake_health)
+        try:
+            run(hg.record_failure("401 unauthorized"))
+            hg._set(cooldown_until=time.time() - 1)
+            ok, why = run(hg.allow_request())
+            self.assertTrue(ok, why)
+            self.assertEqual(probed["n"], 0,
+                             "auth-class recovery must not use the non-billable "
+                             "health probe — it never calls the model provider, "
+                             "so it can't prove a rotated credential works")
+        finally:
+            hg.bind(health_probe=None)
+
+
+class StatusLabelTests(Base):
+    def test_closed_is_operational(self):
+        self.assertEqual(hg.status()["status_label"], "operational")
+
+    def test_billing_open_is_protective_quota(self):
+        run(hg.record_failure(QUOTA_MSG))
+        self.assertEqual(hg.status()["status_label"], "protective_quota")
+
+    def test_auth_open_is_authentication_failed(self):
+        run(hg.record_failure(PAUSED_AUTH_MSG))
+        self.assertEqual(hg.status()["status_label"], "authentication_failed")
+
+    def test_rate_limit_needs_three_then_labels_unreachable_style(self):
+        for _ in range(3):
+            run(hg.record_failure("429 too many requests"))
+        self.assertEqual(hg.status()["reason_class"], "rate_limit")
+        self.assertEqual(hg.status()["status_label"], "rate_limited")
+
+    def test_generic_unavailable_open_is_unreachable(self):
+        for _ in range(3):
+            run(hg.record_failure(UNREACHABLE_MSG))
+        self.assertEqual(hg.status()["status_label"], "unreachable")
+
+    def test_budget_open_is_protective_budget(self):
+        for _ in range(hg.MAX_PER_HOUR):
+            self.submit()
+        with self.assertRaises(hh.HermesProviderBlocked):
+            self.submit()
+        self.assertEqual(hg.status()["status_label"], "protective_budget")
+
+    def test_half_open_is_recovering(self):
+        run(hg.record_failure(QUOTA_MSG))
+        hg._set(state=hg.HALF_OPEN, probe_inflight_until=time.time() + 300)
+        self.assertEqual(hg.status()["status_label"], "recovering")
+
+
+class ProviderHintTests(Base):
+    def test_priced_model_reports_reliable_cost_telemetry(self):
+        run(hh.note_job_state({
+            "id": "job1", "state": "completed",
+            "phases": [{"model": "anthropic/claude-sonnet-5"}],
+        }))
+        out = hg.status()
+        self.assertEqual(out["last_serving_model"], "anthropic/claude-sonnet-5")
+        self.assertEqual(out["last_serving_model_cost_telemetry"], "reliable")
+
+    def test_unpriced_model_eg_fable_flags_unreliable_cost_telemetry(self):
+        """The bridge's own rate card (lib/budget.mjs) and spend probe
+        (lib/usage.mjs, OpenRouter-only) don't know claude-fable-5 — a job
+        served by it prices at $0 in the bridge's ledger. The guard must not
+        silently agree that it cost nothing."""
+        run(hh.note_job_state({
+            "id": "job2", "state": "completed",
+            "phases": [{"model": "claude-fable-5"}],
+        }))
+        out = hg.status()
+        self.assertEqual(out["last_serving_model"], "claude-fable-5")
+        self.assertIn("unreliable", out["last_serving_model_cost_telemetry"])
+
+    def test_no_phases_leaves_last_serving_model_none(self):
+        run(hh.note_job_state({"id": "job3", "state": "completed", "phases": []}))
+        self.assertIsNone(hg.status()["last_serving_model"])
+
+    def test_provider_hint_survives_restart(self):
+        run(hh.note_job_state({
+            "id": "job4", "state": "completed",
+            "phases": [{"model": "anthropic/claude-opus-5"}],
+        }))
+        hg._conn.close()
+        hg._conn = None
+        self.assertEqual(hg.status()["last_serving_model"], "anthropic/claude-opus-5")
+
+
 if __name__ == "__main__":
     unittest.main()

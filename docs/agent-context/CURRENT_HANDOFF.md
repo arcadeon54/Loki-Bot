@@ -4,6 +4,39 @@
 
 ## Just completed
 
+**Hermes multi-provider resilience — DONE 2026-08-10 (dex247 side); one Boss
+action still open on razr.** OpenRouter is confirmed exhausted (402, read-only
+via `hermes auth list` on razr — no paid probe), and this is correctly
+represented as protective degradation (`hermes-provider` incident, one, open,
+`billing`/`protective_quota`), not a full outage. Investigated whether "Fable"
+(the Boss's available credits) can give Hermes a second provider: **it can** —
+Hermes Agent v0.19.0 (the actual agent runtime on razr, not something Loki
+built) already has a native Anthropic adapter and a real fallback-chain
+feature (`hermes fallback add/list/remove`); it isn't wired up yet. No
+Anthropic credential exists for the `hermes` account, and the fallback chain
+is empty. **Blocked on the Boss**, not on code — see
+`.agents/skills/hermes-operations/SKILL.md` § Fable / multi-provider
+capability for the exact two commands to run on razr as the `hermes` user.
+
+Real bug fixed while investigating: `homelab_hermes.note_job_state()` never
+handled the bridge's `paused_auth` job state — a bad/revoked provider
+credential left a job parked forever without ever telling
+`hermes_guard.py`, so the circuit never opened. Fixed; `auth` is now its own
+failure class (opens instantly, like billing, since a bad credential doesn't
+self-resolve by waiting). `hermes_guard.status()` also gained a
+`status_label` field (operational/protective_quota/protective_budget/
+authentication_failed/rate_limited/unreachable/recovering — see SKILL.md for
+the mapping) and `last_serving_model` / `last_serving_model_cost_telemetry`,
+because the bridge's own cost accounting (`hermes-bridge/lib/budget.mjs`,
+`lib/usage.mjs`) only prices two OpenRouter-routed models and would silently
+record $0 for any job Fable ends up serving — the guard now says so instead
+of agreeing spend was zero. 15 new tests, `tests/test_hermes_guard.py` now 45,
+all green; no bridge code touched (Boss chose not to, given a second
+production service on a second machine); no paid Hermes request made during
+this work. Deploy note: `hermes_guard.py`/`homelab_hermes.py` changes are
+code-only until the next `loki.service` restart (not taken — restarts stay
+approval-gated).
+
 **Correction — the 2026-08-09 Tracearr entry below is wrong about who applied
 v1.5.0 → v2.0.1 — DONE 2026-08-10.** While reconciling homelab documentation
 into Joplin, its `Loki/Maintenance` notebook turned up a note **Loki itself

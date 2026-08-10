@@ -89,13 +89,27 @@ def bind(health_probe=None):
 
 # ── Failure classification ─────────────────────────────────────────────────
 _BILLING = ("quota", "insufficient", "credit", "billing", "payment", "402")
+_AUTH = ("authentication failed", "re-authenticate", "invalid api key",
+         "unauthorized", "401", "paused_auth")
 _RATE = ("rate limit", "rate-limit", "ratelimit", "429", "too many requests")
+
+# Models the bridge's own rate card (hermes-bridge/lib/budget.mjs
+# ratesFromEnv()) and spend probe (lib/usage.mjs makeSpendProbe(), OpenRouter
+# only) can actually price. A job phase served by any other model — e.g.
+# claude-fable-5 once configured as a Hermes Agent fallback provider — prices
+# at $0 in the bridge's own ledger: no rate-card entry, and the spend probe
+# only reads OpenRouter's balance. That is a real accounting gap in the
+# bridge, not something this guard can fix from dex247 — so status() flags it
+# instead of silently implying a Fable-served job cost nothing.
+PRICED_MODELS = {"anthropic/claude-sonnet-5", "anthropic/claude-opus-5"}
 
 
 def classify(detail: str) -> str:
     low = (detail or "").lower()
     if any(k in low for k in _BILLING):
         return "billing"
+    if any(k in low for k in _AUTH):
+        return "auth"
     if any(k in low for k in _RATE):
         return "rate_limit"
     return "unavailable"
@@ -300,7 +314,7 @@ async def _close_circuit(how: str):
 async def _reopen_after_failed_probe(detail: str, cls: str):
     prev = int(_getf("cooldown_secs", COOLDOWN_SECS)) or COOLDOWN_SECS
     cooldown = min(max(prev * 2, COOLDOWN_SECS), COOLDOWN_MAX_SECS)
-    if cls == "billing":
+    if cls in ("billing", "auth"):
         cooldown = max(cooldown, BILLING_COOLDOWN_SECS)
     # A reopen inside one continuous outage: state only, no second ops ping.
     now = time.time()
@@ -356,9 +370,13 @@ async def allow_request() -> tuple[bool, str]:
             note_blocked("submit during probe")
             return False, "provider circuit half-open — recovery probe already in flight"
         cls = _get("reason_class") or "unavailable"
-        if cls != "billing" and _health_probe is not None:
+        if cls not in ("billing", "auth") and _health_probe is not None:
             # Reachability-class outage: the bridge's GET /health is
-            # non-billable, so recovery costs nothing.
+            # non-billable, so recovery costs nothing. Billing and auth
+            # outages can't be verified this way — /health never calls the
+            # model provider, so it can't prove a quota refilled or a
+            # credential was fixed. Those get exactly one controlled submit
+            # instead (below).
             _set(probe_inflight_until=now + PROBE_LEASE_SECS, last_probe_at=now)
             try:
                 h = await _health_probe()
@@ -423,12 +441,50 @@ async def record_success(final: bool = True):
     now = time.time()
     state = _get("state", CLOSED)
     if (not final and state == HALF_OPEN
-            and (_get("reason_class") or "") == "billing"):
+            and (_get("reason_class") or "") in ("billing", "auth")):
         _set(last_success_at=now)
         return
     _set(consecutive_failures=0, last_success_at=now, probe_inflight_until=0)
     if state in (HALF_OPEN, OPEN):
         await _close_circuit("controlled recovery attempt succeeded")
+
+
+def record_provider_hint(model: Optional[str]):
+    """Record which model actually served the most recently observed job
+    phase (from the bridge's own job view — `phases[-1].model`). Bookkeeping
+    only, no notification: this is for observability (`status()`), not a
+    success/failure signal in its own right."""
+    if not model:
+        return
+    _set(last_model=model, last_model_at=time.time())
+
+
+# ── Status-label vocabulary ─────────────────────────────────────────────────
+# Maps the circuit's own state/reason_class onto the vocabulary the Boss-
+# facing tool reports. Deliberately built from the existing state machine
+# rather than a second, parallel status system — see hermes-operations skill.
+#
+# "unavailable_all_providers" is intentionally never asserted here: from
+# dex247 this guard only sees one aggregate signal (did the bridge's job
+# succeed or fail), not which of Hermes Agent's own configured providers
+# (openrouter, plus whatever fallback chain is set up on razr) actually
+# served or refused it. A billing-class open means "the provider(s) that
+# actually ran this job are out of quota" — that could be the only provider
+# configured, or the last one left in a fallback chain; this guard cannot
+# tell the difference without querying Hermes Agent directly on razr, which
+# it does not do. Report "protective_quota", not a claim this code can't back.
+def status_label(state: str, reason_class: str) -> str:
+    if state == HALF_OPEN:
+        return "recovering"
+    if state == CLOSED:
+        return "operational"
+    # state == OPEN
+    return {
+        "budget": "protective_budget",
+        "billing": "protective_quota",
+        "auth": "authentication_failed",
+        "rate_limit": "rate_limited",
+    }.get(reason_class, "unreachable")
 
 
 async def record_failure(detail: str):
@@ -444,14 +500,19 @@ async def record_failure(detail: str):
         return
     if state == OPEN:
         # Already open; a late job signal can still upgrade the reason —
-        # quota news during a mere reachability outage extends the cooldown.
-        if cls == "billing" and _get("reason_class") != "billing":
-            _set(reason=detail[:300], reason_class="billing",
+        # quota/auth news during a mere reachability outage extends the
+        # cooldown.
+        if cls in ("billing", "auth") and _get("reason_class") not in ("billing", "auth"):
+            _set(reason=detail[:300], reason_class=cls,
                  cooldown_until=now + BILLING_COOLDOWN_SECS,
                  cooldown_secs=BILLING_COOLDOWN_SECS)
             _ensure_provider_incident(detail)
         return
-    if cls == "billing":
+    if cls in ("billing", "auth"):
+        # Neither class self-resolves by waiting — a bad/revoked credential
+        # needs the Boss to re-authenticate on razr just as much as an
+        # exhausted quota needs a top-up — so both open on the first sighting
+        # rather than waiting for FAILURE_THRESHOLD consecutive failures.
         await _open_circuit(detail, cls, BILLING_COOLDOWN_SECS)
     elif fails >= FAILURE_THRESHOLD:
         await _open_circuit(f"{fails} consecutive provider failures — last: "
@@ -467,10 +528,16 @@ def status() -> dict:
     now = time.time()
     state = _get("state", CLOSED)
     cooldown_until = _getf("cooldown_until")
+    reason_class = _get("reason_class") or ""
+    last_model = _get("last_model") or None
     out = {
         "circuit": state,
+        # Boss-facing vocabulary (operational/protective_quota/
+        # protective_budget/rate_limited/unreachable/authentication_failed/
+        # recovering) computed from the fields below — see status_label().
+        "status_label": status_label(state, reason_class),
         "reason": _get("reason") or None,
-        "reason_class": _get("reason_class") or None,
+        "reason_class": reason_class or None,
         "opened_at": _iso(_getf("opened_at")) if state != CLOSED else None,
         "next_recovery_attempt": (_iso(cooldown_until)
                                   if state == OPEN and cooldown_until > now
@@ -489,14 +556,24 @@ def status() -> dict:
             "the bridge's spend probe works, rate-card estimate otherwise; the "
             "bridge's own ledger is authoritative"),
         "recovery_probe": ("bridge GET /health (non-billable) for outages; "
-                           "one controlled submit for billing-class opens"),
+                           "one controlled submit for billing/auth-class opens"),
+        "last_serving_model": last_model,
+        "last_serving_model_cost_telemetry": (
+            None if last_model is None else
+            "reliable" if last_model in PRICED_MODELS else
+            "unreliable — the bridge's rate card and spend probe (razr "
+            "hermes-bridge/lib/budget.mjs, lib/usage.mjs) only price "
+            f"{sorted(PRICED_MODELS)}; a job served by any other model "
+            "(e.g. a Fable fallback) prices at $0 in both the bridge's "
+            "ledger and this guard's observed spend — treat spend_last_24h_usd "
+            "as understated whenever this says 'unreliable'"),
     }
     return out
 
 
 def status_line() -> str:
     s = status()
-    bits = [f"circuit {s['circuit']}"]
+    bits = [f"circuit {s['circuit']} [{s['status_label']}]"]
     if s["circuit"] != CLOSED:
         bits.append(f"({s['reason_class']}: {(s['reason'] or '')[:80]})")
     bits.append(f"req {s['requests_last_hour']}/h {s['requests_last_24h']}/24h")

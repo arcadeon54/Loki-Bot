@@ -130,20 +130,32 @@ async def health() -> dict:
 
 async def note_job_state(job: dict):
     """Feed one polled bridge-job view to the guard: observed cost always;
-    quota pauses and hard failures as provider failure signals; completion as
-    a provider success. Callers poll jobs anyway — this is bookkeeping, it
-    performs no network requests of its own."""
+    quota/auth pauses and hard failures as provider failure signals;
+    completion as a provider success. Callers poll jobs anyway — this is
+    bookkeeping, it performs no network requests of its own."""
     if guard is None or not isinstance(job, dict):
         return
     jid = str(job.get("id") or "")
     if jid:
         guard.record_cost(jid, job.get("cost_usd"))
+    phases = job.get("phases") or []
+    if phases and isinstance(phases[-1], dict):
+        guard.record_provider_hint(phases[-1].get("model"))
     s = job.get("state")
     if s == "completed":
         await guard.record_success()
     elif s == "paused_quota":
         await guard.record_failure(
             f"provider quota exhausted (job {jid[-8:]} paused_quota)")
+    elif s == "paused_auth":
+        # The bridge's own message is "provider authentication failed —
+        # re-authenticate on razr" (server.mjs classifyFailure "auth"); this
+        # was previously not handled at all, so a bad/revoked provider
+        # credential left the job parked in paused_auth forever without the
+        # guard ever finding out — nothing opened the circuit, and Loki kept
+        # submitting new jobs against a provider that could never succeed.
+        await guard.record_failure(
+            f"provider authentication failed (job {jid[-8:]} paused_auth)")
     elif s == "failed":
         await guard.record_failure(f"hermes job {jid[-8:]} failed at the bridge")
 
