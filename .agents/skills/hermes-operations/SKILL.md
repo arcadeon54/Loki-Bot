@@ -101,57 +101,93 @@ do — see Fable/multi-provider below.
   quota refilled or a credential was fixed. Submit acceptance is
   `record_success(final=False)` and does **not** close either circuit class.
 
-## Fable / multi-provider capability (investigated 2026-08-10)
+## Provider fallback chain (configured 2026-08-10 — live on razr)
 
-**"Fable" is Claude Fable 5 (`claude-fable-5`), Anthropic's own model — not an
-OpenRouter catalog entry.** Hermes Agent (`/home/hermes/.hermes/hermes-agent`,
-v0.19.0, on razr) already has a native, first-class Anthropic provider
-(`agent/anthropic_adapter.py`) that recognizes `claude-fable-5` (confirmed in
-`agent/model_metadata.py`, 1M context), plus a genuine multi-provider
-**fallback chain** feature (`hermes fallback add/list/remove`, "tried in
-order when the primary model fails with rate-limit, overload, or connection
-errors") — built by the Hermes Agent project itself, not something Loki needs
-to reimplement.
+**Fable was investigated twice, then explicitly rejected by the Boss on cost
+grounds. This is settled — do not reopen it as a fallback candidate.**
+First pass: "Fable" is Claude Fable 5 (`claude-fable-5`), Anthropic's own
+model; Hermes Agent has a native Anthropic provider adapter that recognizes
+it — but the Boss doesn't hold an Anthropic account, so that path was
+withdrawn before any credential was requested. Second pass, from the Boss's
+actual OpenRouter account: `anthropic/claude-fable-5` genuinely is a
+live-listed OpenRouter model (confirmed via OpenRouter's public
+`/v1/models`), reachable on the existing key with no new credential — but a
+non-billable balance read on that key (mirroring the bridge's own spend
+probe) showed only $0.36 left on a $10 cap, nowhere near Fable's $10/$50
+per-million pricing. The Boss then ruled it out entirely: *"too expensive for
+routine Hermes diagnostics — I only used it previously because of a
+temporary promotional credit arrangement."* No Fable model appears anywhere
+in the configured chain.
 
-**Current live state (read-only, verified via `hermes auth list` /
-`hermes status` on razr, no paid request made):** OpenRouter is the sole
-configured provider and is `exhausted (402) (ready to retry)`. No Anthropic
-credential exists for the `hermes` system account (`Anthropic ✗ (not set)` in
-`hermes status`; no `~/.claude.json` or `~/.claude/.credentials.json` either).
-The fallback chain is empty (`hermes fallback list` → "No fallback providers
-configured").
+**Final architecture — cost-tiered, per explicit instruction: local first,
+cheap paid second, frontier models manual-escalation-only, never
+automatic.** Hermes Agent (`/home/hermes/.hermes/hermes-agent`, v0.19.0, on
+razr) has its own genuine multi-provider **fallback chain** feature — built
+by the Hermes Agent project itself, not something Loki reimplements. Config
+schema lives at `/home/hermes/.hermes/config.yaml`, a `fallback_providers`
+list (each entry: `provider`, `model`, optional `base_url`, optional
+`api_key`/`key_env` — read by `hermes_cli/fallback_config.py`). Confirmed in
+`agent/conversation_loop.py`, not just the config file's own comment, that
+`FailoverReason.billing` (HTTP 402 — OpenRouter's actual current failure) is
+in the eager-fallback trigger set, alongside rate-limit/overload/connection
+failures, with a built-in guard against retrying a depleted balance once
+every recovery path (credential-pool rotation, then the fallback chain) is
+exhausted.
 
-**The blocker, stated exactly:** to make Fable a working fallback, the Boss
-needs to run, on razr as the `hermes` system account:
+**Configured chain, verified through Hermes Agent's own read-only commands**
+(`hermes fallback list`, `hermes config get fallback_providers --json`,
+`hermes config check`, `hermes doctor` — no paid request):
 
 ```
-sudo -u hermes hermes auth add anthropic --type api-key   # prompts for the key
-sudo -u hermes hermes fallback add                        # pick anthropic / claude-fable-5
+Primary:    anthropic/claude-sonnet-5        (via openrouter)
+Fallback 1: gemma4-12b-balanced:latest       (via custom → local Ollama on razr, $0)
+Fallback 2: deepseek/deepseek-v4-flash-0731  (via openrouter, $0.08/$0.18 per M tok)
 ```
 
-This needs an Anthropic API key (`sk-ant-api...`) with access to Fable — this
-is where "Fable credits" get spent. Do this on razr directly; don't paste the
-key anywhere else. Both commands are interactive by design (secret prompt /
-picker) — that's why this stayed a documented blocker rather than something
-scripted.
+- **Fallback 1 — local Ollama.** Verified read-only: Ollama v0.20.5 running
+  on razr, `gemma4-12b-balanced:latest` reports native
+  `["completion", "tools", "thinking"]` capabilities via its own `/api/tags`
+  — genuinely tool-call capable. Hermes Agent's `custom` provider profile is
+  documented in its own source (`plugins/model-providers/custom/__init__.py`
+  docstring) as covering "any endpoint registered as provider='custom',
+  including local Ollama instances." `base_url: http://localhost:11434/v1`,
+  `api_key: ollama` — a placeholder string, not a real credential; Ollama
+  doesn't authenticate it.
+- **Fallback 2 — cheap OpenRouter.** Picked from a live pricing pull off
+  OpenRouter's public `/v1/models` (332 tool-capable text models, sorted by
+  cost). Carries **no** inline `api_key`/`key_env` — omitting both makes
+  Hermes Agent fall through to the already-configured pooled
+  `OPENROUTER_API_KEY` (confirmed in
+  `hermes_cli/cli_agent_setup_mixin.py`), so this reuses the existing
+  credential rather than adding a new one.
 
-**Known cost-accounting gap once Fable is configured (bridge-side, not fixed
-here — this task deliberately did not touch `~/hermes-bridge` on razr):**
-`hermes-bridge/lib/budget.mjs`'s `ratesFromEnv()` only prices
-`anthropic/claude-sonnet-5` and `anthropic/claude-opus-5`; `lib/usage.mjs`'s
-`makeSpendProbe()` is hard-coded to OpenRouter's own balance endpoint. A job
-phase served by Fable prices at **$0** in both the bridge's own budget ledger
-and Loki's `hermes_guard.spend_last_24h_usd()` — neither the bridge's
-`$5/day` cap nor Loki's `$5.00` observed-spend ceiling will actually see
-Fable spend. `hermes_guard.status()` flags this rather than staying silent:
+**How it was written — not through the CLI's own `add` commands.**
+`hermes config set` can't construct a fresh list-of-dicts key (confirmed in
+`hermes_cli/config.py`'s `_set_nested` — it only indexes into structure that
+already exists), and both `hermes fallback add` and `hermes model` are pure
+interactive pickers with zero non-interactive flags (confirmed: `hermes
+fallback add < /dev/null` errors `"requires an interactive terminal ...
+cannot be run through a pipe or non-interactive subprocess"`). Configured
+instead via a direct edit to `/home/hermes/.hermes/config.yaml`, using
+exactly the schema `fallback_config.py` consumes — two backups taken first
+(`config.yaml.bak-<timestamp>`), YAML validity checked with `yaml.safe_load`,
+then read back through Hermes Agent's own commands above as the real
+verification (not an assumption about what the edit would do).
+
+**Cost-accounting gap — not fixed here.** `hermes-bridge/lib/budget.mjs`'s
+`ratesFromEnv()` only prices `anthropic/claude-sonnet-5` and
+`anthropic/claude-opus-5`; `lib/usage.mjs`'s `makeSpendProbe()` is hard-coded
+to OpenRouter's own balance endpoint. A job served by **either** configured
+fallback prices at **$0** in the bridge's own ledger — correctly for local
+Ollama (genuinely free), silently wrong for DeepSeek (real nonzero cost
+hidden). `hermes_guard.status()` flags this rather than staying silent:
 `last_serving_model` + `last_serving_model_cost_telemetry` (`"reliable"` for
-the two priced OpenRouter-routed models, `"unreliable — ..."` for anything
-else, Fable included). **Deterministic ceilings remain fully effective
-regardless**: Loki's own 6/hour, 20/day request-count ceilings; the bridge's
-`max_turns` (triage 8, escalation 14), `phaseTimeoutMs`, `jobTimeoutMs`,
-`maxConcurrent: 1`. None of those depend on knowing a price, so Fable cannot
-become an unbounded fallback even with broken cost telemetry — it just can't
-be trusted to *report* its true cost yet.
+the two priced models, `"unreliable — ..."` for anything else, including
+DeepSeek). **Deterministic ceilings remain fully effective regardless**:
+Loki's own 6/hour, 20/day request-count ceilings; the bridge's `max_turns`
+(triage 8, escalation 14), `phaseTimeoutMs`, `jobTimeoutMs`,
+`maxConcurrent: 1`. None of those depend on knowing a price, so neither
+fallback can become unbounded even with broken cost telemetry.
 
 ### Cost accounting
 
@@ -209,9 +245,13 @@ pre-existing import-order pollution).
 `hermes_guard.py` · `homelab_hermes.py` · `homelab_api.py` ·
 `tests/test_hermes_guard.py` · `docs/agent-context/SECURITY_BOUNDARIES.md`
 
-razr side (separate repo, read-only investigated 2026-08-10, not modified):
-`~/hermes-bridge/server.mjs`, `lib/hermes.mjs`, `lib/budget.mjs`,
-`lib/usage.mjs` · Hermes Agent itself at
-`/home/hermes/.hermes/hermes-agent/` (`agent/anthropic_adapter.py`,
-`agent/model_metadata.py`) · Hermes Agent config
-`~/hermes-bridge/config/hermes-config.yaml`.
+razr side, 2026-08-10 — `~/hermes-bridge` (separate repo, `server.mjs`,
+`lib/hermes.mjs`, `lib/budget.mjs`, `lib/usage.mjs`) investigated read-only,
+not modified. Hermes Agent itself at `/home/hermes/.hermes/hermes-agent/`
+(`agent/anthropic_adapter.py`, `agent/model_metadata.py`,
+`agent/conversation_loop.py`, `plugins/model-providers/custom/__init__.py`,
+`hermes_cli/fallback_config.py`, `hermes_cli/cli_agent_setup_mixin.py`,
+`hermes_cli/config.py`) investigated read-only. Hermes Agent's own config,
+**edited**: `/home/hermes/.hermes/config.yaml` (`fallback_providers` key
+added — backups at `config.yaml.bak-20260810-145453` and
+`config.yaml.bak-20260810-150617-2`).

@@ -4,38 +4,68 @@
 
 ## Just completed
 
-**Hermes multi-provider resilience — DONE 2026-08-10 (dex247 side); one Boss
-action still open on razr.** OpenRouter is confirmed exhausted (402, read-only
-via `hermes auth list` on razr — no paid probe), and this is correctly
-represented as protective degradation (`hermes-provider` incident, one, open,
-`billing`/`protective_quota`), not a full outage. Investigated whether "Fable"
-(the Boss's available credits) can give Hermes a second provider: **it can** —
-Hermes Agent v0.19.0 (the actual agent runtime on razr, not something Loki
-built) already has a native Anthropic adapter and a real fallback-chain
-feature (`hermes fallback add/list/remove`); it isn't wired up yet. No
-Anthropic credential exists for the `hermes` account, and the fallback chain
-is empty. **Blocked on the Boss**, not on code — see
-`.agents/skills/hermes-operations/SKILL.md` § Fable / multi-provider
-capability for the exact two commands to run on razr as the `hermes` user.
+**Hermes provider resilience — DONE 2026-08-10, live on razr.** OpenRouter
+was confirmed exhausted (402, read-only via `hermes auth list` — no paid
+probe), correctly represented as protective degradation
+(`hermes-provider` incident, one, open, `billing`/`protective_quota`), not a
+full outage.
 
-Real bug fixed while investigating: `homelab_hermes.note_job_state()` never
-handled the bridge's `paused_auth` job state — a bad/revoked provider
+**Fable was investigated, then explicitly rejected by the Boss — do not
+reopen.** First finding: Hermes Agent has a native Anthropic adapter, but the
+Boss doesn't use an Anthropic account — withdrew that plan before any
+credential was requested. Re-investigated: `anthropic/claude-fable-5` is
+actually a real, live-listed OpenRouter model (verified via OpenRouter's
+public `/v1/models`) reachable on the Boss's *existing* OpenRouter key, no
+Anthropic account needed — but that same key's own $10 cap had $0.36 left
+(verified via a live, non-billable balance read), nowhere near enough for
+Fable's $10/$50-per-million pricing. The Boss then ruled Fable out entirely:
+*"too expensive for routine Hermes diagnostics — I only used it previously
+because of a temporary promotional credit arrangement."* Final instruction:
+plan fallback around cost efficiency instead — local first, cheap paid
+second, frontier models manual-escalation-only, never automatic.
+
+**What's actually configured and verified live, on razr, in
+`/home/hermes/.hermes/config.yaml`** (Hermes Agent's own config — no
+`loki.service` restart involved, this is entirely on razr):
+
+```
+Primary:    anthropic/claude-sonnet-5   (via openrouter)
+Fallback 1: gemma4-12b-balanced:latest  (via custom → local Ollama on razr, $0)
+Fallback 2: deepseek/deepseek-v4-flash-0731  (via openrouter, $0.08/$0.18 per M,
+                                               reuses the existing pooled key)
+```
+
+Verified entirely through Hermes Agent's own read-only commands
+(`hermes fallback list`, `hermes config get --json`, `hermes config check`,
+`hermes doctor`) — not assumed. Confirmed in source
+(`agent/conversation_loop.py`) that `FailoverReason.billing` (HTTP 402 — the
+exact failure OpenRouter is in right now) is in the eager-fallback trigger
+set, with Hermes Agent's own built-in guard against retrying a depleted
+balance once every recovery path is exhausted. No Anthropic credential was
+ever added. No frontier/expensive model is in the automatic chain. Two
+config backups taken on razr before editing. No paid Hermes job submitted at
+any point in this work. See
+`.agents/skills/hermes-operations/SKILL.md` § Provider fallback chain for the
+full trail (OpenRouter model pricing pull, why local Ollama, why this
+specific cheap model).
+
+Real bug fixed along the way, dex247-side: `homelab_hermes.note_job_state()`
+never handled the bridge's `paused_auth` job state — a bad/revoked provider
 credential left a job parked forever without ever telling
 `hermes_guard.py`, so the circuit never opened. Fixed; `auth` is now its own
-failure class (opens instantly, like billing, since a bad credential doesn't
-self-resolve by waiting). `hermes_guard.status()` also gained a
-`status_label` field (operational/protective_quota/protective_budget/
-authentication_failed/rate_limited/unreachable/recovering — see SKILL.md for
-the mapping) and `last_serving_model` / `last_serving_model_cost_telemetry`,
-because the bridge's own cost accounting (`hermes-bridge/lib/budget.mjs`,
-`lib/usage.mjs`) only prices two OpenRouter-routed models and would silently
-record $0 for any job Fable ends up serving — the guard now says so instead
-of agreeing spend was zero. 15 new tests, `tests/test_hermes_guard.py` now 45,
-all green; no bridge code touched (Boss chose not to, given a second
-production service on a second machine); no paid Hermes request made during
-this work. Deploy note: `hermes_guard.py`/`homelab_hermes.py` changes are
-code-only until the next `loki.service` restart (not taken — restarts stay
-approval-gated).
+failure class (opens instantly, like billing). `hermes_guard.status()` also
+gained a `status_label` field (operational/protective_quota/protective_budget/
+authentication_failed/rate_limited/unreachable/recovering) and
+`last_serving_model` / `last_serving_model_cost_telemetry` — the bridge's own
+cost accounting (`hermes-bridge/lib/budget.mjs`, `lib/usage.mjs`) only prices
+the two OpenRouter-routed Anthropic models, so a job served by **either**
+fallback (local Ollama or DeepSeek) prices at $0 in the bridge's own ledger;
+the guard flags that rather than agreeing spend was zero. 15 new tests,
+`tests/test_hermes_guard.py` now 45, all green. Deploy note:
+`hermes_guard.py`/`homelab_hermes.py` changes are code-only until the next
+`loki.service` restart (not taken — restarts stay approval-gated); the razr
+fallback chain itself is already live (Hermes Agent reads its config fresh
+per invocation, no restart needed there).
 
 **Correction — the 2026-08-09 Tracearr entry below is wrong about who applied
 v1.5.0 → v2.0.1 — DONE 2026-08-10.** While reconciling homelab documentation
@@ -379,6 +409,11 @@ the DONE condition — live verified behaviour is. See
 - Joplin CLI sidecar (`loki-joplin-api`) — obsolete, must not be resurrected.
 - Maintenance notification amplification / incident dedupe — fixed.
 - Hermes / OpenRouter guard — fixed.
+- Fable as a Hermes provider — explicitly rejected by the Boss (too
+  expensive for routine diagnostics; the $10/$50-per-million pricing was
+  only ever covered by a temporary promotional credit). Don't re-propose it
+  as a fallback. The configured chain is local Ollama → cheap OpenRouter
+  DeepSeek; frontier models are manual-escalation-only.
 - gluetun / qBittorrent pairing — settled, must never be "fixed".
 
 ## Next action

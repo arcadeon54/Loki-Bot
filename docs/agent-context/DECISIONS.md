@@ -227,10 +227,17 @@ own fallback chain (if any) is exhausted, not after the first provider fails.
 ## Don't claim cost accuracy the bridge itself doesn't have
 
 `hermes-bridge/lib/budget.mjs`'s rate card and `lib/usage.mjs`'s spend probe
-(razr, not this repo) only price/observe OpenRouter-routed models. A job
-served by any other provider — Fable, once configured — prices at $0 in the
-bridge's own ledger, silently. `hermes_guard.status()` reports
-`last_serving_model_cost_telemetry` as `"unreliable"` for any model outside
-that known-priced set rather than letting a $0 observed spend read as "this
-job was free." The fix belongs in the bridge (razr); this repo's job is to
-not repeat a wrong number with false confidence.
+(razr, not this repo) only price/observe the two Anthropic models routed
+through OpenRouter (`anthropic/claude-sonnet-5`, `anthropic/claude-opus-5`) —
+not "OpenRouter" generally. A job served by the configured Hermes fallback
+chain (local Ollama, or `deepseek/deepseek-v4-flash-0731` — also OpenRouter,
+just a model the rate card has never heard of) prices at $0 in the bridge's
+own ledger, silently, whether or not that's actually true.
+`hermes_guard.status()` reports `last_serving_model_cost_telemetry` as
+`"unreliable"` for any model outside that known-priced set rather than
+letting a $0 observed spend read as "this job was free." The fix belongs in
+the bridge (razr); this repo's job is to not repeat a wrong number with false
+confidence. (Fable, investigated as a possible provider, was rejected by the
+Boss on cost grounds before this ever mattered for it specifically — the
+decision generalizes to any unpriced model, which is exactly what DeepSeek
+now is.)
