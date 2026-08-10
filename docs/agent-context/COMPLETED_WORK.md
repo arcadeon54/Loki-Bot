@@ -9,8 +9,18 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ## Tracearr registry version drift
 
-**DONE — 2026-08-09.** Not an upgrade — no update, restart, recreate, or pull
-was performed. Tracearr was already healthy on v2.0.1; only
+**DONE — 2026-08-09; corrected 2026-08-10.** The version/digest reconciliation
+below is accurate. The explanation of *who* moved v1.5.0 → v2.0.1 was not:
+this entry originally attributed it to watchtower. It was Loki's own
+approval-gated `tracearr_update` — see the correction at the top of
+`CURRENT_HANDOFF.md` for the evidence (a Joplin note Loki wrote at update
+time, matching the container's recreate timestamp to the minute). Left the
+rest of this entry as written at the time; read it with that correction in
+mind.
+
+Not an upgrade *from Loki's perspective at the time this was written* — no
+update, restart, recreate, or pull was believed to have been performed by
+Loki. Tracearr was already healthy on v2.0.1; only
 `config/homelab_assets.yml` still described it as v1.5.0.
 
 **Verification came first, and independently.** `config/homelab_assets.yml`
@@ -28,13 +38,20 @@ trusted on sight. Queried live through the restricted NAS dispatcher instead:
 - `container_inventory` — confirms `watchtower` running on the NAS
   (`up 3 days`), long enough to have performed the 2026-08-07 recreate.
 
-The uncommitted value matched exactly. **Why it happened**, without reopening
-the closed v1.5.0 investigation: the registry already recorded
-`updates.applied_by: watchtower-on-nas` — Tracearr updates on the NAS are
-watchtower's job, not Loki's approval-gated path. This is the already-tracked
-`watchtower → monitor-only` backlog item behaving exactly as documented: a
-MAJOR version bump landed without going through approval. Not new, not
-re-investigated — just the explanation for how a v1.5.0 registry became stale.
+The uncommitted value matched exactly. **Why it happened** — this paragraph as
+originally written said the registry's `updates.applied_by: watchtower-on-nas`
+meant watchtower did it, "the already-tracked `watchtower → monitor-only`
+backlog item behaving exactly as documented: a MAJOR version bump landed
+without going through approval." **That was wrong — corrected 2026-08-10.**
+`applied_by: watchtower-on-nas` was stale YAML boilerplate never touched by
+Loki's real update code; `container_inventory` showing watchtower merely
+running on the NAS only proves presence, not causation. Loki's own Joplin
+maintenance log has a note it wrote at the time — "Tracearr update v1.5.0 →
+v2.0.1 — success", `prepare_id e7f4e2ef6f381073`, started
+`2026-08-07T18:46:06Z` — proving its own `tracearr_apply_update` performed
+this update, backed up and verified, through the existing approval gate. See
+the top of `CURRENT_HANDOFF.md`. The registry field is now
+`applied_by: loki_approval_gate`.
 
 **Why this was not merely cosmetic.** `check_upstream()` in `nas_maint.py`
 derives "installed version" straight from `asset.get("version")` for every

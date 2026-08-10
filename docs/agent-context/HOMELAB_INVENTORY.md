@@ -131,10 +131,11 @@ network `tracearr_tracearr-network`:
 - `tracearr-redis` — service `redis`, `172.19.0.2`
 - `tracearr-db` — TimescaleDB, service `timescale`, `172.19.0.3`
 
-Watchtower on the NAS updates Tracearr independently of Loki's approval-gated
-path (`updates.applied_by: watchtower-on-nas`); v1.5.0 → v2.0.1 happened this
-way on 2026-08-07. Registry reconciled to match 2026-08-09 — see
-`docs/agent-context/COMPLETED_WORK.md`.
+v1.5.0 → v2.0.1 was applied 2026-08-07 through Loki's own approval-gated
+`tracearr_update` (`applied_by: loki_approval_gate`) — corrected 2026-08-10,
+see `CURRENT_HANDOFF.md`. Earlier docs blamed watchtower for this jump; that
+was a stale YAML comment, not evidence. Registry reconciled to match
+2026-08-09 — see `docs/agent-context/COMPLETED_WORK.md`.
 
 ### Two NAS traps
 

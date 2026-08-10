@@ -1,10 +1,36 @@
 # CURRENT HANDOFF
 
-*Updated 2026-08-09 04:4x UTC. Keep this under a minute to read.*
+*Updated 2026-08-10. Keep this under a minute to read.*
 
 ## Just completed
 
-**Tracearr registry drift reconciled — DONE 2026-08-09.** Not an upgrade —
+**Correction — the 2026-08-09 Tracearr entry below is wrong about who applied
+v1.5.0 → v2.0.1 — DONE 2026-08-10.** While reconciling homelab documentation
+into Joplin, its `Loki/Maintenance` notebook turned up a note **Loki itself
+wrote**: "Tracearr update v1.5.0 → v2.0.1 — success", written by
+`nas_maint.py`'s own `tracearr_apply_update` handler (the same code path that
+recorded the known-good v1.4.27→v1.5.0 update and one earlier failed/rolled-back
+attempt). Started `2026-08-07T18:46:06Z`, matching the container's recreate
+timestamp `18:46:50Z` exactly, `prepare_id e7f4e2ef6f381073`, verified backup
+(compose + 4.4 MB DB dump, gzip-integrity checked), full post-update health
+checks green. `tracearr_update`/`tracearr_apply_update` **is** Loki's own
+update verb for Tracearr — Boss-only, approval-gated, backed up, verified,
+rollback-capable (`b075780`, `16b2178`). It was live and working before
+2026-08-07.
+
+The "watchtower-on-nas" conclusion below came from a stale YAML comment in
+`config/homelab_assets.yml` that predates that update capability and was never
+touched by the code that actually applies updates — not from checking Joplin's
+own maintenance log, which is exactly the record that would have caught this.
+`config/homelab_assets.yml`'s `applied_by` field is corrected to
+`loki_approval_gate`. The general "NAS watchtower could still touch containers
+outside Loki's gate" concern is unaffected — watchtower is confirmed running on
+the NAS — but there is now no specific evidence it ever touched Tracearr; that
+falls back to an open question rather than a documented incident. See
+`COMPLETED_WORK.md` and `TASK_LEDGER.md` #16 for the corrected record.
+
+**Tracearr registry drift reconciled — DONE 2026-08-09** (superseded above on
+who applied the update; the version/digest reconciliation itself still stands). Not an upgrade —
 production was already on v2.0.1; only `config/homelab_assets.yml` still
 claimed v1.5.0. Verified live and independently through the dispatcher before
 touching anything: `tracearr_status` and `tracearr_dependencies` both confirm
@@ -290,7 +316,8 @@ presence notification passthrough (`ede172d`).
 - `loki-homelab-api.service` — active (read-only Hermes interface).
 - Hermes guard — circuit closed, 0/6 per hour, 0/20 per day, $0.00/$5.00.
 - Tracearr — v2.0.1 on the NAS, pinned by digest in `config/homelab_assets.yml`
-  (watchtower-applied 2026-08-07, registry reconciled 2026-08-09).
+  (applied via Loki's own approval-gated update 2026-08-07, registry
+  reconciled 2026-08-09, watchtower misattribution corrected 2026-08-10).
 
 ## Next active task
 

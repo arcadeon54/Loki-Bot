@@ -381,13 +381,26 @@ assets:
       registry_repo: ghcr.io/connorgallopo/tracearr
       # Git tags carry a leading 'v' (v1.4.27); registry tags do not (1.4.27).
       registry_tag_style: strip_v
-      # Updates on the NAS are Watchtower's job. Loki has no update verb here.
-      applied_by: watchtower-on-nas
+      # CORRECTED 2026-08-10: this said "watchtower-on-nas", assumed rather
+      # than checked, when the 2026-08-09 drift reconciliation (c8b62d7)
+      # found v2.0.1 already running. Loki's OWN Joplin/Maintenance log
+      # ("Tracearr update v1.5.0 → v2.0.1 — success", prepare_id
+      # e7f4e2ef6f381073) proves nas_maint.py's tracearr_apply_update ran
+      # this update — started 2026-08-07T18:46:06Z, matching the container's
+      # recreate timestamp 18:46:50Z exactly, with a verified backup
+      # (compose + DB dump) and full post-update health checks. tracearr_update
+      # IS Loki's update verb here (Boss-only, approval-gated) — this field
+      # predates that capability and was never updated by the code that
+      # actually applies updates (confirmed: b075780's real v1.4.27→v1.5.0
+      # update didn't touch this field either). Both the v1.4.27→v1.5.0 and
+      # v1.5.0→v2.0.1 jumps went through Loki's own approval gate.
+      applied_by: loki_approval_gate
     known_issues:
       restart_churn:
         # All evidence below is from the v1.5.0 deployment (2026-07-27). The
-        # app was recreated on v2.0.1 by watchtower on 2026-08-07, which
-        # resets restart_count to 0 regardless of whether the app-side defect
+        # app was recreated on v2.0.1 via Loki's approval-gated tracearr_update
+        # on 2026-08-07 (see updates.applied_by note above — NOT watchtower),
+        # which resets restart_count to 0 regardless of whether the app-side defect
         # was fixed upstream — 0 restarts since is NOT proof of a fix, it is
         # too short a window and too coarse a signal to conclude anything.
         # Re-open this record with fresh evidence if churn resumes on v2.0.1.

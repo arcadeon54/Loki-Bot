@@ -65,10 +65,24 @@ already be live.
 
 ## Documentation
 
+Two layers — see `.agents/rules/documentation-policy.md` for the full rule.
+When a substantial homelab task reaches DONE, update both where appropriate:
+
+- **Repository agent context** (`docs/agent-context/` — read
+  `CURRENT_HANDOFF.md` first every session; also `COMPLETED_WORK.md`,
+  `TASK_LEDGER.md`, `DECISIONS.md`, `HOMELAB_INVENTORY.md`) — for Claude Code,
+  Antigravity, and future AI sessions.
+- **Joplin** — the Boss's permanent human-readable reference: the **Homelab**
+  notebook (machines/network/storage/services) and **Homelab/L.O.K.I.** /
+  **Loki/Documentation** for Loki's own internals. Update the existing note,
+  don't duplicate; no secrets; no debug transcripts. The skillkit-maintained
+  **Loki Architecture** notebook is separate and machine-owned — don't
+  hand-edit it.
+
+Older, still-valid docs:
+
 - `docs/PROJECT_STATE.md` — full audit snapshot (2026-07-19)
 - `docs/NEXT_STEPS.md` — known issues and priorities
 - `docs/HISTORICAL_HANDOFF.md` — historical context (never overrides code)
 - `docs/SESSION_RECOVERY.md` — beginner session guide
 - `README.md` / `INTEGRATIONS.md` — feature docs
-- Authoritative architecture reference: Joplin "Loki Architecture" notebook,
-  maintained via skillkit `archdoc`.

@@ -91,6 +91,14 @@ security-sensitive approval, or a genuinely ambiguous high-risk decision.
   sessions. Do not merge these systems.
 - Verification: success is proven, not assumed.
 
+## Documentation
+
+Two layers — repository agent-context (`docs/agent-context/`) for AI sessions,
+and Joplin (the **Homelab** notebook, **Homelab/L.O.K.I.**,
+**Loki/Documentation**) as the Boss's permanent human-readable reference. A
+substantial homelab task is not done until both have been considered. Full
+rule: `.agents/rules/documentation-policy.md`.
+
 ## Skills
 
 Deep task knowledge lives in `.agents/skills/`. Read the relevant `SKILL.md`
