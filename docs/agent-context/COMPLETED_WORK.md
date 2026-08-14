@@ -256,6 +256,37 @@ tracked in git — this repo doesn't own host firewall state), persisted to
 Tailscale ACLs, router config, qBittorrent VPN config, Docker's firewall
 backend, Sonarr path mapping.
 
+**POLICY EXCEPTION — Home Assistant stays public through NPM, permanently
+— 2026-08-14.** Everything above pushes toward "admin interfaces are
+LAN/Tailscale-only." `ha.ivn-group.cc` is a deliberate, permanent exception
+to that pattern, not a leftover gap — **do not recommend taking it private
+in a future audit.** Reason: the roommate has no Tailscale-capable device
+and that isn't expected to change, so HA has to stay reachable the ordinary
+public-web way for him.
+
+Verified rather than assumed: NPM's proxy host (`ha.ivn-group.cc` →
+`192.168.1.63:8123`, `block_exploits=1`) is enabled and not deleted. A real
+end-to-end request from a separate LAN host (razr) through the actual
+public domain got `200` with title `Home Assistant`; hitting `/api/`
+with no token got `401`, confirming HA's own login is still required —
+nothing here weakens HA's authentication. dex247's Phase 3B `DOCKER-USER`/
+`INPUT` firewall has **no rule referencing `8123` at all**, because HA runs
+on the NAS, not dex247 — that firewall was never in a position to expose or
+protect this port either way, so no dex247-side change was needed or made.
+
+**What's NOT independently verified, and why:** whether the NAS's own
+local firewall additionally restricts `:8123` to LAN-only, and whether the
+router has a *direct* forward for `8123` bypassing NPM entirely. NAS SSH is
+disabled by default (must be re-enabled in the Ugreen UI each time) and the
+router admin password is unknown — neither was checked this pass, and
+neither was required to be, since nothing on dex247 needed to change. If
+that certainty is ever wanted: enable NAS SSH and check `:8123`'s bind, or
+check the router's port-forward table for anything besides 80/443 pointed
+at dex247.
+
+**No infrastructure change was made or needed** — the existing
+configuration already satisfied every requirement.
+
 ---
 
 ## Video-doorbell announcement reliability
