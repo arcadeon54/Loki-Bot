@@ -81,6 +81,70 @@ group.cc` → no response (no vhost), `ngnx`/`qbit`/`ollama.ivn-group.cc` →
 Sonarr, Immich) → normal 200/302. `nginx -t` clean, Loki/Docker(32
 containers)/Tailscale all healthy throughout.
 
+**DONE (Phase 3A, part A/B/C/D — SSH hardened + firewall preflight) —
+2026-08-14.** SSH on dex247 is now key-only; the firewall itself was
+designed but **not applied** (that's Phase 3B, explicitly not authorized
+yet).
+
+*SSH hardening.* Journal showed the actual client in current use (key
+`arcadeon54@penguin`, a Chromebook/Crostini env at 192.168.1.105) had
+authenticated by key earlier the same day, but the three most recent
+sessions from that IP — including the live one this work was done from —
+had fallen back to password. Rather than assume the key path still worked,
+asked the Boss to prove it live with an explicit
+`PreferredAuthentications=publickey` connection in a second terminal before
+touching anything. Confirmed, then applied
+`/etc/ssh/sshd_config.d/10-hardening.conf` (loads before the existing
+`50-cloud-init.conf`, which is what was actually setting
+`PasswordAuthentication yes` this whole time): `PasswordAuthentication no`,
+`KbdInteractiveAuthentication no`, `PubkeyAuthentication yes`,
+`AllowUsers g2k247` (confirmed via 30 days of auth logs that `g2k247` is the
+only account that has ever logged in over SSH; root was already
+`prohibit-password` by OpenSSH default, untouched — not weakened, not
+duplicated). `sshd -t` clean, applied via `systemctl reload ssh` (no
+restart, no dropped sessions), a second key-authenticated session held open
+throughout as a safety net. Post-change proof: a fresh key-only connection
+succeeded; a connection forced to try password auth got
+`Permission denied (publickey)` with no prompt offered at all — the server
+itself no longer advertises password as a method. Backup of the pre-change
+`sshd_config.d/` and `sshd -T` snapshot at
+`~/ssh-hardening-backups/sshd_config.d.pre-hardening-20260814-210730/` on
+dex247. All 9 existing `authorized_keys` entries (asus, razr, penguin,
+dex247's own, gemini-cli) still work — only the password fallback is gone.
+
+*fail2ban (part C).* Recommended holding off, not installed. With SSH
+already key-only, brute-forcing a password is moot; fail2ban's remaining
+value is cutting scan noise, which the Phase 3B firewall (restricting :22 to
+LAN+Tailscale) solves more completely. Revisit only if that firewall phase
+doesn't fully close off :22 for some reason.
+
+*Firewall preflight (part D/E/F/G — discovery and design only, nothing
+applied).* Docker 29.5.3, **Firewall Backend: iptables** (confirmed via
+`docker info`), `iptables` → `iptables-nft` alternative, `DOCKER-USER`
+chain exists and is empty on both `iptables` and `ip6tables` — the
+Docker-supported hook to use in Phase 3B, not a bolted-on UFW layer.
+`enp3s0` (192.168.1.0/24, default route) carries a **real global IPv6**
+address, so any Phase 3B design has to cover IPv6 explicitly — it is
+*not* currently covered by Docker's own rules (no IPv6 DNAT exists) and a
+IPv4-only firewall would leave it wide open. Host `INPUT`/`FORWARD` policy
+is currently default-ACCEPT; `ss -tlnp` audit found several 0.0.0.0-bound
+services beyond the already-documented Docker ports that need LAN+Tailscale
+classification in Phase 3B: Samba (139/445 + 137/138 UDP), Loki's HA webhook
+receiver (9100), and — new finding — **dex247's own local Ollama
+(`ollama.service`, native systemd, not Docker) is bound to `*:11434` on all
+interfaces**, never proxied through NPM so not "publicly exposed" in the
+Phase 2A/2B sense, but wide open at the host level the same way razr's was
+before that got locked down. Full access matrix, proposed `DOCKER-USER` +
+host `INPUT` rule design (IPv4 and IPv6), and rollback/persistence plan
+handed to the Boss for review — **none of it applied**. qBittorrent's WebUI
+port (8080) is still directly reachable host-wide even with its NPM route
+disabled, since Docker's own port publish is a separate thing from NPM
+routing — flagged as the top Phase 3B priority.
+
+**Explicitly not started (per the Boss's stop point):** firewall
+activation, UFW, nftables/iptables policy changes, Docker firewall-backend
+changes, Tailscale ACL changes, router changes, the Sonarr mapping task.
+
 ---
 
 ## Video-doorbell announcement reliability
