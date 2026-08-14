@@ -358,6 +358,104 @@ different DOCKER-USER matching strategy less sensitive to IP churn), or
 finally act on the standing recommendation to put watchtower in monitor-
 only mode.
 
+**DONE (Phase 3C — eliminated Docker-IP firewall drift, tamed watchtower) —
+2026-08-14.** Follow-on to the Seerr fix above: that was a patch to symptoms
+(resync the IPs, reorder one rule). This phase replaces the *design* so the
+same class of bug can't recur.
+
+**Why container-IP rules are now prohibited.** `DOCKER-USER` sees traffic
+*after* Docker's own DNAT, so a rule written as `-d <container-ip> --dport
+<container-port>` is only correct for as long as that container happens to
+hold that IP — and Docker's default bridge IPAM reassigns IPs on
+recreation (confirmed cause: watchtower recreating containers outside
+Loki's approval gate). Every such rule is a ticking outage or a ticking
+silent re-exposure, and there is no way to know in advance which.
+
+**New architecture — zero container IPs anywhere in `DOCKER-USER`.**
+Verified `-m conntrack --ctorigdstport N` live before redesigning anything
+(temporary `LOG` rule, confirmed it matches the *pre-DNAT, host-facing*
+port regardless of the post-DNAT container IP). Rebuilt the chain in three
+tiers, matched only on interface + stable port, never IP:
+1. Unconditional trust — loopback, established/related, `tailscale0`, LAN
+   `192.168.1.0/24` on `enp3s0`. (Same as Phase 3B — these were never
+   IP-based to begin with.)
+2. Public — `-i enp3s0 -p tcp -m conntrack --ctorigdstport 80/443 -j
+   RETURN`. Matches by the *original* destination port a WAN client
+   actually dialed, not NPM's current bridge IP.
+3. WAN-blocked — same pattern, `-j DROP`, for every other Docker-published
+   port (29 rules covering flaresolverr/radarr/sabnzbd/sonarr/prowlarr/
+   searxng/tautulli/pihole/cobalt/chromadb/bazarr/media-server/jdownloader/
+   metube/seerr/joplin/nzbhydra2/immich/filebrowser/jellyfin/NPM-admin/
+   qBittorrent WebUI+P2P/webdav).
+
+**The NPM-trust rule is gone entirely — not replaced, eliminated.** The
+reason DOCKER-USER needed a "trust NPM's IP" rule at all was to distinguish
+NPM's own backend-fetch traffic from a genuine WAN client hitting the same
+port. Matching on `-i enp3s0` does that distinction structurally: a real
+WAN/LAN client's packet physically arrives via the NIC (`IN=enp3s0`,
+confirmed via the same `LOG`-rule technique); NPM's hairpin request to a
+backend originates from a container and arrives via a Docker bridge
+interface (`IN=br-...`), never `enp3s0`, no matter which IP NPM currently
+holds. No rule at all is needed for "is this NPM" — untrusted-source WAN
+traffic is the *only* thing the port-DROP rules can ever match, so NPM
+(and any other container) reaching a backend via the host's published port
+was never something that needed protecting against in the first place, and
+is no longer something that can accidentally be un-trusted by an IP change.
+
+**Proven, not assumed — recreation survivability.** Recreated NPM
+(`docker compose up -d --force-recreate --no-deps`), then forced a *real*
+IP change for Seerr (temporarily occupied the lower IPs on
+`privacyserver_default` with disposable containers, recreated `seer`:
+`172.19.0.8` → `172.19.0.13`), then recreated `sonarr` as the fourth
+representative. Confirmed **zero firewall edits** were made or needed:
+`ha.ivn-group.cc`, `rq.ivn-group.cc`, `sonarr.ivn-group.cc`,
+`jfin.ivn-group.cc` all worked immediately post-recreation, LAN-direct
+Seerr access at its new IP worked immediately, and `iptables -S
+DOCKER-USER | grep 172\.` returned nothing at any point. This is the
+acceptance test Phase 3B never had.
+
+**Watchtower — reconfigured to monitor-only, not removed.** Found: image
+`nickfedor/watchtower:latest`, command `--cleanup --interval 86400`, no
+`--label-enable` (monitoring **all** running containers, not just labeled
+ones), `docker.sock` bind-mounted RW, started via a bare `docker run` (no
+compose file). Checked dependencies first, as instructed: Loki's own
+`nas_maint.py` explicitly relies on the **NAS's separate Watchtower
+instance** for NAS container updates ("Updates on the NAS are performed by
+Watchtower there, not by Loki") — **that one was not touched, out of
+scope, still doing its job.** dex247's instance had no such dependency;
+Loki's own `container_updates.py` already has purpose-built detection code
+for exactly this conflict (`detect_external_updaters` /
+`describe_updater`, feeding an `external_autoupdate_active` flag) and
+`container_image_update` is already an APPROVAL-tier action in
+`maintenance_policy.py` — Loki's own gated update path already exists and
+doesn't need Watchtower's auto-apply behavior on dex247 at all. Recreated
+dex247's watchtower with `--interval 86400 --monitor-only` (dropped
+`--cleanup` — meaningless without real updates), same image/mount/restart
+policy otherwise. Verified two ways: watchtower's own log ("Next scheduled
+run...", no update applied), and by running Loki's actual
+`describe_updater()` against the live container — `monitor_only: True,
+cleanup: False` — which makes `external_autoupdate_active` evaluate to
+`False` per its own formula (`bool([u for u in updaters if
+u['monitor_only'] is False])`). Docker socket stays mounted — monitor-only
+still needs it to inspect images — this was a deliberate keep-visibility
+choice, not a removal, so the mount is expected, not a regression.
+
+**Persistence + final regression.** `netfilter-persistent save` only after
+recreation-proof succeeded. `systemctl restart docker` once more:
+`DOCKER-USER` rule count identical before/after (35), zero container-IP
+references either time, all 32 containers back healthy. Full sweep after
+restart: every public NPM host, every still-private host (qbit/ngnx/
+ollama, unchanged), LAN direct access, SSH (existing session + fresh LAN +
+fresh Tailscale), qBittorrent VPN egress IP unchanged, BLACK-BOXX 17/17,
+Loki active. One transient 503 on Jellyfin immediately after the daemon
+restart, resolved itself within ~10s (containers still settling) — not a
+firewall regression, same pattern as Phase 3B's restart test.
+
+**Explicitly not touched:** Sonarr path mapping, Seerr `trustProxy`/CSRF,
+Tailscale ACLs, router config, qBittorrent VPN config, the NAS's own
+Watchtower, Home Assistant's and Seerr's public exceptions (both still
+public, both still verified working throughout).
+
 ---
 
 ## Video-doorbell announcement reliability
