@@ -7,6 +7,58 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## Security hardening — public control-plane exposure lockdown
+
+**DONE (Phase 2A) — 2026-08-14.** Follow-on to the qBittorrent compromise
+(AutoRun RCE via a forged-login custom Nginx block in NPM, contained and
+recovered same day) and the subsequent read-only exposure audit. That audit
+found NPM's own admin interface and a raw, unauthenticated Ollama API were
+both publicly reachable — the same class of exposure that caused the
+qBittorrent incident, just not yet exploited.
+
+**NPM admin (`ngnx.ivn-group.cc` → `192.168.1.155:81`) taken private.**
+Disabled in NPM's own database (`enabled=0`) and the live generated Nginx
+conf replaced with a bare `return 403` block (original backed up as
+`6.conf.pre-admin-lockdown-20260814.bak`). NPM administration is now
+LAN (`http://192.168.1.155:81/`) or Tailscale (`http://100.68.187.69:81/`)
+only. Public app proxying on 80/443 is untouched — spot-checked eight other
+public hosts (Sonarr, Radarr, Jellyfin, Immich, Bazarr, Prowlarr, Tautulli,
+NZBHydra2) all still respond normally.
+
+**Ollama (`ollama.ivn-group.cc` → `192.168.1.31:11434`, razr) taken private.**
+Same pattern (DB `enabled=0` + 403 conf, backup `38.conf.pre-lockdown-
+20260814.bak`). Checked first whether anything legitimately depended on
+public access: the proxy's own access log had **zero requests ever logged**
+against this host, nothing in Loki/skillkit/Hermes references
+`ollama.ivn-group.cc` or `192.168.1.31` directly, Loki's local-model fallback
+talks to its own `localhost:11434` on dex247 (a separate, unaffected Ollama
+instance), and Hermes's Ollama integration (commented out in its `.env`)
+would point at the hosted `ollama.com` API if ever enabled, not this
+self-hosted one. Razr's Ollama remains reachable on the LAN
+(`192.168.1.31:11434`) for anything that legitimately needs it there.
+
+**Portainer — corrected, no action needed.** The read-only audit flagged
+`portainer.ivn-group.cc` as publicly exposed; that was a false positive from
+not filtering NPM's `is_deleted` flag. The proxy host was actually deleted
+back on 2026-03-05, has no live Nginx conf, and no Portainer container even
+runs on this host anymore (nothing listens on `:9443`). Nothing to remediate.
+
+**Also found, not yet acted on (deferred to a later phase):** MeTube
+(`metube.ivn-group.cc`) is public with no authentication at all — an
+`htpasswd-metube` file exists in NPM's data dir but was never wired into
+this proxy host's config. `firefox.ivn-group.cc` points at a dead backend
+(502, nothing listening on `192.168.1.155:3002`) — a dormant public route
+that would silently go live if that service is ever started without
+someone remembering to secure it first. Neither was touched this pass.
+
+**Still outstanding (explicitly out of scope for this phase):** host-level
+firewall (currently default-ACCEPT with no general inbound filtering —
+exposure is entirely dependent on unverified router port-forwarding rules),
+SSH hardening (password auth still enabled, no fail2ban), Tailscale ACL
+review, the MeTube/`firefox.ivn-group.cc` findings above.
+
+---
+
 ## Video-doorbell announcement reliability
 
 **DONE — 2026-08-10, live on the NAS Home Assistant instance (192.168.1.63:8123),
