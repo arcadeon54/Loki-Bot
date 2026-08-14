@@ -57,6 +57,30 @@ exposure is entirely dependent on unverified router port-forwarding rules),
 SSH hardening (password auth still enabled, no fail2ban), Tailscale ACL
 review, the MeTube/`firefox.ivn-group.cc` findings above.
 
+**DONE (Phase 2B) — 2026-08-14, verification pass, no NPM changes required.**
+Requested to disable `portainer.ivn-group.cc` and two stale bare NPM entries
+(`ngnix`, `ngnx`, forwarding to admin port 81) as dormant public routes. Took
+a full NPM database backup first (`nginx-proxy-manager/backups/
+database.sqlite.pre-phase2b-20260814-202417.bak`) as a precaution, then found
+all three already `is_deleted=1` with no live Nginx conf — `ngnix`/`ngnx`
+since 2026-01-31, `portainer.ivn-group.cc` since 2026-03-05, matching the
+Phase 2A note above. No edit was made to a deleted row; disabling something
+already deleted would be a meaningless write, not a fix.
+
+This corrects an in-session read-only audit (done before this Phase 2B
+request) that re-flagged `portainer.ivn-group.cc` as still live — that audit
+queried `proxy_host` without filtering `is_deleted` and read `enabled=1` on
+the deleted row as "still enabled publicly." It wasn't; the Phase 2A record
+was right the first time. Re-ran the inventory correctly this pass: of 25
+non-deleted proxy hosts, only two are control-plane-relevant
+(`ngnx.ivn-group.cc` and `ollama.ivn-group.cc`, both `enabled=0` from Phase
+2A) — no live public route exists for NPM admin, Portainer, Docker
+management, or the raw Ollama API. `curl` spot-checks: `portainer.ivn-
+group.cc` → no response (no vhost), `ngnx`/`qbit`/`ollama.ivn-group.cc` →
+403 (the Phase 2A stub confs), three unrelated public hosts (Jellyfin,
+Sonarr, Immich) → normal 200/302. `nginx -t` clean, Loki/Docker(32
+containers)/Tailscale all healthy throughout.
+
 ---
 
 ## Video-doorbell announcement reliability
