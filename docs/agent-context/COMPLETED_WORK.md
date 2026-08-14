@@ -287,6 +287,77 @@ at dex247.
 **No infrastructure change was made or needed** — the existing
 configuration already satisfied every requirement.
 
+**POLICY EXCEPTION — Seerr stays public through NPM, permanently — 2026-08-
+14.** `rq.ivn-group.cc` is a second deliberate exception to the LAN/
+Tailscale-only pattern, alongside Home Assistant. **Do not recommend taking
+it private in a future audit.** Reason: the Boss uses it daily from his
+phone and Nvidia Shield, neither of which run Tailscale.
+
+Verified rather than assumed: NPM's proxy host (`rq.ivn-group.cc` →
+`192.168.1.155:5055`, `ssl_forced=1`, `http2_support=1`, `block_exploits=1`,
+`advanced_config` empty — no custom nginx logic, audited specifically for
+anything resembling the qBittorrent forged-login incident and found clean)
+was already enabled and never touched during any prior hardening phase.
+Live-verified the actual container: `seer` (`ghcr.io/seerr-team/seerr`),
+backend really is `:5055` (checked, not assumed). Seerr's own auth is
+enforced (`/api/v1/user` and `/api/v1/auth/me` both `401` unauthenticated;
+`localLogin`/`mediaServerLogin` both `true` in `settings.json`).
+
+**CSRF protection — deliberately left disabled, real dependency found.**
+`network.csrfProtection` is `false`. Checked whether anything depends on
+Seerr's external write API before considering enabling it, per instructions
+— **it does**: `tools.py` holds `SEERR_API_KEY`/`SEERR_URL` and calls
+`POST {SEERR_URL}/api/v1/request` directly with an `X-Api-Key` header (Loki
+lets the Boss request media via API key, not a browser session). CSRF
+protection specifically blocks state-changing requests that don't carry a
+session-tied CSRF token — enabling it would break this integration. Left
+unchanged, as instructed for exactly this case.
+
+**Trust Proxy — found off, not changed.** `network.trustProxy` is `false`
+even though Seerr sits behind NPM, meaning Seerr currently can't correctly
+attribute request IPs (`X-Forwarded-For`) — a correctness gap, not a
+security one; doesn't affect authentication. Flagged rather than flipped:
+changing it means editing a live app's `settings.json` and likely
+restarting a container the Boss actively uses, which felt worth a nod
+before doing rather than a silent edit. Say the word and it's a two-minute
+change.
+
+**A real firewall bug was found and fixed while investigating this.**
+Comparing the live DNAT table (`iptables -t nat -S DOCKER`) against Phase
+3B's rules showed most container bridge IPs had drifted since — likely
+watchtower recreating containers (see the standing `watchtower-
+autoupdates-conflict` note) reassigns bridge IPs on the default driver.
+Seerr's own backend had moved `172.19.0.7`→`172.19.0.8`; **NPM's own
+container IP had also moved** (`172.22.0.6`→`172.22.0.5`), and — the actual
+bug — the corrected NPM-trust `RETURN` rule had been appended to the *end*
+of `DOCKER-USER`, after the original, still-address-correct `DROP` rules
+for Sonarr/Radarr/Prowlarr/SABnzbd (whose IPs hadn't moved). Rule order
+matters in iptables; a source-based trust rule sitting after a destination-
+port `DROP` rule never gets evaluated for that traffic. Result: NPM's own
+proxied requests to those four services were being silently dropped —
+confirmed live via a temporary `LOG` rule and packet counters, not guessed
+(`SRC=172.22.0.5` correctly identified, just positioned wrong). Fixed by
+resyncing every drifted container IP against live state and moving the
+NPM-trust `RETURN` rules into the same top tier as the other trusted-source
+rules (loopback/established/Tailscale/LAN), ahead of all destination-port
+rules. Re-validated every NPM-fronted service (Sonarr, Radarr, Prowlarr,
+SABnzbd, Seerr, Jellyfin, Immich, Bazarr, NZBHydra2 — all correct HTTP
+codes via a real separate-host path through razr) plus qbit/NPM-admin/
+Ollama still private and Home Assistant's exception still intact.
+Persisted via `netfilter-persistent save` after validation. Same dead-man-
+rollback discipline as Phase 3B (backup, armed background restore,
+cancelled only after full validation).
+
+**Open risk, not fixed this pass:** the underlying fragility — DOCKER-USER
+rules keyed to container IPs that watchtower's daily recreate can silently
+reassign — is structural, not a one-time fix. Today's drift happened to
+surface as a broken proxy path (loud) rather than a silently-reopened admin
+port (quiet); next time it may not announce itself. Worth a follow-up:
+either stop matching by container IP (e.g., a periodic resync job, or a
+different DOCKER-USER matching strategy less sensitive to IP churn), or
+finally act on the standing recommendation to put watchtower in monitor-
+only mode.
+
 ---
 
 ## Video-doorbell announcement reliability
