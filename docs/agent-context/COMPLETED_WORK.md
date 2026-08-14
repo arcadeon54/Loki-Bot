@@ -145,6 +145,117 @@ routing — flagged as the top Phase 3B priority.
 activation, UFW, nftables/iptables policy changes, Docker firewall-backend
 changes, Tailscale ACL changes, router changes, the Sonarr mapping task.
 
+**DONE (Phase 3B — Docker-aware host firewall applied) — 2026-08-14.**
+The firewall designed but not applied in Phase 3A is now live on dex247,
+staged and validated incrementally rather than pasted as one ruleset.
+
+*Pre-flight correction.* Project memory said "qBittorrent stays OUT of
+gluetun" and this had been read as "no VPN protection" going into this
+phase. Verified empirically instead of trusting that: `qbittorrent` is
+`binhex/arch-qbittorrentvpn` with its own embedded WireGuard client
+(`wg0`, Windscribe), confirmed live (`docker exec qbittorrent curl
+ifconfig.me` → `198.44.138.155`, a VPN exit IP) and confirmed by the
+container's own killswitch (`iptables -L` inside it: default-DROP on
+INPUT/OUTPUT/FORWARD, narrow exceptions). "Not gluetun" was correct; "no
+VPN" was not — gluetun is what the *arr stack uses, qBittorrent has always
+had its own separate tunnel. This directly answered the port-51413
+question: the container's killswitch has **no exception for `:6881`** (the
+P2P port, only `:8080` WebUI is allowed on `eth0`), and
+`STRICT_PORT_FORWARD=no` — meaning the Docker-published `:51413`→`:6881`
+mapping has never carried real P2P traffic; the container drops it
+internally regardless of what the host firewall does. `:51413` was
+therefore **not opened on the WAN interface** — no functional loss, one
+less exposed port.
+
+*Safety mechanics.* Two independent key-only SSH sessions held open
+throughout (one idle safety net, one used for LAN-perspective testing via
+razr — testing from the host itself to its own published ports doesn't
+exercise `FORWARD`/`DOCKER-USER` at all, since locally-originated traffic
+takes the `OUTPUT` path, so a genuinely separate LAN host was needed for
+real validation). Backed up `iptables-save`/`ip6tables-save`/`nft list
+ruleset` to `~/firewall-backups/` before any change. Dead-man rollback: `at`
+isn't installed on this host, so used a `setsid`-detached background script
+instead (immune to SSH session loss) that would auto-restore the pre-3B
+state unless a sentinel file existed by the time its window elapsed —
+cancelled only after full validation passed.
+
+*`DOCKER-USER` (the Docker-supported hook — `DOCKER`, `DOCKER-FORWARD`,
+`DOCKER-BRIDGE`, `DOCKER-CT`, `DOCKER-INTERNAL`, Docker's NAT rules
+untouched).* Trusted sources (loopback, established/related, `tailscale0`,
+LAN `192.168.1.0/24`, and NPM's own container IPs `172.21.0.2`/`172.22.0.6`
+— NPM needs to reach backend ports on the Boss's behalf) `RETURN`
+immediately. NPM's container is allowed on `:80`/`:443` for anyone — the
+genuinely public path. Every other Docker-published port is matched by its
+**post-DNAT container IP:port** (traffic reaches `DOCKER-USER` after
+Docker's own DNAT already rewrote the destination — matching the original
+host port would silently match nothing) and dropped for untrusted sources:
+flaresolverr, radarr/sabnzbd/sonarr/prowlarr (all share gluetun's netns IP),
+searxng, tautulli, Pi-hole DNS/admin, cobalt, chromadb, bazarr, media-server,
+jdownloader (both ports), metube, seerr, joplin, nzbhydra2, immich direct,
+filebrowser, jellyfin, NPM admin, qBittorrent WebUI, and qBittorrent P2P
+(both protocols). No blanket default-DROP was added to the chain — each
+restriction targets one specific published port, so non-Docker forwarded
+traffic (BLACK-BOXX's `wlp2s0`→`wg-ap`) never touches these rules and can't
+be broken by them, which was the specific risk flagged going in.
+
+*Host `INPUT`* (native services: sshd, `ollama.service`, Loki's `:9100`
+webhook, Samba). Same trusted-source allowlist plus `wlp2s0` (BLACK-BOXX's
+AP interface — dnsmasq/hostapd need to freely serve `192.168.10.0/24`),
+then explicit drops for `:22`, `:11434`, `:9100`, `:139`/`:445` TCP,
+`:137`/`:138` UDP for anyone not already trusted. Deliberately did **not**
+flip `INPUT`'s default policy to DROP — dex247 runs enough uncatalogued
+host-level protocols (DHCPv6/SLAAC, BLACK-BOXX's own DHCP/DNS, mDNS) that a
+blanket default-deny risked breaking something not on this list; targeted
+per-port drops reach the same security outcome with a smaller blast radius.
+
+*IPv6 — mirrored, not skipped.* `enp3s0` carries a real global IPv6
+address; an IPv4-only firewall would have left SSH/Ollama/Samba fully
+reachable over IPv6 regardless of the IPv4 rules, since they all bind
+dual-stack (`[::]` as well as `0.0.0.0`). Mirrored `DOCKER-USER` and `INPUT`
+structure in `ip6tables` (LAN-equivalent = the `/64` on `enp3s0`), with
+`ipv6-icmp` allowed broadly (Neighbor Discovery/RA/SLAAC need it — this
+isn't optional the way ICMPv4 filtering can be). Docker isn't publishing
+any container port over IPv6 currently, so the IPv6 `DOCKER-USER` chain is
+mostly future-proofing; the IPv6 `INPUT` drops are live and real.
+
+*Validation.* Real LAN-perspective tests via razr (a genuinely separate
+host, so traffic actually transits `FORWARD`): SSH, Ollama, Sonarr, Radarr,
+SABnzbd, Prowlarr, Filebrowser, Samba (445 TCP connect), qBittorrent WebUI,
+Pi-hole DNS all confirmed working from LAN. NPM public passthrough
+confirmed end-to-end from razr through the real domain resolving to
+dex247's LAN IP (`jfin`/`sonarr`/`radarr`/`immich`.ivn-group.cc all correct
+HTTP codes) — proving both the public `:80`/`:443` rule and the NPM-trusted-
+source rule work together without NPM's own backend fetches getting
+blocked by the same restrictions meant for direct WAN access. Docker
+container egress/DNS/inter-container (sonarr→qbittorrent) and NPM→jellyfin
+backend connectivity confirmed. qBittorrent VPN egress IP unchanged
+(`198.44.138.155`) after every stage. BLACK-BOXX runbook: 17/17 checks
+green, 0 advisories, both before and after. **Direct WAN-sourced blocking
+could not be tested from an external vantage point** (no host outside the
+network was available) — the rule logic and DNAT-target matching were
+verified against live `iptables -t nat -S DOCKER` output instead; a real
+external spot-check (e.g. from cellular data) would close this gap if
+wanted.
+
+*Persistence.* `netfilter-persistent`/`iptables-persistent` were already
+installed (unused since 2026-05) — no new packages needed. Saved only after
+every rule above was live-validated. Docker-restart survivability tested
+directly: `DOCKER-USER` (36 rules) and `INPUT` (15 rules) counts identical
+before/after `systemctl restart docker`, Docker's own chains rebuilt
+normally, all 32 containers came back healthy (one transient NPM→Jellyfin
+502 during the ~10s restart window, resolved itself, not a firewall
+regression). **No reboot was performed** — boot-time persistence is
+inferred from documented `netfilter-persistent`+Docker interaction, not
+proven live; treat an actual reboot as separate, approved maintenance if
+that proof is wanted.
+
+**Files/state changed:** live `iptables`/`ip6tables` rules on dex247 (not
+tracked in git — this repo doesn't own host firewall state), persisted to
+`/etc/iptables/rules.v4`/`rules.v6`; backups and dead-man script under
+`~/firewall-backups/` on dex247. **Not changed:** NPM proxy definitions,
+Tailscale ACLs, router config, qBittorrent VPN config, Docker's firewall
+backend, Sonarr path mapping.
+
 ---
 
 ## Video-doorbell announcement reliability
