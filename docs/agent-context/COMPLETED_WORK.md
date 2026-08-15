@@ -635,6 +635,50 @@ correctly `401` (their own auth still enforced, unaffected either way since
 nothing pointed at NZBHydra2 to begin with). Full public-route sweep
 (ha/rq/qbit/ngnx/ollama/jfin/sonarr) all unchanged from expected state.
 
+**DONE (Phase 4D — jd.ivn-group.cc + firefox.ivn-group.cc taken private) —
+2026-08-15.** Closes the last two Phase 4A findings.
+
+**JDownloader (`jd.ivn-group.cc`) — taken private, backend untouched.**
+This fronted JDownloader's noVNC remote-desktop interface — full
+browser/GUI control gated only by a VNC password prompt, the most
+sensitive of the remaining exposures. Dependency audit found `jd_
+integration.py` (Loki's own JDownloader automation, called from
+`loki_bot.py`) controls JDownloader **entirely through the official
+MyJDownloader cloud API** (`myjdapi`, `jd.connect(MYJD_EMAIL,
+MYJD_PASSWORD)` against my.jdownloader.org) — never through
+`jd.ivn-group.cc`, the LAN IP, or port 5800 directly. That's a
+completely separate mechanism from the noVNC GUI the public route
+exposed, so disabling the route doesn't touch Loki's automation at all.
+No evidence of a genuine off-LAN GUI-access requirement either. Disabled
+the NPM proxy host (same pattern as every prior disable this series — DB
+`enabled=0` + 403 stub, backup at `25.conf.pre-lockdown-20260815.bak`).
+Backend container untouched, confirmed still healthy and reachable at
+`192.168.1.155:5800` on LAN — that's the access path now, not Tailscale
+(Phase 4B is still vendor-blocked, not treated as a substitute).
+
+**Firefox (`firefox.ivn-group.cc`) — taken private, dormant route
+closed.** Confirmed still dead (`192.168.1.155:3002` unreachable, no
+container). No automation references it anywhere. Disabled the same way
+(backup at `1.conf.pre-lockdown-20260815.bak`) rather than leaving a
+dormant public route that would silently go live unsecured the moment
+something starts listening on that port again — the exact risk flagged
+back in Phase 2A. Not deleted, so it's a five-minute restore if the
+Firefox (Big Bear) service is intentionally redeployed — review its
+security posture at that time rather than assuming the old config is
+still appropriate.
+
+**Validation:** both routes now `403` publicly. JDownloader `200` on LAN.
+Full regression sweep unchanged: `ha` 200, `rq` 307, `metube` 401 (still
+gated), `hydra`/`qbit`/`ngnx`/`ollama` all `403` (still private), `jfin`
+302, `sonarr` 200. Full NPM inventory re-checked — only proxy host IDs 1
+and 25 changed this pass, all other hosts untouched.
+
+**Public NPM attack surface from the original Phase 4A audit is now
+fully closed:** qBittorrent, NPM admin, raw Ollama, NZBHydra2, JDownloader
+noVNC, and the dead Firefox route are all private. MeTube is the one
+formerly-open host now protected with auth instead of closed. HA and
+Seerr remain the two deliberate, documented public exceptions.
+
 ---
 
 ## Video-doorbell announcement reliability
