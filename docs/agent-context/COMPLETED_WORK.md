@@ -456,6 +456,124 @@ Tailscale ACLs, router config, qBittorrent VPN config, the NAS's own
 Watchtower, Home Assistant's and Seerr's public exceptions (both still
 public, both still verified working throughout).
 
+**DONE (Phase 4A — Tailscale/router exposure audit, read-only) — 2026-08-14.**
+Full read-only inventory of the tailnet and router. Findings: the tailnet
+ACL was the untouched Tailscale default (`{"src":["*"],"dst":["*"],"ip":["*"]}`
+— confirmed by the Boss pulling it directly from the admin console, since
+this environment has no Tailscale API/OAuth credential to read it any other
+way). dex247 advertises itself as a full exit node (`0.0.0.0/0`, `::/0`)
+but packet counters on the exit-node MASQUERADE/mark rules were zero —
+nobody was using it. Router identified as an Xfinity gateway via HTTP
+banner; UPnP/NAT-PMP/PCP all probed (SSDP M-SEARCH, NAT-PMP/PCP unicast
+queries) and found inactive — no automatic port-mapping path exists.
+Classified every enabled NPM host; found two with **no authentication at
+all** (`hydra.ivn-group.cc` / NZBHydra2, `metube.ivn-group.cc` — the MeTube
+gap already flagged in Phase 2A, still unresolved) and one remote-desktop
+exposure (`jd.ivn-group.cc`, JDownloader noVNC) — none fixed this phase,
+read-only per the Boss's explicit scope.
+
+**PHASE 4B — BLOCKED / VENDOR ISSUE, NOT COMPLETE.** Designed and attempted
+to apply a least-privilege Tailscale Grants policy (host-alias-only, no
+tags — tags were tried first and abandoned after tagging dex247 forced an
+unexpected re-authentication and briefly dropped its tailnet identity;
+recovered cleanly via `tailscale login --advertise-tags=`, no data lost, but
+see the exit-node note below).
+
+**Desired end state (not yet actually enforced — see below):**
+```jsonc
+{
+  "acls": [],   // required: Tailscale documents that omitting "acls"
+                // entirely applies an implicit default-allow-all ACL that
+                // coexists with (and defeats) restrictive grants. An
+                // explicit empty array suppresses that implicit layer.
+                // https://tailscale.com/docs/features/access-control/acls
+                // https://tailscale.com/docs/reference/examples/acls
+  "hosts": {
+    "dex247": "100.68.187.69", "asus": "100.101.112.55",
+    "razr": "100.87.97.120", "nas": "100.121.95.97",
+    "tracearr": "100.113.107.95"
+  },
+  "grants": [
+    {"src": ["asus"], "dst": ["dex247"],
+     "ip": ["tcp:22","tcp:81","tcp:8080","tcp:8989","tcp:7878","tcp:8182",
+            "tcp:8085","tcp:11434","tcp:139","tcp:445","tcp:8785"]},
+    {"src": ["razr"], "dst": ["dex247"], "ip": ["tcp:22","tcp:8785"]},
+    {"src": ["dex247"], "dst": ["asus"], "ip": ["tcp:22"]}
+  ],
+  "tests": [ /* 9 tests covering the intended allow/deny matrix */ ]
+}
+```
+No `tagOwners`, no tags, no wildcard grant. asus deliberately stays
+user-owned/untagged (Tailscale doesn't let a tagged device SSH into a
+user-owned one, which would have broken `dex247 → asus:22`, load-bearing for
+`sshfs-unicron.service`).
+
+**Verified true, in order, exhausting every non-destructive diagnostic
+before calling this a vendor issue:**
+- Console's embedded `tests` pass.
+- Configuration Log shows the correct diff (including `"acls": []`),
+  correct actor/timestamp, **no later overwrite**.
+- Confirmed same tailnet (`tail3744e0.ts.net`) between the admin console
+  session and dex247.
+- Confirmed **GitOps is not enabled** — nothing else could be silently
+  reverting the console edit.
+- Confirmed the Access Controls editor currently still shows the exact
+  restrictive policy, live.
+- Despite all of that: `sudo tailscale debug netmap` on dex247 shows
+  `PacketFilter` as a single rule — every tailnet source, every
+  destination, **ports 0–65535**, TCP/UDP/ICMP/ICMPv6. Byte-for-byte the
+  old trust-all filter.
+- A clean `systemctl restart tailscaled` (no `up`, no `login`, no tag or
+  preference change — same IP, same identity, no tags after) did not
+  change the `PacketFilter` at all.
+- Confirmed live-traffic evidence isn't a LAN bypass: `ip route get
+  100.68.187.69` from razr resolves via `dev tailscale0`; a `tcpdump`
+  capture on dex247's own `tailscale0` caught the actual SYN
+  (`100.87.97.120.47664 > 100.68.187.69.8080`), full handshake, HTTP 200.
+  `razr → dex247:8080` and `:11434` both still succeed with no matching
+  grant.
+- Required ALLOW paths (asus→dex247 full admin list, razr→dex247:22/:8785,
+  dex247→asus:22) all correctly work throughout — this is specifically an
+  **under-restriction**, not a general breakage, and not worse than the
+  trust-all state that preceded it.
+
+**Generated `tailscale bugreport` ID for Tailscale Support:**
+`BUG-d16d94099bdbec217c5a5f6b62b373505ea5508e550ba7d00bc9d0711ef4e69d-20260815014000Z-35237dcb71c3b367`
+(2026-08-15T01:40:00Z). Support-case draft prepared, **not submitted** —
+pending the Boss's review/send.
+
+**Incidental side effect, accepted:** during the dex247 identity recovery,
+`tailscale login --advertise-tags=` (unlike `tailscale up`, which refuses
+to run without restating every non-default flag) silently dropped the
+`AdvertiseRoutes` exit-node advertisement. Since nobody was using it anyway
+(confirmed via zero packet counters in Phase 4A) and this happens to match
+what Phase 4B's own Step 5 intended to do deliberately later, the Boss
+accepted leaving it removed rather than restoring it just to remove it
+again cleanly. **dex247 no longer advertises as an exit node — intentional,
+confirmed, done.**
+
+**THE TAILNET IS NOT CURRENTLY LEAST-PRIVILEGE, despite the control-plane
+policy being correct.** The saved policy is provably correct (console
+tests pass, audit log confirms the save, no overwrite) but dex247's live
+enforcement still matches the old trust-all behavior. Any tailnet device —
+including the six idle personal/media ones — can currently reach any port
+on any node, exactly as before this phase started. **Do not mark Phase 4B
+complete, and do not treat the restrictive policy as protecting anything,
+until live DENY tests actually pass post-fix.**
+
+**Rollback artifact preserved:** the pre-4B transitional trust-all policy
+(with the leftover unused `tag:server` tagOwners block from the abandoned
+tag approach) is saved at
+`/home/g2k247/firewall-backups/tailscale/acl.pre-4B-restrictive-20260815-003535.json`
+on dex247, for reference — the *console* already has the restrictive policy
+live and should **not** be reverted; this file exists purely as a record of
+what came before.
+
+**Pending action is Tailscale Support, not more local experimentation.**
+Explicitly not touched further per the Boss's instruction: policy, tags,
+device identity, `tailscaled`, firewall, NPM, Docker, SSH, router, stale
+device cleanup.
+
 ---
 
 ## Video-doorbell announcement reliability
