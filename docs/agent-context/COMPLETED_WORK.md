@@ -815,17 +815,47 @@ dex247 (`loki-bot`, `skillkit`, `.config`, `docker`, `bin`, `/tmp`) or
 RAZR (`/home/razr`, `/home/hermes`, `/tmp`). Shell history clean, process
 argv clean, nothing token-shaped in git.
 
-**⚠️ SEPARATE FINDING, NOT REMEDIATED — six more `.env.bak*` files on
-dex247.** `.env.bak.1776992428`, `.1776993304`, `.1776993608`,
-`.20260321_213308`, `.20260427-231230`, `.20260428-234835`. They contain
-**no HA tokens** (they predate both `L.O.K.I.` and `AGY`), so they were
-outside this task's deletion scope and were left alone — but each holds
-7-ish other live secrets (`DISCORD_TOKEN`, `OPENAI_API_KEY`,
-`GEMINI_API_KEY`, `ELEVENLABS_API_KEY`, `MYJD_PASSWORD`, …) and **all are
-world-readable (mode 664, one is 666)**. They're git-ignored, so this is a
-local-filesystem exposure, not a repo leak. Recommend deleting them or at
-minimum `chmod 600` — needs the Boss's go-ahead since some may be wanted
-as history.
+**Six more world-readable `.env.bak*` files — RESOLVED 2026-08-15
+(Phase 5B-3).** `.env.bak.1776992428`, `.1776993304`, `.1776993608`,
+`.20260321_213308`, `.20260427-231230`, `.20260428-234835`. They contained
+**no HA tokens** (they predate both `L.O.K.I.` and `AGY`) but each held
+~7 other credentials, and — the part that made this urgent rather than
+cosmetic — **6 of the 7 secrets in each were still the *live* production
+values**, not rotated-away history. All six were world-readable (mode 664;
+`.1776993608` was mode **666, world-writable**).
+
+Classification found all six were class **D** (stale secret-bearing, no
+current purpose): no systemd unit, script, cron entry, or Docker config
+referenced any of them by name — the only hits were policy documents
+warning that `.env.bak*` files hold secrets, plus this changelog. They
+also weren't viable rollback targets even in principle: each held 24-29
+variables against the live `.env`'s 64, so restoring one would have
+dropped 35+ settings. No two were byte-identical. All six `shred -u`'d.
+
+**Broader sweep of `/home/g2k247` for other credential-bearing backups**
+found two more (both now `chmod 600`, neither deleted — they're active
+config, not stale backups):
+- `schedule-parser/credentials.json` — was mode **644**, holds a Google
+  OAuth `client_id`/`client_secret`.
+- `.claude/projects/…/memory/reference_npm_credentials.md` — was mode
+  **664**, holds the **NPM admin password in plaintext**.
+
+A third, `backups/maintenance-checkpoint-2026-07-25/loki-bot.env.bak`
+(16 secret keys), was left untouched: it's already mode 600 and is part of
+a deliberate, named maintenance checkpoint rather than the stale-backup
+pattern — deleting it is the Boss's call, not an automatic cleanup.
+
+**⚠️ CREDENTIAL LEAKED DURING THIS CLEANUP — NPM admin password needs
+rotation.** While inspecting `reference_npm_credentials.md`, the redaction
+regex used to preview it was faulty: it matched the *label*
+(`Password:**`) and redacted only the trailing asterisks, printing the
+actual password into the session transcript. The file itself was fine; the
+inspection was not. **That NPM admin password must be treated as
+compromised and rotated**, and the plaintext copy in that memory file
+should be removed or replaced with a pointer to a secret store. Lesson:
+never regex-redact a file to preview it — check for the *presence* of
+secret-shaped content and report key names only, or don't print the file
+at all.
 
 **Still unknown / open:**
 - Whether `:9999` was reachable from the WAN during those two months, or
@@ -835,7 +865,11 @@ as history.
 - Whether Antigravity itself needs an HA token at all going forward (the
   `AGY` token it was presumably using is now dead; nothing on the box was
   actively reading the file).
-- The six world-readable `.env.bak*` files above.
+- **NPM admin password rotation** (leaked in-session, see above), plus
+  removing the plaintext copy from the `.claude` memory file.
+- Whether `backups/maintenance-checkpoint-2026-07-25/loki-bot.env.bak`
+  should be kept — it holds 16 live secrets, mode 600, deliberate
+  checkpoint.
 - RAZR still has no host firewall, SSH password auth enabled, and Ollama
   on `*:11434` — all P1 findings from Phase 5A, none remediated yet.
 
