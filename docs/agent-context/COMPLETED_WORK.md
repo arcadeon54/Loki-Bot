@@ -681,6 +681,88 @@ Seerr remain the two deliberate, documented public exceptions.
 
 ---
 
+## SECURITY INCIDENT — RAZR credential exposure via unauthenticated file server
+
+**Phase 5A discovery / Phase 5B-1 remediation — 2026-08-15.**
+
+**What was exposed.** A Phase 5A read-only audit of the non-dex247 hosts
+found RAZR running `python3 -m http.server 9999 --directory /home/razr` —
+an unauthenticated directory-listing file server over **RAZR's entire home
+directory**, bound to `0.0.0.0` (so IPv4 + the machine's global IPv6),
+with no host firewall in front of it. Started **2026-06-20 17:51 UTC**,
+found **2026-08-15** — roughly **two months** of exposure. Confirmed
+reachable from another LAN host; whether the router also forwarded it to
+the WAN was never established (see "still unknown" below).
+
+**Remediated.** Process killed (PID 61231, parent `init`). Port confirmed
+closed from localhost and from a second LAN host. No persistence found —
+no cron, no system or user systemd unit, no `rc.local`, no shell-rc entry,
+no screen/tmux session, no `at` job (`at` isn't installed). It was a
+detached manual `nohup`-style launch from a long-dead session, so it will
+not return, including across a reboot.
+
+**Credential rotation.** `/home/razr/.ha_token` (a Home Assistant
+long-lived access token) was in the served directory and treated as
+compromised. Dependency audit first: no active consumer anywhere on RAZR
+reads that file — nothing in systemd, cron, Docker env, OpenClaw, Hermes,
+or any script references the path or an `HA_TOKEN`-style variable. Rotated
+anyway. Identifying *which* HA token record it was mattered, because the
+UI listed seven long-lived tokens and revoking the wrong one would break a
+live integration: decoded the old JWT's `iss` claim in-process (never
+printed) and matched it against `auth/refresh_tokens` over HA's WebSocket
+API, authenticated with the *new* token. Exact match on both the
+refresh-token id and the creation timestamp (`2026-06-23 01:03:11 UTC`,
+48s before the file's mtime) identified it as the UI entry named **`AGY`**
+(Antigravity). Boss revoked `AGY` manually; old token then returned `401`
+and the new one `200`. Old token file shredded.
+
+**A note on method that will matter next time:** HA's UI shows
+`last_used_at` equal to `created_at` for *every* long-lived token,
+including one used successfully minutes earlier — so "last used" is
+useless for identifying which token is which. The `iss`↔refresh-token-`id`
+match is the reliable method.
+
+**⚠️ SECOND EXPOSED CREDENTIAL — STILL LIVE, NOT YET ROTATED.** The
+post-rotation leak audit scanned RAZR for JWT-shaped strings (matching on
+shape, never printing values) and found HA tokens stored in plaintext
+inside **Antigravity/Gemini CLI conversation history**:
+
+- `~/.gemini/antigravity-cli/history.jsonl`
+- `~/.gemini/antigravity-cli/brain/8fe62e15-.../.system_generated/logs/transcript.jsonl` and `transcript_full.jsonl`
+- `~/.gemini/antigravity-cli/conversations/8fe62e15-....db`
+- `~/.gemini/antigravity-cli/conversations/b5669c0f-....db`
+
+Most of those copies are the now-revoked `AGY` token (harmless). But
+`b5669c0f-....db` contains a **different, still-valid** HA long-lived
+token, identified by its `iat` of `2026-05-18 20:26:35 UTC` — an exact
+match for the UI entry named **`L.O.K.I.`**. That token was equally
+exposed by the `:9999` server for the same two months and **has not been
+rotated.** It is presumably in active use by Loki's own HA integration, so
+rotating it needs the same dependency-check-first treatment `AGY` got.
+Conversation history was **not** deleted — that needs the Boss's approval
+separately.
+
+**Clean:** shell history, `/tmp`, process argv (verified with a corrected
+check — an earlier version of the probe had a shell logic bug that
+produced a false positive), env/config files, user journal, and every git
+repo on RAZR (tracked and untracked) contain no JWT-shaped strings. The
+new active token appears in none of the transcripts. `~/.ha_token` is
+mode `600`, owned `razr:razr`.
+
+**Still unknown / open:**
+- Whether `:9999` was reachable from the WAN during those two months, or
+  only from the LAN. The router's port-forward table has never been
+  inspected (no admin credentials) — this is the same blocker as Phase 4A.
+  Until that's known, assume the exposure may have been internet-wide.
+- The `L.O.K.I.` token rotation above.
+- Whether Antigravity itself needs an HA token at all going forward (the
+  `AGY` token it was presumably using is now dead; nothing on the box was
+  actively reading the file).
+- RAZR still has no host firewall, SSH password auth enabled, and Ollama
+  on `*:11434` — all P1 findings from Phase 5A, none remediated yet.
+
+---
+
 ## Video-doorbell announcement reliability
 
 **DONE — 2026-08-10, live on the NAS Home Assistant instance (192.168.1.63:8123),
