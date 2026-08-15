@@ -574,6 +574,67 @@ Explicitly not touched further per the Boss's instruction: policy, tags,
 device identity, `tailscaled`, firewall, NPM, Docker, SSH, router, stale
 device cleanup.
 
+**DONE (Phase 4C — public auth for MeTube + NZBHydra2) — 2026-08-15.**
+Closes the two no-auth public findings from Phase 4A.
+
+**NZBHydra2 (`hydra.ivn-group.cc`) — taken private, not protected.**
+Dependency audit first, as instructed: pulled Sonarr/Radarr/Prowlarr's own
+indexer databases (copied out, queried read-only) and found **zero
+reference to NZBHydra2 anywhere** — every indexer in Sonarr and Radarr is
+synced from Prowlarr (`"Name (Prowlarr)"`), and Prowlarr's own indexer list
+has no NZBHydra2 entry either. Prowlarr fully replaced NZBHydra2's
+aggregation role at some point; nothing depends on it. No evidence of
+remote personal browser use either. Disabled the NPM proxy host (DB
+`enabled=0` + 403 stub conf, same pattern as every prior phase — backup at
+`36.conf.pre-lockdown-20260815.bak`). Backend container untouched, still
+reachable on LAN/Tailscale per the existing Phase 3C firewall policy — only
+the public route closed. `curl` confirms `hydra.ivn-group.cc` → `403`
+publicly, `192.168.1.155:5076` → `200` on LAN. **Reversible** — if it turns
+out there is remote personal use, re-enabling + adding Basic Auth instead
+of a full lockout is a five-minute follow-up.
+
+**MeTube (`metube.ivn-group.cc`) — kept public, now behind NPM Basic
+Auth.** Inspected the orphaned `htpasswd-metube` file mentioned in Phase 2A
+first, as instructed: it's a raw file sitting in NPM's data directory,
+**not referenced by any `access_list`/`access_list_auth` row in NPM's own
+database** — NPM's actual enforcement mechanism generates its own
+`/data/access/<id>` htpasswd file from the database when an Access List is
+saved through the app; a file that never went through that path was never
+going to be wired into any host's nginx config no matter what. Didn't
+reuse it — created a proper Access List the same way NPM itself would:
+new `access_list` + `access_list_auth` rows, a fresh random 22-character
+password, hashed with the same `apr1` format NPM's own existing "Ollama
+Auth" list already used (confirmed by inspecting that list's hash prefix
+first, so the new one matches NPM's real mechanism instead of guessing),
+written to `/data/access/2`, and the exact `auth_basic`/`satisfy all` block
+added to `3.conf` copied verbatim from NPM's own `_access.conf` template —
+no custom/brittle nginx logic invented.
+
+**A credential-handling mistake happened and was caught immediately:** the
+first attempt built the `INSERT` as an inline shell string, which failed on
+a missing `owner_user_id` column and — because the failing SQL statement
+echoed back in the error — **leaked a fragment of the generated password
+into visible output.** Treated that password as burned: deleted the
+credential file immediately, generated a completely new password, and
+redid the whole operation as a Python script using parameterized SQLite
+queries and `subprocess` with the password passed via `stdin`/args rather
+than ever appearing in a shell command line. The credential file
+(`~/nginx-proxy-manager/backups/credentials/metube-npm-auth.txt`, mode
+`600`) was never printed after that point — validated by reading it back
+in a Python subprocess call whose own stdout was never displayed, only the
+resulting `200`.
+
+**Validation:** `metube.ivn-group.cc` unauthenticated → `401`. Same URL
+with the saved credential → `200`. LAN direct (`192.168.1.155:8081`) →
+`200`, unaffected. TLS cert valid (`subject: CN=metube.ivn-group.cc`,
+verified ok), `block-exploits`/`force-ssl` includes confirmed still present
+in the rewritten conf. Full NPM inventory re-checked — only proxy host
+IDs 3 and 36 changed, all other 23 enabled hosts untouched.
+*arr-integration regression: Prowlarr/Sonarr/Radarr health endpoints all
+correctly `401` (their own auth still enforced, unaffected either way since
+nothing pointed at NZBHydra2 to begin with). Full public-route sweep
+(ha/rq/qbit/ngnx/ollama/jfin/sonarr) all unchanged from expected state.
+
 ---
 
 ## Video-doorbell announcement reliability
