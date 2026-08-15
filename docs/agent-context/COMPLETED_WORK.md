@@ -722,10 +722,10 @@ including one used successfully minutes earlier — so "last used" is
 useless for identifying which token is which. The `iss`↔refresh-token-`id`
 match is the reliable method.
 
-**⚠️ SECOND EXPOSED CREDENTIAL — STILL LIVE, NOT YET ROTATED.** The
-post-rotation leak audit scanned RAZR for JWT-shaped strings (matching on
-shape, never printing values) and found HA tokens stored in plaintext
-inside **Antigravity/Gemini CLI conversation history**:
+**⚠️ SECOND EXPOSED CREDENTIAL — since ROTATED, see the L.O.K.I. section
+below.** The post-rotation leak audit scanned RAZR for JWT-shaped strings
+(matching on shape, never printing values) and found HA tokens stored in
+plaintext inside **Antigravity/Gemini CLI conversation history**:
 
 - `~/.gemini/antigravity-cli/history.jsonl`
 - `~/.gemini/antigravity-cli/brain/8fe62e15-.../.system_generated/logs/transcript.jsonl` and `transcript_full.jsonl`
@@ -749,15 +749,93 @@ repo on RAZR (tracked and untracked) contain no JWT-shaped strings. The
 new active token appears in none of the transcripts. `~/.ha_token` is
 mode `600`, owned `razr:razr`.
 
+**L.O.K.I. TOKEN ROTATION — COMPLETE, 2026-08-15.** The second exposed
+credential is now rotated, validated, revoked and cleaned up.
+
+*Consumers found (two, both confirmed by fingerprint — the `.env` value's
+`iss`/`iat`/sha256 matched the `L.O.K.I.` HA record exactly):*
+1. **`loki.service`** ← `/home/g2k247/loki-bot/.env`. `ha_integration.py`
+   reads `HA_TOKEN` at **module level** (line 19), so it's bound at import
+   → **restart required**. This is the only module in the whole repo that
+   reads the variable; `loki_bot.py` references `ha_integration.HA_TOKEN`.
+2. **skillkit** ← `/home/g2k247/skillkit/config/skillkit.env`.
+   `ha_automations.py` reads `os.environ` **per call**, and skillkit is
+   CLI/cron-invoked with no daemon → **no restart needed**.
+
+Ruled out as consumers: `homelab_monitor.py` (unauthenticated health GET
+only), `presence_monitor.py`, `loki-homelab-api.service` (its env file
+holds only `HOMELAB_API_*`), and everything on RAZR/NAS.
+
+*Sequence used (old token deliberately kept alive until the very end):*
+backed both env files up outside git (mode 600) → updated only the
+`HA_TOKEN` line in each, in-process via Python with atomic `os.replace`
+and mode/ownership preserved (line counts verified identical: 150 and 15)
+→ validated skillkit **first**, since it needs no restart, proving the new
+token before touching production → Boss approved → `systemctl restart
+loki` → full validation → Boss revoked the old token → negative/positive
+test → cleanup.
+
+*Validation results:* new PID, `NRestarts: 0`, `:9100` webhook rebound,
+Discord gateway connected, Telegram online as `@Leauxki_Bot`, presence
+monitor online reporting live resident states (which is itself proof the
+daemon made authenticated HA reads on the new token). `get_state` →
+`person.kavaris` = `home`. `get_all_states` → **434 entities**. skillkit
+`list_ha_automations()` → 31 automations. **Zero HA auth errors** in the
+journal. One `403` matched the error grep — the *Discord* weekly-export
+`Missing Permissions` issue, which also occurred before this restart and
+is a separate known UNFINISHED item, not HA. No unrelated service was
+restarted. No state-changing HA action was ever invoked (no
+`call_service`, alarms, doorbell, TTS).
+
+*Note on proving which token a running daemon holds:* `/proc/<pid>/environ`
+does **not** show it — `python-dotenv` loads at runtime and doesn't rewrite
+the initial environ block. Functional evidence (successful authenticated
+HA reads after restart + zero 401s + `.env` mtime predating the restart) is
+the reliable proof. Also, as with `AGY`, HA's `last_used_at` never updates
+for long-lived tokens, so the JWT `iss` ↔ refresh-token `id` match remains
+the only dependable identification method.
+
+*Final state:* old token → **HTTP 401** (revoked, confirmed). New token →
+**HTTP 200**. Both production env files verified byte-identical to each
+other and mode 600.
+
+*Cleanup performed (all shredded, not just unlinked):* `.ha_token_new`;
+the two stale `.env.bak*` files that contained the old token; both
+timestamped rotation backups (they contained the now-dead credential and
+rollback was no longer needed); and on RAZR the five Antigravity/Gemini
+files holding revoked tokens — `conversations/b5669c0f-….db` (L.O.K.I.),
+`conversations/8fe62e15-….db`, `history.jsonl`, and the two
+`brain/8fe62e15-…/transcript*.jsonl`. **Deleting those cost the
+corresponding Antigravity conversation history** — accepted deliberately;
+they were conversation records, not configuration, and in-place SQLite
+surgery would have risked corrupting the DBs for no benefit.
+
+*Residual scan:* zero copies of either revoked token remain anywhere on
+dex247 (`loki-bot`, `skillkit`, `.config`, `docker`, `bin`, `/tmp`) or
+RAZR (`/home/razr`, `/home/hermes`, `/tmp`). Shell history clean, process
+argv clean, nothing token-shaped in git.
+
+**⚠️ SEPARATE FINDING, NOT REMEDIATED — six more `.env.bak*` files on
+dex247.** `.env.bak.1776992428`, `.1776993304`, `.1776993608`,
+`.20260321_213308`, `.20260427-231230`, `.20260428-234835`. They contain
+**no HA tokens** (they predate both `L.O.K.I.` and `AGY`), so they were
+outside this task's deletion scope and were left alone — but each holds
+7-ish other live secrets (`DISCORD_TOKEN`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`, `ELEVENLABS_API_KEY`, `MYJD_PASSWORD`, …) and **all are
+world-readable (mode 664, one is 666)**. They're git-ignored, so this is a
+local-filesystem exposure, not a repo leak. Recommend deleting them or at
+minimum `chmod 600` — needs the Boss's go-ahead since some may be wanted
+as history.
+
 **Still unknown / open:**
 - Whether `:9999` was reachable from the WAN during those two months, or
   only from the LAN. The router's port-forward table has never been
   inspected (no admin credentials) — this is the same blocker as Phase 4A.
   Until that's known, assume the exposure may have been internet-wide.
-- The `L.O.K.I.` token rotation above.
 - Whether Antigravity itself needs an HA token at all going forward (the
   `AGY` token it was presumably using is now dead; nothing on the box was
   actively reading the file).
+- The six world-readable `.env.bak*` files above.
 - RAZR still has no host firewall, SSH password auth enabled, and Ollama
   on `*:11434` — all P1 findings from Phase 5A, none remediated yet.
 
