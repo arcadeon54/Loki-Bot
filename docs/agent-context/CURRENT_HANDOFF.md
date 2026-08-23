@@ -1,8 +1,58 @@
 # CURRENT HANDOFF
 
-*Updated 2026-08-10. Keep this under a minute to read.*
+*Updated 2026-08-23. Keep this under a minute to read.*
 
 ## Just completed
+
+**Public access restored and validated; NPM database recovered — 2026-08-23
+(Phases 5B-4 + 5C).** Full detail in `COMPLETED_WORK.md`; the short version:
+
+**NPM was running on an orphaned SQLite inode.** An earlier `docker cp`-class
+overwrite replaced `/data/database.sqlite` underneath the running container, so
+NPM kept writing to the deleted inode. Two consequences: UI/API writes would
+have vanished at the next restart, and the Phase 4C/4D hardening **had never
+actually taken effect** — `firefox`, `jd`, and `hydra` were still publicly
+reachable and MeTube still had no auth. A controlled restart fixed it (both DBs
+compared and integrity-checked first; nothing lost). Configs regenerated,
+`nginx -t` clean, and write persistence was then *proven* by a real UI save.
+**Never replace a live SQLite DB with `docker cp` — use the API/UI, or stop the
+service first.**
+
+**NPM admin password rotated** via the supported API. New credential validated,
+old one rejected (NPM answers `400 error.invalid-auth`, not `401` — confirmed
+against controls). Plaintext memory copy replaced with a pointer, temp file
+shredded after the Boss saved it to his password manager. **NPM admin stays
+private on `:81`.**
+
+**Three public services, all with app-level auth as the boundary and no NPM
+Basic Auth:**
+
+| Service | Backend | State |
+|---|---|---|
+| `jfin.ivn-group.cc` (Jellyfin) | `192.168.1.155:8096` | ✅ WebSockets on; **cellular validated** (login/browse/playback/seeking, Tailscale off) |
+| `cloud.ivn-group.cc` (Nextcloud) | `192.168.1.63:8082` | ✅ stale `192.168.1.247` fixed via UI; **cellular validated** + public share link with no login and no Tailscale |
+| `immich.ivn-group.cc` (Immich) | `192.168.1.155:2283` | ⚠️ server-side passed; **cellular/client validation PENDING** |
+
+All three backend ports are DROPped from WAN at `DOCKER-USER`; only 80/443 are
+public. **Jellyfin is now the third deliberate permanent public exception**
+alongside Home Assistant and Seerr — do not take any of them private.
+
+*Immich improvement item (not a regression):* it inherits NPM's global
+`client_max_body_size 2000m` / 90s timeouts, so very large or slow uploads may
+fail. Nextcloud overrides these; Immich doesn't.
+
+**Also today (Boss-side, no repo change):** NextDNS now works *through*
+Tailscale on the S23 Ultra (NextDNS profile as Tailscale global nameserver +
+"Override DNS servers"; `test.nextdns.io` → `status=ok`, DoH, `clientName=tailscale`),
+so Tailscale no longer has to be toggled off for ad blocking. And an
+**unresolved incident artifact** was logged: ~5 unsolicited NVIDIA Shield ADB
+authorization prompts on the morning the compromise was found, "Always allow"
+taken each time, with the previously-known ADB workstation already dead. Not
+proof of lateral movement — **attribute the keys before revoking anything.**
+
+---
+
+## Previously completed — 2026-08-10
 
 **Generic ("a person") presence wording fix — DONE 2026-08-10, code-only
 (needs a `loki.service` restart, not taken).** Follow-on to the roommate
@@ -425,7 +475,24 @@ presence notification passthrough (`ede172d`).
 
 ## Next active task
 
-**None assigned.** The Reliability reconciliation is complete.
+**Current priorities, in order (set 2026-08-23):**
+
+1. **Finish Immich cellular validation** — server-side already passed.
+2. **Router WAN exposure audit** — manual port forwards **and** UPnP/NAT-PMP.
+   This is the long-standing blocker behind several open unknowns.
+3. **Determine whether RAZR `:9999`, Ollama, or other services were ever
+   WAN-reachable** (unresolved since Phase 5A).
+4. **RAZR hardening** — IPv4/IPv6 firewall + SSH hardening.
+5. **Shield ADB attribution** — preserve evidence before revoking.
+6. **ASUS hardening** — firewall, IPv6, SSH.
+7. **NAS unexpected SSH listener** — identify and account for it.
+8. **Tailscale restrictive Grants** — **blocked pending Tailscale Support**;
+   not a substitute for any access path in the meantime.
+
+Older, still-true context follows.
+
+**None assigned from the previous cycle.** The Reliability reconciliation is
+complete.
 
 Two things it surfaced and deliberately left alone: `filebrowser`'s
 `/mnt/unicron-downloads` mount conflict on dex247 (**repaired 2026-08-09**),
@@ -456,6 +523,10 @@ the DONE condition — live verified behaviour is. See
   as a fallback. The configured chain is local Ollama → cheap OpenRouter
   DeepSeek; frontier models are manual-escalation-only.
 - gluetun / qBittorrent pairing — settled, must never be "fixed".
+- The three public exceptions — Home Assistant, Seerr, and (since 2026-08-23)
+  Jellyfin — are deliberate. Do not "harden" them by taking them private;
+  Nextcloud and Immich are public for the same reason. Their security boundary
+  is the application's own login, not NPM.
 
 ## Next action
 

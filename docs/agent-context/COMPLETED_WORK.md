@@ -865,8 +865,9 @@ at all.
 - Whether Antigravity itself needs an HA token at all going forward (the
   `AGY` token it was presumably using is now dead; nothing on the box was
   actively reading the file).
-- **NPM admin password rotation** (leaked in-session, see above), plus
-  removing the plaintext copy from the `.claude` memory file.
+- ~~**NPM admin password rotation** (leaked in-session, see above), plus
+  removing the plaintext copy from the `.claude` memory file.~~
+  **RESOLVED 2026-08-23 (Phase 5B-4)** — see the Phase 5B-4/5C section below.
 - Whether `backups/maintenance-checkpoint-2026-07-25/loki-bot.env.bak`
   should be kept — it holds 16 live secrets, mode 600, deliberate
   checkpoint.
@@ -874,6 +875,171 @@ at all.
   on `*:11434` — all P1 findings from Phase 5A, none remediated yet.
 
 ---
+
+## NPM database recovery, credential rotation, and public-access restoration
+
+**DONE (Phase 5B-4 + 5C) — 2026-08-23.** Closes the credential leak from
+Phase 5B-3 and restores/validates the three public user-facing services.
+
+### The orphaned SQLite inode (root cause of everything below)
+
+NPM's node process was holding a **deleted/orphaned `/data/database.sqlite`
+inode**. An earlier session had replaced the live database file underneath the
+running container (a `docker cp`-class overwrite), so the process kept its
+handle on the old, unlinked inode while a *different* file occupied the path.
+Consequences, both confirmed rather than assumed:
+
+- Every NPM UI/API write landed in the orphaned copy and would have been lost
+  at the next restart.
+- The real on-disk database — which held the Phase 4C/4D hardening — was **not
+  what NPM was serving from**. `firefox`, `jd`, and `hydra` were therefore still
+  publicly reachable and MeTube still had no auth, despite the database on disk
+  saying otherwise. The hardening had never actually taken effect.
+
+Before restarting, both databases were captured and compared: both passed
+`PRAGMA integrity_check`, `audit_log` was identical at 253 rows (so no admin
+writes were at risk), and the on-disk file was a strict superset (it alone had
+the MeTube access list). Adopting it lost nothing.
+
+A **controlled container restart** resolved it. NPM reopened the real inode
+(verified: fd 18 → `/data/database.sqlite` with no `(deleted)` marker), all 25
+proxy-host configs regenerated, and `nginx -t` passed. NPM's own generator emits
+`return 403` for disabled hosts, so the Phase 4C/4D lockdowns are now enforced by
+NPM itself rather than by hand-edited confs that regeneration would have wiped.
+
+Write persistence was then **proven, not assumed**: a subsequent UI save moved
+the DB mtime and size, added the expected `audit_log` row, and regenerated that
+host's conf in the same second.
+
+> **Rule — do not repeat this:** never replace a live SQLite database by copying
+> over it (`docker cp` or `cp`) while the service is running. The process retains
+> the old inode and silently diverges from the file on disk. Use the supported
+> API/UI, or stop the service first.
+
+### NPM admin credential rotation (Phase 5B-4)
+
+The password leaked in Phase 5B-3 was rotated through **NPM's supported API**
+(`POST /api/tokens` → `PUT /api/users/1/auth`) — no SQLite edit, no restart.
+
+- New credential authenticates (`200`); **old credential rejected**. NPM returns
+  `400 error.invalid-auth` rather than `401` for bad credentials — confirmed by
+  control tests that the old password now yields the identical response to a
+  deliberately-wrong one, and a distinctly different one from a malformed
+  request. It is genuinely revoked, not a false pass.
+- The `auth` bcrypt hash changed, and the change persisted to the live inode.
+- The plaintext copy in the `.claude` memory file was replaced with a pointer
+  (that file lives under the `-home-g2k247` project memory dir, not
+  `-home-g2k247-loki-bot`). The temporary local credential file was shredded
+  after the Boss saved the password to his password manager. No plaintext copy
+  remains on disk.
+- **NPM admin remains private** — `:81`, LAN or Tailscale only, and DROPped from
+  the WAN at `DOCKER-USER`.
+
+### Jellyfin — `jfin.ivn-group.cc` (Phase 5C)
+
+**Third deliberate, permanent public exception**, alongside Home Assistant and
+Seerr. It must work from phones and TV clients that don't run Tailscale — **do
+not "fix" this by taking it private.**
+
+- Backend `192.168.1.155:8096`; `:8096` DROPped from WAN at `DOCKER-USER`.
+- **No NPM Basic Auth** (`access_list_id=0`, zero `auth_basic` in the conf) —
+  Jellyfin's own login is the boundary; unauthenticated API paths return `401`
+  from Jellyfin.
+- **WebSockets Support enabled** and persisted; the generated conf carries
+  `Upgrade` / `Connection` / `proxy_http_version 1.1`. Verified behaviourally,
+  not just textually.
+- Cert npm-37 valid to 2026-11-04. Redirects stay on the public hostname
+  (`location: web/`) — no internal hostname or IP leak.
+- **Cellular validation passed with Tailscale off** (incognito): login, library
+  browsing, playback, and seeking.
+
+### Nextcloud — `cloud.ivn-group.cc` (Phase 5C)
+
+Intentional public exception; public share links must work for recipients on
+external networks.
+
+**Found and fixed a database/config drift.** NPM's database pointed at a stale
+`192.168.1.247:8082` — a host that answers ping but runs nothing on that port —
+while the live generated conf correctly used `192.168.1.63:8082` (the NAS, as
+the Joplin domain table has documented all along). Traffic followed the conf, so
+Nextcloud worked; but the next genuine regeneration would have written the dead
+address and taken it down. This was a latent outage, not a cosmetic mismatch.
+
+Corrected to `192.168.1.63:8082` **through the NPM UI**. Database and generated
+conf now agree, `nginx -t` passed, and the existing large-file directives
+(`client_max_body_size 55G`, 600s connect/send/read) survived regeneration
+unchanged. Nextcloud reports healthy (34.0.3, not in maintenance) and WebDAV
+`PROPFIND` returns `401` with `realm="Nextcloud"` — the app's own auth, not NPM's.
+
+**Cellular validation passed:** login, browsing, download, upload. A **public
+share link also worked from cellular with Tailscale off and without logging in**,
+which validates Loki's private-download → Nextcloud-public-share workflow for
+external recipients.
+
+### Immich — `immich.ivn-group.cc` (Phase 5C) — client validation PENDING
+
+Server-side audit passed: backend `192.168.1.155:2283` (matches DB exactly),
+HTTPS with Force SSL, HTTP/2, WebSocket support, cert npm-45 valid to
+2026-11-04, **no NPM Basic Auth**, and `:2283` DROPped from WAN. A real
+socket.io upgrade through NPM returned **`101 Switching Protocols`**, byte-identical
+to the backend. `/api/server/about` returns `401` — Immich's own auth is the
+boundary. No media, users, libraries, or app settings were touched.
+
+**⚠️ Immich cellular/client validation is still PENDING — do not record Immich
+remote access as fully validated.**
+
+*Improvement item, not a regression:* Immich has no per-host overrides, so it
+inherits NPM's global **`client_max_body_size 2000m` and 90s timeouts**
+(Nextcloud overrides these; Immich doesn't). Very large or slow uploads may fail.
+Adding the same directives Nextcloud uses would fix it — it has run this way
+since 2026-03-09, so this is an improvement, not something newly broken.
+
+### Cert-renewal noise (observed, not actioned)
+
+NPM force-renews on startup and hit Let's Encrypt rate limits for `npm-63`
+(notes) and `npm-83` (chat) — **both certs are actually valid to 2026-11-21**, so
+this is harmless today but burns quota that a genuinely-needed renewal might
+want. `npm-68` (obsidian) is genuinely expired (2026-07-28) and **no proxy host
+uses it**, which is also why its challenge fails. Deleting that stale cert would
+quiet the sweep.
+
+---
+
+## NextDNS over Tailscale on Android
+
+**DONE — 2026-08-23, Boss-side configuration.** Android's Private DNS and
+Tailscale previously competed for DNS, forcing a manual switch between NextDNS
+ad blocking and Tailscale being on.
+
+The existing NextDNS profile is now configured as a **Tailscale global
+nameserver** (via NextDNS's IPv6 endpoint) with **"Override DNS servers"**
+enabled. Tested on the Samsung Galaxy S23 Ultra: `test.nextdns.io` returned
+`status=ok`, `protocol=DOH`, `clientName=tailscale`.
+
+**Result: Tailscale can stay enabled full-time while retaining NextDNS ad
+blocking.** The profile ID and endpoint address are deliberately not recorded
+here or in Joplin — retrieve them from the NextDNS dashboard.
+
+---
+
+## NVIDIA Shield — unattributed ADB authorization prompts
+
+**UNRESOLVED observation — logged 2026-08-23.** On the morning the earlier
+homelab compromise was discovered, the Shield displayed roughly **five
+unsolicited ADB authorization prompts**, and **"Always allow" was selected each
+time** — so those keys are now trusted. The computer previously known to have
+used ADB with the Shield **was already dead** at the time, and no other
+authorized ADB client has been identified.
+
+**This is NOT proof of lateral movement** — ADB prompts have mundane causes. But
+given the timing it is retained as an **incident-timeline artifact requiring
+attribution**.
+
+**Preserve the evidence before revoking.** Attribute the five grants via the
+Shield's ADB keys and connection history *first*; revoking blindly destroys the
+only record that could explain them. Revoke anything illegitimate afterwards.
+Tracked as issue **#11** in the Joplin `Homelab/Issues → Issues Log` note.
+
 
 ## Video-doorbell announcement reliability
 

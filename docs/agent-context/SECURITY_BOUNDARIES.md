@@ -26,6 +26,40 @@ convenience.
 - **No unrestricted sudo for the agent.** `g2k247` has broad sudo on dex247 as a
   human; an AI agent must not exploit that to run arbitrary privileged commands.
 
+## Public exposure boundary
+
+*Operational, not code-enforced — unlike everything else in this file. Recorded
+here because a well-meaning "hardening" pass is exactly what would break it.*
+
+Public reachability is **only** ever: Internet → HTTPS 443 → Nginx Proxy Manager
+→ application backend. Direct backend ports are DROPped from the WAN at
+`DOCKER-USER`; only 80 and 443 are allowed through.
+
+**Five services are public on purpose.** For each, the security boundary is the
+application's own authentication, not NPM:
+
+| Host | Why it must stay public |
+|---|---|
+| `ha.ivn-group.cc` | Roommate has no Tailscale-capable device |
+| `rq.ivn-group.cc` (Seerr) | Daily use from phone + Nvidia Shield |
+| `jfin.ivn-group.cc` (Jellyfin) | Phone/TV clients that don't run Tailscale |
+| `cloud.ivn-group.cc` (Nextcloud) | Public share links must work for external recipients |
+| `immich.ivn-group.cc` (Immich) | Phone clients that may not use Tailscale |
+
+**Do not take these private, and do not put NPM Basic Auth in front of them** —
+Basic Auth breaks their native clients. Tailscale is not a substitute for any of
+them.
+
+**NPM admin (`:81`) stays private** — LAN or Tailscale only, DROPped from WAN.
+It is control-plane: it can rewrite routing for every domain, which is how the
+qBittorrent compromise was created in the first place.
+
+**Never overwrite a live SQLite database in place** (`docker cp`, `cp`) while the
+owning service is running. The process keeps the old inode and silently diverges
+from what is on disk — this produced a real NPM outage-in-waiting where security
+hardening appeared applied but was not. Use the supported API/UI, or stop the
+service first.
+
 ## Command allowlist model
 
 `maintenance_policy.py` is the single chokepoint:
