@@ -261,19 +261,28 @@ prompt-tune the rewriter and hope.
 
 ## MQTT's published port stays pinned to IPv4 (`0.0.0.0:1883`)
 
-**Decided 2026-09-02.** The NAS holds globally-routable IPv6 addresses, and
-Docker's bare `"1883:1883"` publish binds `[::]` as well as `0.0.0.0`. While
-the broker is anonymous, a dual-stack publish would expose it to the WAN over
-IPv6 — and edge IPv6 filtering could not be verified from inside the LAN, so it
-is not assumed. The explicit `0.0.0.0:` prefix removes that reach.
+**Decided 2026-09-02. Reaffirmed 2026-09-03 after MQTT authentication landed.**
+The NAS holds globally-routable IPv6 addresses, and Docker's bare `"1883:1883"`
+publish binds `[::]` as well as `0.0.0.0`. Edge IPv6 filtering has never been
+verified from inside the LAN, so it is not assumed. The explicit `0.0.0.0:`
+prefix removes that reach.
+
+**The original rationale said this mattered "while the broker is anonymous."
+That framing was too narrow and is now corrected.** The broker is authenticated
+now, and the binding still matters: reachability and authentication are
+independent controls. A dual-stack publish would expose the broker's
+credentials to the open internet for online guessing, put an unauthenticated
+TCP surface in front of anyone who finds it, and — since TLS is not configured
+— carry those credentials in cleartext. Authentication is not a reason to relax
+the binding.
 
 It is deliberately **not** pinned to `192.168.1.63:1883:1883`, even though that
 is tighter: a specific-IP publish can fail at container start if the interface
 isn't up yet, which would leave the broker — and therefore every camera — down
 after a reboot. `0.0.0.0` keeps IPv4 behind NAT without that boot fragility.
 
-Reopening requires either MQTT authentication landing (after which the binding
-matters far less) or verified proof that inbound IPv6 is filtered at the edge.
+Reopening requires verified proof that inbound IPv6 is filtered at the edge —
+not merely that authentication exists.
 
 ## Do not repeatedly reinstall the Frigate HA integration
 
@@ -312,3 +321,32 @@ addresses the consumers actually use.
 A "cleanup" pass that collapses these back to the shorthand is a security
 regression, not a simplification. Reopening requires verified proof that
 inbound IPv6 is filtered at the edge — which has not been established.
+
+
+## MQTT authentication came before ACLs and TLS — deliberately, in that order
+
+**Decided 2026-09-03.** All three were on the table for the camera stack. Only
+authentication was done, and the ordering was a judgement, not an oversight.
+
+**Authentication first** because it is the only one of the three that is both a
+large, binary security win and *cheaply provable*: anonymous CONNECT either
+returns `rc=5` or it doesn't. It also converts an open broker into one where
+every connection is attributable in the log (`u'ha'`, `u'frigate'`), which is
+what makes the other two diagnosable later.
+
+**ACLs deferred** because the benefit is genuinely small here. Frigate could be
+scoped to `frigate/#`, but Home Assistant legitimately needs broad
+publish/subscribe rights across `homeassistant/#`, `frigate/#` and anything a
+future MQTT entity uses — so an ACL constrains one of two clients. Against that,
+a mis-scoped ACL fails **silently**: topics simply stop being delivered, which
+is far harder to diagnose than an auth rejection, and this stack had just come
+back from an outage. Worth doing as its own change with its own validation.
+
+**TLS deferred** because the exposure it closes is currently near-zero: both
+consumers run on the NAS itself, so credentials never traverse the LAN in
+normal operation — Frigate connects over the docker bridge and HA from the same
+host. TLS becomes worthwhile the moment an off-host or remote MQTT client is
+added, and that should be the trigger to revisit.
+
+Reopening: add an off-host MQTT client (→ do TLS), or accept the silent-failure
+risk and scope Frigate with an ACL as a standalone, separately-validated change.

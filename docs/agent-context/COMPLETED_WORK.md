@@ -7,6 +7,131 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## MQTT authentication migration — anonymous → authenticated-only
+
+**DONE — 2026-09-03.** Closes the temporary anonymous-MQTT security item opened
+during the 2026-09-02 camera outage repair. The Mosquitto broker on the NAS now
+requires credentials; anonymous CONNECT is rejected. **No camera downtime, and
+neither consumer was ever locked out.**
+
+### Final verified state
+
+| | |
+|---|---|
+| Broker | `allow_anonymous false` + `password_file /mosquitto/secrets/passwd` |
+| Hashing | **sha512-pbkdf2** (`$7$`), verified — hashes only, zero plaintext entries |
+| Accounts | **`ha`** (Home Assistant) · **`frigate`** (Frigate) — separate, independently rotatable |
+| Publish | `0.0.0.0:1883` — IPv4 only, **no `[::]:1883` listener** |
+| Secrets mount | `/volume1/docker/mosquitto/secrets:/mosquitto/secrets:**ro**` |
+
+Proven rather than assumed: anonymous CONNECT → `rc=5 NOT AUTHORIZED`; wrong
+password for either real account → `rc=5`; both consumers reconnect
+authenticated after enforcement (`u'ha'`, `u'frigate'`); **48/48** Frigate
+entities available; all three cameras `recording`. Every `not authorised` line
+in the broker log is attributable to a deliberate `loki-*` probe — **none from
+HA or Frigate**.
+
+### The approach that made it safe: mixed-mode staging
+
+Mosquitto 2.x treats `allow_anonymous` as governing only clients that supply
+**no** username; a client that *does* supply one is authenticated against
+`password_file` regardless. That makes `allow_anonymous true` **plus**
+`password_file` a genuine mixed mode — and that is the whole trick.
+
+It was verified empirically before being relied on (`allow_anonymous true` with
+no password file accepts *anything*, including junk credentials — so the
+mixed-mode behaviour had to be measured, not assumed):
+
+1. Broker moved to mixed mode. Proved anonymous still worked **and** that wrong
+   credentials were now rejected — the gate that had to pass before touching a
+   consumer.
+2. **Frigate** migrated alone and proven authenticated, with anonymous still
+   available as a fallback it never needed.
+3. **Home Assistant** migrated alone via the supported Reconfigure flow, proven
+   authenticated the same way.
+4. Only once **both** were demonstrably credential-bearing was
+   `allow_anonymous` flipped to `false`.
+
+Each consumer was migrated and verified independently, with a working fallback
+underneath it the entire time. The only irreversible-feeling step came last,
+when both clients had already proved they present correct credentials.
+
+### Secret handling
+
+Passwords were generated inside a throwaway container from `/dev/urandom` (32
+alphanumeric chars each), staged in **container-only tmpfs**, hashed with
+`mosquitto_passwd -U` — never `-b`, so no password ever entered argv — and the
+staging file destroyed with the container. Nothing was echoed to the terminal
+except usernames, counts and modes.
+
+The `frigate` password lives only in `/volume1/docker/frigate/secrets/frigate.env`
+(`0600 root:root`, `0700` dir), injected via compose `env_file` and referenced
+in `config.yml` solely as `"{FRIGATE_MQTT_PASSWORD}"` — the value is in neither
+the YAML nor the config file. The `ha` password was **never written to disk**;
+it exists only in the Boss's password manager.
+
+Verified afterwards: no plaintext credential material anywhere in `/tmp`,
+`/run`, `/dev/shm`, `/var/tmp`, or the deployment and backup directories.
+
+### Implementation lessons — the non-obvious ones
+
+- **`install -d -m` and `mkdir -m` do not set modes on this NAS share.** New
+  directories are born `0777` regardless of umask (umask is `0022`), and
+  `install`'s mode argument is silently overridden. An explicit `chmod` *after*
+  creation does stick, permanently. Both secrets directories were created
+  world-writable on the first attempt and only caught by reading the mode back
+  numerically — `stat` in the creating command had reported the intended
+  `drwx------`. **Always chmod separately and verify by read-back.**
+- **A docker `-v /dev/shm:/hostshm` bind did not reach the host's `/dev/shm`.**
+  `ls` inside the container confirmed the file existed; it never appeared on the
+  host. This cost the first HA credential — unrecoverable, since `passwd` stores
+  only a hash — and forced a full regeneration. The host's `/dev/shm` was proven
+  fine independently (a marker file survived), so the bind itself was the fault.
+  The redo used `--tmpfs /work` instead and worked.
+- **`docker compose up -d` is a no-op when only a bind-mounted file's *contents*
+  change.** Compose diffs the container spec, not file contents, so it reports
+  `up-to-date` and the broker never re-reads its config. **`--force-recreate` is
+  required** (or a plain `docker restart`). This would have silently produced a
+  "successful" enforcement step that changed nothing.
+- **Config-entry titles are not configuration.** HA's `mqtt` and `frigate`
+  entries are still *titled* `192.168.1.247` (the decommissioned ASUS box) while
+  their actual `data` correctly points at `192.168.1.63`. This was briefly
+  misdiagnosed as the fault during the outage. Read `data`, never the title.
+
+### Deferred, deliberately
+
+**ACLs** and **TLS** are both open — see `DECISIONS.md` for why authentication
+was done first and what should trigger each.
+
+### One checkpoint still outstanding
+
+Authentication has only been exercised through **warm recreates**. The cold path
+— broker starting at boot with the `:ro` secrets mount present and reading
+`passwd` before consumers connect — has not been tested.
+`mosquitto.conf.p5-snapshot` (mixed mode) is retained as break-glass **until a
+real NAS reboot** shows both consumers reconnecting authenticated. It must be
+deleted after that: restoring it silently re-enables anonymous access.
+
+### Rollback assets retained
+
+In `/volume1/docker/.loki-backups/mqtt-auth-2026-09-03/` (dir `0700`, files
+`0400`): `mosquitto.conf.p5-snapshot` (mixed mode — the correct first rollback),
+`mosquitto.conf.bak` (pre-migration), `docker-compose-infra.yml.p3-snapshot`
+(pre-`env_file`), `docker-compose-infra.yml.bak` (pre-secrets-mount),
+`frigate-config.yml.bak` (pre-auth). Staged artefacts were removed only after
+`cmp` proved each byte-identical to what had been installed.
+
+### Access boundary
+
+Loki cannot run docker on the NAS — not in the `docker` group, no NOPASSWD sudo
+for it, and the dispatcher has no verb for these containers. Every privileged
+step (four container recreates, the credential generation, the root-owned file
+installs) was handed to the Boss as a single gated command with pre-flight
+assertions that abort before touching anything. That boundary held throughout
+and should stay.
+
+---
+
 ## Home Assistant camera outage — MQTT broker + Frigate integration compatibility
 
 **DONE — 2026-09-02** (evening EDT; the UTC side of these timestamps reads

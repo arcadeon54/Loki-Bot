@@ -145,26 +145,52 @@ once treated an unset `OWNER_USER_ID` as a match, making any blank-id caller
 Boss. Fixed in `251807b` — never reintroduce an empty-string comparison there.
 
 
-## Open security item — anonymous MQTT (opened 2026-09-02)
+## MQTT authentication — CLOSED 2026-09-03
 
-The Mosquitto broker on the NAS (`192.168.1.63`) currently runs
-**`allow_anonymous true`**. This is a **deliberate, temporary compatibility
-configuration** taken during the camera outage repair, not an oversight:
-neither consumer holds credentials, and adding them requires editing Frigate's
-`config.yml` and restarting Frigate, which was outside that phase's scope.
-Broker-only auth would have locked out both clients and left the cameras down.
+The Mosquitto broker on the NAS (`192.168.1.63`) is **authenticated-only**:
+`allow_anonymous false` + `password_file /mosquitto/secrets/passwd`. The
+temporary anonymous state opened on 2026-09-02 is resolved.
 
-**What currently limits exposure is the publish binding, not authentication.**
-The port is published IPv4-only as `0.0.0.0:1883`; there is no `[::]:1883` host
-listener. This matters because the NAS holds globally-routable IPv6 addresses,
-and the previous bare `"1883:1883"` publish placed 1883 on `[::]` — edge IPv6
-filtering could not be verified from inside the LAN, so it was not assumed safe.
+**Two separate service accounts**, one per consumer, so either can be rotated or
+revoked independently and the broker log attributes every connection:
 
-**Do not revert the publish to `"1883:1883"`.** Doing so re-exposes an
-anonymous broker over public IPv6.
+| Account | Consumer | Configured via |
+|---|---|---|
+| `ha` | Home Assistant | supported MQTT **Reconfigure** flow — `.storage` never hand-edited |
+| `frigate` | Frigate | `config.yml` `user: frigate` + `password: "{FRIGATE_MQTT_PASSWORD}"`, injected by compose `env_file` |
 
-**Closing this item** means: a `password_file` with a dedicated credential per
-client, `allow_anonymous false`, Frigate's `mqtt.user`/`mqtt.password` set
-(needs a Frigate restart), and Home Assistant updated through
-Settings → Devices & Services → MQTT → Configure — the supported reconfigure
-flow. **Never hand-edit HA's `.storage` to do this.**
+Credentials are **sha512-pbkdf2** hashes. Secret storage:
+
+| Path | Owner | Mode |
+|---|---|---|
+| `/volume1/docker/mosquitto/secrets/` | `1883:1883` | `0700` |
+| `…/secrets/passwd` (hashes only) | `1883:1883` | `0600` |
+| `/volume1/docker/frigate/secrets/` | `root:root` | `0700` |
+| `…/secrets/frigate.env` | `root:root` | `0600` |
+
+The only plaintext on the host is the Frigate env file. The HA password exists
+solely in the Boss's password manager — it was never written to disk.
+
+**Proven, not assumed:** anonymous CONNECT returns `rc=5 NOT AUTHORIZED`, wrong
+passwords for both real accounts are rejected, and both consumers reconnect
+authenticated (`u'ha'`, `u'frigate'`) after enforcement.
+
+**The publish binding is still a separate control and still matters.** The port
+is published IPv4-only as `0.0.0.0:1883`; there is no `[::]:1883` listener.
+**Do not revert the publish to `"1883:1883"`** — the NAS holds
+globally-routable IPv6 addresses, and edge IPv6 filtering has never been
+verified from inside the LAN. Authentication does not make that safe to undo.
+
+### Remaining future hardening (deliberate, not oversights)
+
+- **ACLs — deferred.** Frigate could be scoped to `frigate/#`, but Home
+  Assistant legitimately needs broad publish/subscribe rights, so the gain is
+  small while a mis-scoped ACL fails *silently*. Its own change, later.
+- **TLS — deferred.** Credentials cross port 1883 unencrypted. Both consumers
+  run on the NAS itself today, so nothing traverses the LAN in normal
+  operation; TLS becomes worthwhile if an off-host client is ever added.
+- **Cold-start not yet proven.** Authentication has only been exercised through
+  warm recreates. `mosquitto.conf.p5-snapshot` (mixed mode) is retained as
+  break-glass until a real NAS reboot shows both consumers reconnecting
+  authenticated — then it must be deleted, because restoring it silently
+  re-enables anonymous access.

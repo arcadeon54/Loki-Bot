@@ -32,9 +32,10 @@ started accepting connections, that would have put an **anonymous** broker on a
 public IPv6 address. Edge IPv6 filtering could not be verified from inside the
 LAN, so it was not assumed. **No `[::]:1883` host listener remains.**
 
-⚠️ **MQTT is currently ANONYMOUS as a TEMPORARY compatibility configuration.**
-Neither consumer holds credentials, and adding them requires a Frigate restart,
-which was out of scope. See "Next active task".
+*(At the time of this repair MQTT was left anonymous as a deliberate temporary
+compatibility configuration, because neither consumer held credentials. **That
+was resolved on 2026-09-03** — the broker is now authenticated-only with
+separate `ha` and `frigate` accounts. See `COMPLETED_WORK.md`.)*
 
 **Fault 2 — Frigate HA integration v5.15.4 is incompatible with HA 2026.9.0.**
 The integration passed the deprecated `via_device` to
@@ -570,10 +571,11 @@ presence notification passthrough (`ede172d`).
 - Tracearr — v2.0.1 on the NAS, pinned by digest in `config/homelab_assets.yml`
   (applied via Loki's own approval-gated update 2026-08-07, registry
   reconciled 2026-08-09, watchtower misattribution corrected 2026-08-10).
-- Camera stack (NAS) — `mosquitto` healthy, IPv4-only publish `0.0.0.0:1883`
-  (**anonymous, temporary**); `frigate` 0.17.2 healthy, all 3 cameras
-  streaming; Frigate HA integration running fixed v5.15.5 code; 48/48 Frigate
-  entities available (verified 2026-09-02).
+- Camera stack (NAS) — `mosquitto` healthy, **authenticated-only**
+  (`allow_anonymous false`, separate `ha` + `frigate` accounts), IPv4-only
+  publish `0.0.0.0:1883` with no `[::]` listener; `frigate` 0.17.2 healthy, all
+  3 cameras streaming; Frigate HA integration running fixed v5.15.5 code;
+  48/48 Frigate entities available (verified 2026-09-03).
 - NostalgiaTV (razr) — `nostalgiatv` 0.9.49 healthy, digest-pinned, published
   to LAN + Tailscale only (never `0.0.0.0`/`[::]`). Weather is profile-scoped;
   **Default** set to `Tucker, GA` 2026-09-03, IVN and X - Rav still on the app's
@@ -582,17 +584,14 @@ presence notification passthrough (`ede172d`).
 
 ## Next active task
 
-**Added 2026-09-02 — top of the security queue:**
+**Added 2026-09-03 — MQTT auth is DONE; one checkpoint remains:**
 
-0. **Migrate MQTT to authenticated access.** The broker on the NAS is running
-   **anonymous** as a deliberate TEMPORARY compatibility configuration after the
-   camera outage repair. Both consumers connect without credentials. The work:
-   create a `password_file` with a dedicated credential per client, set
-   `allow_anonymous false`, add `mqtt.user`/`mqtt.password` to Frigate's
-   `config.yml` (**requires a Frigate restart**), and update Home Assistant via
-   Settings → Devices & Services → MQTT → Configure (the supported reconfigure
-   flow — **never** hand-edit `.storage`). Exposure is currently limited by the
-   IPv4-only publish (`0.0.0.0:1883`, no `[::]` listener), not by auth.
+0. **Validate authenticated MQTT across a real NAS reboot.** The migration is
+   complete and enforced, but has only been exercised by warm recreates. On the
+   next reboot confirm both consumers reconnect authenticated (broker log shows
+   `u'ha'` and `u'frigate'`), then **delete
+   `/volume1/docker/.loki-backups/mqtt-auth-2026-09-03/mosquitto.conf.p5-snapshot`**
+   — it restores mixed mode and would silently re-enable anonymous access.
 
 **Current priorities, in order (set 2026-08-23):**
 

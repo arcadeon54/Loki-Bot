@@ -262,11 +262,33 @@ Cameras (all reachable, RTSP/554 open):
 Key paths: `/volume1/docker/mosquitto/` (config, `data/`, `log/`),
 `/volume1/docker/frigate/`, `/volume1/docker/homeassistant/`.
 
+**Secret storage** (paths, ownership and modes only — never the values):
+
+| Path | Owner | Mode | Contents |
+|---|---|---|---|
+| `/volume1/docker/mosquitto/secrets/` | `1883:1883` | `0700` | — |
+| `…/secrets/passwd` | `1883:1883` | `0600` | sha512-pbkdf2 **hashes only** |
+| `/volume1/docker/frigate/secrets/` | `root:root` | `0700` | — |
+| `…/secrets/frigate.env` | `root:root` | `0600` | `FRIGATE_MQTT_PASSWORD=…` |
+
+`passwd` reaches the broker via a **read-only** bind mount
+(`/volume1/docker/mosquitto/secrets:/mosquitto/secrets:ro`). Frigate's password
+is injected by compose `env_file` and referenced in `config.yml` only as
+`"{FRIGATE_MQTT_PASSWORD}"` — the value is in neither the YAML nor the config.
+The HA password lives only in the Boss's password manager.
+
+⚠️ **`install -d -m` and `mkdir -m` do not set modes reliably on this share** —
+new directories are born `0777` regardless of umask. Always `chmod` explicitly
+*after* creation and read the mode back.
+
 **Operational warnings:**
 
-- ⚠️ **MQTT is anonymous — TEMPORARY.** `allow_anonymous true`. Exposure is
-  limited by the IPv4-only publish, **not** by authentication. Migration is top
-  of the security queue.
+- **MQTT is authenticated-only** (since 2026-09-03). `allow_anonymous false` +
+  `password_file /mosquitto/secrets/passwd`, sha512-pbkdf2 hashes, with two
+  separate service accounts — `ha` (Home Assistant) and `frigate` (Frigate) —
+  so either can be rotated or revoked independently. Anonymous CONNECT is
+  rejected (`rc=5`). ACLs and TLS are deliberately deferred; see
+  `SECURITY_BOUNDARIES.md`.
 - ⚠️ **Never leave 1883 published dual-stack.** The NAS has globally-routable
   IPv6 (ISP-delegated; check `ip -6 addr show scope global` — addresses are
   deliberately not recorded here); a bare `"1883:1883"` publishes on `[::]` too
