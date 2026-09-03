@@ -110,6 +110,80 @@ service depends on it. Do **not** describe it as a SATA drive.
 - Active Gemma4 blob: `sha256-8ebc…` (6.9 GB, referenced)
 - Orphan blob `sha256-5965…` (6.9 GB) **removed 2026-08-08** — was unreferenced
 
+### NostalgiaTV — retro TV channel server (documented 2026-09-03)
+
+Runs on razr, not dex247 and not the NAS — it is easy to miss because nothing
+in this repo referenced it before today.
+
+| | |
+|---|---|
+| Container | `nostalgiatv` — **healthy** |
+| Version | **0.9.49** (`NTV_SERVER_VERSION`) |
+| Image | `purestream711/nostalgiatv-server`, **pinned by digest** (only `:latest` is published upstream, so the digest is what makes it reproducible) |
+| Compose | `/home/razr/nostalgiatv/docker-compose.yml` |
+| Access | `192.168.1.31:19850` (LAN) · `100.87.97.120:19850` (Tailscale) |
+| Consumed by | Jellyfin on dex247 (`192.168.1.155`) |
+
+Bind mounts (all host-side, so config survives a container recreate):
+
+- `./data` → `/app/data`
+- `./config` → `/app/config`
+- `./logos` → `/app/logos`
+
+⚠️ **The port bindings are deliberate — do not "simplify" them.** The service is
+bound explicitly to the LAN address and the Tailscale address, and **never to
+`0.0.0.0` or `[::]`**. razr has a globally-routable IPv6 address and no host
+firewall, so a bare `"19850:19850"` publish would expose this to the internet
+over IPv6. The compose file carries its own warning to the same effect. Same
+principle as the MQTT publish on the NAS — see `DECISIONS.md`.
+
+**No watchtower runs on razr**, so this image does not silently auto-update.
+Combined with the digest pin, the running version only changes deliberately.
+
+#### Weather / Storm Channel
+
+| | |
+|---|---|
+| Built-in Storm Channel data | **WeatherAPI.com** (server-rendered; `GET /api/weather/storm`) |
+| Geocoding | **ArcGIS**, cached to `data/weather_geocode.json` |
+| External WeatherStar embed | **disabled** (`wsEnabled: false`) |
+
+Weather settings are **profile-scoped**, stored per profile under
+`config/profiles/<id>/weatherstar_settings.json`. Two keys carry the location
+and the supported save path writes both together:
+
+- `weatherLocationQuery` — the **built-in Storm Channel** (this is the one that
+  renders while the WeatherStar embed is disabled)
+- `wsLocationQuery` — the external WeatherStar embed
+
+**The app's fallback default is `Buffalo, NY`.** A profile with no
+`weatherstar_settings.json` gets that default — it is baked into the image, not
+a setting anyone chose.
+
+Current state (set 2026-09-03):
+
+| Profile | Weather location |
+|---|---|
+| **Default** | **`Tucker, GA`** → resolves to Tucker / Georgia |
+| IVN | unset — falls back to the `Buffalo, NY` default |
+| X - Rav | unset — falls back to the `Buffalo, NY` default |
+
+**Supported change path:** the NostalgiaTV web UI (channel config → Location →
+Save Location) or `POST /api/weatherstar?profileId=<id>` with
+`{"weatherLocationQuery": "...", "wsLocationQuery": "..."}`. Profile IDs come
+from `config/profiles.json`. **Do not hand-edit the JSON** — the API merges and
+mirrors the two keys, which hand-editing skips. A city name, ZIP, or `lat,lon`
+all work.
+
+**Operational notes:**
+
+- **No container restart is needed** for a weather-location change; it applies
+  immediately.
+- If the player still shows the old location, **re-tune the channel or reload**
+  — the client caches settings and resolved coordinates per session.
+- **A newly created profile will show Buffalo, NY until explicitly configured.**
+  Setting one profile does not affect the others.
+
 ## UGREEN NAS — storage and Tracearr
 
 | | |

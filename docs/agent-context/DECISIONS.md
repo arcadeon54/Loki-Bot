@@ -287,3 +287,28 @@ version" is available. **Never use this integration's `manifest.json` as a
 version indicator** — verify by checking for `get_frigate_via_device` in
 `custom_components/frigate/__init__.py` instead. Reopening: upstream fixes the
 manifest, or a genuinely newer release appears.
+
+## Services on IPv6-routable hosts publish to explicit addresses, never `0.0.0.0`/`[::]`
+
+**Decided 2026-09-03**, generalizing the MQTT decision above after the same
+pattern turned up on razr.
+
+Both razr and the NAS hold globally-routable IPv6 addresses, and razr has no
+host firewall. Docker's shorthand `"PORT:PORT"` publish binds `[::]` as well as
+`0.0.0.0`, so on these hosts the shorthand quietly makes a service
+internet-reachable over IPv6 — no port-forward required, and NAT does not save
+you the way it does on IPv4.
+
+The rule: on a host with a routable IPv6 address, publish to the specific
+addresses the consumers actually use.
+
+- **NostalgiaTV** (razr) — `192.168.1.31:19850` + `100.87.97.120:19850`
+  (LAN + Tailscale). Its compose file carries its own warning.
+- **Mosquitto** (NAS) — `0.0.0.0:1883`, which pins it to IPv4 only. A specific
+  LAN IP was rejected there because that service must survive a reboot and a
+  specific-IP bind can fail before the interface is up; NostalgiaTV has no such
+  constraint, so it gets the tighter binding.
+
+A "cleanup" pass that collapses these back to the shorthand is a security
+regression, not a simplification. Reopening requires verified proof that
+inbound IPv6 is filtered at the edge — which has not been established.

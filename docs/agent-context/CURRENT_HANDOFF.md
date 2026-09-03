@@ -574,6 +574,11 @@ presence notification passthrough (`ede172d`).
   (**anonymous, temporary**); `frigate` 0.17.2 healthy, all 3 cameras
   streaming; Frigate HA integration running fixed v5.15.5 code; 48/48 Frigate
   entities available (verified 2026-09-02).
+- NostalgiaTV (razr) — `nostalgiatv` 0.9.49 healthy, digest-pinned, published
+  to LAN + Tailscale only (never `0.0.0.0`/`[::]`). Weather is profile-scoped;
+  **Default** set to `Tucker, GA` 2026-09-03, IVN and X - Rav still on the app's
+  `Buffalo, NY` fallback. Newly added to `HOMELAB_INVENTORY.md` — it had never
+  been documented anywhere.
 
 ## Next active task
 
