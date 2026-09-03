@@ -258,3 +258,32 @@ HA state) rather than from parsing HA's arbitrary phrasing. Any future
 "Loki keeps narrating something it already knows structurally" complaint
 should get the same treatment: classify → answer from state, not
 prompt-tune the rewriter and hope.
+
+## MQTT's published port stays pinned to IPv4 (`0.0.0.0:1883`)
+
+**Decided 2026-09-02.** The NAS holds globally-routable IPv6 addresses, and
+Docker's bare `"1883:1883"` publish binds `[::]` as well as `0.0.0.0`. While
+the broker is anonymous, a dual-stack publish would expose it to the WAN over
+IPv6 — and edge IPv6 filtering could not be verified from inside the LAN, so it
+is not assumed. The explicit `0.0.0.0:` prefix removes that reach.
+
+It is deliberately **not** pinned to `192.168.1.63:1883:1883`, even though that
+is tighter: a specific-IP publish can fail at container start if the interface
+isn't up yet, which would leave the broker — and therefore every camera — down
+after a reboot. `0.0.0.0` keeps IPv4 behind NAT without that boot fragility.
+
+Reopening requires either MQTT authentication landing (after which the binding
+matters far less) or verified proof that inbound IPv6 is filtered at the edge.
+
+## Do not repeatedly reinstall the Frigate HA integration
+
+**Decided 2026-09-02.** Upstream's `v5.15.5` tag ships `manifest.json` still
+declaring `5.15.4`. HACS reads the manifest on restart, so it perpetually
+reports v5.15.5 as an available update even though the fixed v5.15.5 code is
+installed and running. Reinstalling re-downloads identical code and loops.
+
+Treat the badge as cosmetic until upstream bumps the manifest; "skip this
+version" is available. **Never use this integration's `manifest.json` as a
+version indicator** — verify by checking for `get_frigate_via_device` in
+`custom_components/frigate/__init__.py` instead. Reopening: upstream fixes the
+manifest, or a genuinely newer release appears.

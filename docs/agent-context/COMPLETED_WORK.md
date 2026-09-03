@@ -7,6 +7,255 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## Home Assistant camera outage — MQTT broker + Frigate integration compatibility
+
+**DONE — 2026-09-02** (evening EDT; the UTC side of these timestamps reads
+2026-09-03). All three Frigate camera cards — Front Door, Entryway, Living Room
+— were `unavailable` in Home Assistant while other entities worked. Diagnosed
+read-only first, then repaired in two Boss-approved phases. **Two genuinely
+independent faults, plus a third that resolved itself.**
+
+### Diagnosis
+
+The three dead cards were `camera.front_door`, `camera.entryway`,
+`camera.livingroom` — the **Frigate** integration, not the TP-Link Tapo one.
+The separate Tapo entities (`camera.*_hd_stream`) were healthy throughout,
+which is why only three cards failed. ~60 Frigate-owned entities went
+`unavailable` within the same millisecond — the signature of one shared
+dependency, not three cameras failing.
+
+Frigate itself was **never the problem**: `/api/stats` returned HTTP 200
+throughout, version 0.17.2. The two HTTP 500s in the HA log were transient
+startup races. All three physical cameras answered ping and RTSP/554.
+
+**A false lead worth recording:** the HA `mqtt` and `frigate` config entries
+are *titled* `192.168.1.247` / `192.168.1.247:5000` — the decommissioned
+pre-rebuild ASUS box, the same stale-`.247` string that has bitten Nextcloud,
+`internal_url` and the doorbell chime before. It was **not** the cause this
+time. Reading the entries' actual `data` showed `broker: 192.168.1.63` and
+`url: http://192.168.1.63:5000` — correct. The titles are cosmetic labels
+frozen at creation and never updated. **Do not "fix" them; do not trust a
+config-entry title as configuration.**
+
+### Fault 1 — Mosquitto came up with an empty configuration
+
+`/volume1/docker/mosquitto/mosquitto.conf` was **1 byte** — a single newline.
+`eclipse-mosquitto:2.0` applies its 2.0 defaults to an empty config: the
+default listener binds to **loopback inside the container**, and
+`allow_anonymous` defaults false. Nothing outside the container namespace could
+connect.
+
+Evidence chain:
+- HA: `[Errno 111] Connection refused` from `homeassistant.components.mqtt.client`
+- Frigate: `frigate.comms.mqtt ERROR: MQTT disconnected` every 2 minutes for hours
+- NAS host → `127.0.0.1:1883`: TCP accepted then **connection reset**
+  (docker-proxy accepting, upstream refusing)
+- NAS host → `192.168.1.63:1883`: **ECONNREFUSED**
+- `ss` showed `0.0.0.0:1883` + `[::]:1883` — that is **docker-proxy**, not the
+  broker. The broker behind it was serving nobody.
+
+The Frigate HA integration derives entity availability from MQTT, so every
+Frigate entity went `unavailable` at once.
+
+**No prior configuration was recoverable** — no backup, no old copy, no
+`password_file`, no `acl_file`, empty `unicron_final_backup/`, nothing in the
+repo docs, no readable shell history. The config was **reconstructed**, not
+restored.
+
+A related artifact dates the damage: a file literally named
+`docker-compose-infra.ymlnservices:` sits in `/volume1/docker` (Jun 12 20:21),
+containing the mosquitto service block — the fingerprint of a botched write
+where `\n` was never interpreted. `mosquitto.conf` was born 20:21:47 and
+truncated to one newline at 20:22:21, in the same operation.
+
+**Timeline correction (an early inference that was wrong):** the first read of
+this looked like "latent since Jun 12, detonated at the 2026-09-02 19:54 NAS
+reboot." HA history disproves it — `camera.front_door` was `recording` on
+2026-08-23 and stayed healthy until **2026-09-02 16:34:56 UTC (12:34 EDT)**,
+roughly 7 hours *before* the reboot. A zero-byte `home-assistant.log.fault` is
+stamped exactly `Sep 2 12:34`. **How the broker worked with an empty config
+before that was never established** — no mosquitto logs, no docker history
+access. Recorded as unknown rather than guessed.
+
+### The repair, and the IPv6 exposure it forced
+
+Reconstructed config (installed atomically, backup of the 1-byte original kept
+alongside at mode 0400):
+
+```
+listener 1883
+allow_anonymous true
+persistence true
+persistence_location /mosquitto/data/
+log_dest file /mosquitto/log/mosquitto.log
+log_dest stdout
+log_type error / warning / notice / information
+connection_messages true
+log_timestamp true
+```
+
+**⚠️ ANONYMOUS IS TEMPORARY.** Authentication was the preferred option and was
+rejected on scope, not principle: neither consumer holds MQTT credentials
+(Frigate's `mqtt` block has only host/port; HA's entry has only
+`broker`/`port`/`protocol`), so enabling auth requires editing Frigate's
+`config.yml` and **restarting Frigate** — explicitly out of scope for that
+phase. Auth on the broker alone would have locked out both clients and left the
+cameras down. The file header documents the migration.
+
+**Published port hardened from dual-stack to IPv4-only.** In
+`/volume1/docker/docker-compose-infra.yml`:
+
+```diff
+-      - "1883:1883"
++      - "0.0.0.0:1883:1883"
+```
+
+The NAS holds globally-routable IPv6 addresses (ISP-delegated; values
+withheld from this repo — confirm with `ip -6 addr show scope global` on the
+NAS) and docker-proxy was publishing 1883 on `[::]`. That
+was harmless only while the broker refused everyone; the moment it started
+accepting, it would have been an **anonymous broker on a public IPv6 address**.
+Edge IPv6 filtering could not be verified from inside the LAN and was therefore
+not assumed.
+
+Deliberately **not** pinned to `192.168.1.63:1883:1883` — a specific-IP publish
+can fail at boot if the interface isn't up yet, which would leave the broker
+down after a reboot. `0.0.0.0` removes the IPv6 exposure without that
+fragility; IPv4 stays behind NAT.
+
+Applied by the Boss with `docker compose ... up -d mosquitto --no-deps`.
+Verified after: `0.0.0.0:1883` only, **`[::]:1883` count 0**, one broker start
+line (no restart loop), HA connected as a p5 client, Frigate connected as
+`frigate (p2)`, `frigate/available` → `online` retained, topics flowing.
+**45/48 Frigate entities recovered immediately**; the three cameras did not,
+for the reasons below.
+
+### Fault 2 — Frigate HA integration v5.15.4 vs HA 2026.9.0
+
+The integration passed the deprecated `via_device` to
+`device_registry.async_get_or_create`. HA 2026.9 **raises** instead of warning:
+
+```
+ERROR [homeassistant.components.camera] Error adding entity None for domain camera with platform frigate
+RuntimeError: Detected code that calls `device_registry.async_get_or_create`
+with a deprecated `via_device` parameter; use `via_device_id` instead
+```
+
+Exactly two occurrences per boot, matching the two cameras carrying
+`restored: true` — `camera.front_door` and `camera.livingroom` were **never
+added**, only rehydrated as registry stubs. (`camera.entryway` *was* added; it
+was unavailable for a different reason — see below.)
+
+**HACS v5.15.5 fixes exactly this.** Release note: *"Fix HA 2026.9 device
+registry via_device compatibility" (#1116)*. Verified against upstream source
+before installing, not taken on the release title alone: 5.15.4 hardcodes
+`"via_device":` at **21** call sites; 5.15.5 replaces them with a
+version-branching helper in `__init__.py`:
+
+```python
+def get_frigate_via_device(hass, entry) -> DeviceInfo:
+    identifier = get_frigate_device_identifier(entry)
+    if "via_device_id" in DeviceInfo.__annotations__:
+        device = dr.async_get(hass).async_get_device({identifier})
+        if not device:
+            return {}
+        return {"via_device_id": device.id}     # HA 2026.9 path
+    return {"via_device": identifier}           # legacy path
+```
+
+Installed via the supported path only — `update.install` on
+`update.frigate_update`. No manual patching of `camera.py`, no `.storage`
+edits, no Frigate server changes.
+
+**A config-entry reload was deliberately NOT attempted.** Python keeps the old
+modules in `sys.modules`; reloading re-runs setup against the *old* in-memory
+code, which would have re-triggered the RuntimeError and risked the 45 entities
+that were already healthy, for zero benefit. HACS agreed — it raised repair
+issue `restart_required_311536795_tags/v5.15.5`. HA restart was requested and
+approved.
+
+**Result after restart:** zero `via_device` / `MissingIntegrationFrame` /
+`Error adding entity None` occurrences; **48/48 Frigate entities available**;
+all three cameras `recording` with `restored=None` — genuinely loaded entities.
+
+### ⚠️ HACS packaging quirk — do not chase the update badge
+
+Upstream's **v5.15.5 tag ships `manifest.json` declaring `"version": "5.15.4"`**
+— verified by fetching upstream's own manifest at that tag, so this is an
+upstream oversight and **not** a local install fault. HACS re-reads the manifest
+on restart, so it reverted its tracking to `version_installed: v5.15.4` and
+**will keep offering v5.15.5 as an available update, indefinitely**.
+
+The fixed code is installed and running: helper defined once, 20 call sites
+across 7 modules, and the only remaining literal `"via_device":` is the
+unreachable legacy fallback inside the helper. Zero RuntimeErrors proves it is
+live. **Do not repeatedly reinstall** — it re-downloads identical code and
+loops. Treat the badge as cosmetic; "skip this version" in HACS is available.
+Also: **do not use this integration's `manifest.json` as a version indicator.**
+
+### Entryway — self-recovered, root cause NOT established
+
+Entryway's Frigate stream had been failing for ~2.5 h: ffmpeg/go2rtc
+`Could not find codec parameters for stream 1 (Video: h264, none):
+unspecified size`, watchdog restarting every ~20 s, **4380** error lines,
+`camera_fps=0.0`. During that window `camera.entryway` was unavailable purely
+because of the integration's own logic (`camera.py`):
+
+```python
+if coordinator.data["cameras"][cam]["camera_fps"] == 0:
+    return False
+```
+
+It **self-recovered to ~5 fps at 22:22:02**, about 20 seconds before the HA
+restart. Nothing in this work fixed it, and **why it broke or why it healed was
+never determined.** It could regress.
+
+Immediately afterwards the *direct Tapo* entity
+`camera.entryway_door_hd_stream` went `unavailable` (it was `idle` before),
+with HA logging `Operation not permitted` opening
+`rtsp://…@192.168.1.5:554/stream1`. These `stream_worker` errors had **zero**
+occurrences in the pre-restart log.
+
+**Hypothesis, explicitly not a confirmed root cause:** a concurrent
+RTSP/session limit on that C201 now that Frigate/go2rtc holds a session.
+Livingroom and Front Door Tapo entities are unaffected, which is consistent but
+not proof. **Frigate's Entryway camera works — do not disturb it merely to
+restore the duplicate Tapo entity.**
+
+### Access boundary held
+
+Loki **could not** restart the Mosquitto container: not in the `docker` group,
+no NOPASSWD sudo for docker, and the NAS dispatcher has **no mosquitto verb**
+(its 22 actions cover Plex and Tracearr only). `kill -HUP` also refused — the
+broker runs as uid 1883. Both privileged steps (compose recreate, HA restart)
+were handed to the Boss with exact commands. That boundary is correct and
+should stay; no dispatcher verb was added.
+
+### Backup / rollback
+
+`/volume1/docker/.loki-backups/frigate-hass-integration-2026-09-02/` (dir mode
+0500, files 0400) — deliberately **outside** `custom_components/` so HA never
+tries to load it, and outside any git tree:
+
+- `frigate-v5.15.4.tar.gz` — 50 files, manifest `5.15.4`, sha256 `808e759e…`
+- `hacs-frigate-record.json` — version/commit tracking only, no secrets
+- `hacs.data.snapshot` — scanned for credential-shaped keys first; clean
+
+Rollback: remove `custom_components/frigate`, extract the tarball, restart HA.
+**Retain for now.**
+
+Also retained on the NAS: `mosquitto.conf.bak-2026-09-02_broken-1byte` (the
+original 1-byte file, sha256 `01ba4719…`) and
+`docker-compose-infra.yml.bak-2026-09-02_pre-mqtt-repair`.
+
+### Unrelated pre-existing items — seen, deliberately not touched
+
+`extended_openai_conversation` setup failure (`openai~=2.21.0` unresolvable),
+Immich `isFavorite` validation errors, `calendar.get_events` missing (the
+`google` config entry is in `setup_error`).
+
+---
+
 ## Security hardening — public control-plane exposure lockdown
 
 **DONE (Phase 2A) — 2026-08-14.** Follow-on to the qBittorrent compromise

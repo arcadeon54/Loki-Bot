@@ -5,9 +5,19 @@ convenience.
 
 ## Never
 
-- **No unrestricted NAS root.** Loki reaches the UGREEN NAS only through the
-  root-owned dispatcher `/usr/local/sbin/loki-nas-maint`, which exposes six
-  literal read-only actions. Never add a state-changing verb to it.
+- **No unrestricted NAS root.** Loki reaches privileged NAS operations only
+  through the root-owned dispatcher `/usr/local/sbin/loki-nas-maint`, whose
+  actions are enumerated literally in sudoers (no wildcards). **Corrected
+  2026-09-02:** it exposes **22** actions, not six, and six of them are
+  state-changing (`plex_restart`, `tracearr_apply_update`, `tracearr_backup`,
+  `tracearr_update_prepare`, `tracearr_rollback`, `tracearr_verify_update`) —
+  each already approval-gated on the Loki side. Never add a new
+  state-changing verb without the Boss's explicit sign-off.
+  Note also that `ssh nas-maint` **does** yield an interactive shell (UGOS's
+  global `ForceCommand` overrides per-key restrictions); containment is the
+  sudoers allowlist plus the fact that `unimatrix_001` is not in the `docker`
+  group and plain `sudo` needs a password. Earlier docs claiming "no shell"
+  were wrong.
 - **No unrestricted Docker socket.** No bind-mounting `/var/run/docker.sock`
   into anything Loki drives.
 - **No Docker-group shortcut.** Never add Loki (or `unimatrix_001`) to the
@@ -133,3 +143,28 @@ credential redaction; content-bearing tools set `redact_log`.
 **A missing `.env` must lock Loki down, not open it up.** `tools.user_level()`
 once treated an unset `OWNER_USER_ID` as a match, making any blank-id caller
 Boss. Fixed in `251807b` — never reintroduce an empty-string comparison there.
+
+
+## Open security item — anonymous MQTT (opened 2026-09-02)
+
+The Mosquitto broker on the NAS (`192.168.1.63`) currently runs
+**`allow_anonymous true`**. This is a **deliberate, temporary compatibility
+configuration** taken during the camera outage repair, not an oversight:
+neither consumer holds credentials, and adding them requires editing Frigate's
+`config.yml` and restarting Frigate, which was outside that phase's scope.
+Broker-only auth would have locked out both clients and left the cameras down.
+
+**What currently limits exposure is the publish binding, not authentication.**
+The port is published IPv4-only as `0.0.0.0:1883`; there is no `[::]:1883` host
+listener. This matters because the NAS holds globally-routable IPv6 addresses,
+and the previous bare `"1883:1883"` publish placed 1883 on `[::]` — edge IPv6
+filtering could not be verified from inside the LAN, so it was not assumed safe.
+
+**Do not revert the publish to `"1883:1883"`.** Doing so re-exposes an
+anonymous broker over public IPv6.
+
+**Closing this item** means: a `password_file` with a dedicated credential per
+client, `allow_anonymous false`, Frigate's `mqtt.user`/`mqtt.password` set
+(needs a Frigate restart), and Home Assistant updated through
+Settings → Devices & Services → MQTT → Configure — the supported reconfigure
+flow. **Never hand-edit HA's `.storage` to do this.**

@@ -116,11 +116,37 @@ service depends on it. Do **not** describe it as a SATA drive.
 |---|---|
 | Address | `192.168.1.63`, host `Unimatrix0001`, user `unimatrix_001` |
 | Access | SSH alias `nas-maint`, dedicated key, root-owned dispatcher only |
-| Dispatcher | `/usr/local/sbin/loki-nas-maint` — six literal read-only actions |
+| Dispatcher | `/usr/local/sbin/loki-nas-maint` — 22 literal actions, enumerated in sudoers |
 
-Loki has **no shell** on the NAS. Every operation goes through the dispatcher:
-`host_status`, `container_inventory`, `tracearr_status`,
-`tracearr_dependencies`, `tracearr_recent_logs`, `tracearr_update_check`.
+**Corrected 2026-09-02** (verified live during the camera outage repair). Two
+long-standing inaccuracies here:
+
+- It is **not** "six read-only actions". `sudo -n -l` lists **22** enumerated
+  NOPASSWD actions, and several are **state-changing**: `plex_restart`,
+  `tracearr_apply_update`, `tracearr_backup`, `tracearr_update_prepare`,
+  `tracearr_rollback`, `tracearr_verify_update`. The read-only ones are
+  `host_status`, `container_inventory`, `network_status`,
+  `network_tooling_check`, `network_speed_test`, `disk_status`, `plex_status`,
+  `plex_dependencies`, `plex_recent_logs`, `plex_transcode_processes`,
+  `tracearr_status`, `tracearr_dependencies`, `tracearr_recent_logs`,
+  `tracearr_update_check`, `tracearr_restart_forensics`,
+  `tracearr_exit_window_logs`.
+- Loki does **not** have "no shell" — `ssh nas-maint` yields a full interactive
+  bash shell as `unimatrix_001`. This is consistent with NAS trap 2 below and
+  with `nas_maint.py`'s own docstring: containment rests on the **sudoers
+  allowlist**, not on the shell or on SSH key options.
+
+What actually confines Loki: `unimatrix_001` is **not** in the `docker` group,
+and plain `sudo` requires a password. So the docker socket is unreachable
+(`permission denied`) and anything outside the NOPASSWD list needs the Boss.
+The sudoers file does also carry `(ALL : ALL) ALL` — full root **with a
+password** — which is a human affordance, not an agent one.
+
+**Practical consequence, hit for real on 2026-09-02:** there is **no dispatcher
+verb for mosquitto** (or for any container other than Plex/Tracearr), so Loki
+could not restart the broker it had just repaired. The compose recreate and the
+HA restart were both handed to the Boss. Correct outcome — do not add verbs to
+widen this.
 
 ### Tracearr stack
 
@@ -136,6 +162,64 @@ v1.5.0 → v2.0.1 was applied 2026-08-07 through Loki's own approval-gated
 see `CURRENT_HANDOFF.md`. Earlier docs blamed watchtower for this jump; that
 was a stale YAML comment, not evidence. Registry reconciled to match
 2026-08-09 — see `docs/agent-context/COMPLETED_WORK.md`.
+
+### Camera / NVR stack (documented 2026-09-02)
+
+Runs on the NAS, compose project `docker`, file
+`/volume1/docker/docker-compose-infra.yml`:
+
+| Component | Detail |
+|---|---|
+| `frigate` | `ghcr.io/blakeblackshear/frigate:stable`, **0.17.2**, privileged, API `192.168.1.63:5000` |
+| `mosquitto` | `eclipse-mosquitto:2.0` (2.0.22), publish **`0.0.0.0:1883`** (IPv4-only) |
+| `homeassistant` | compose project `homeassistant`, `192.168.1.63:8123`, HA **2026.9.0** |
+| go2rtc | inside the Frigate container; restreams on `127.0.0.1:8554` |
+
+Stream path: **Tapo camera → go2rtc restream → Frigate → MQTT → Home Assistant.**
+
+Cameras (all reachable, RTSP/554 open):
+
+| Frigate name | IP | Model |
+|---|---|---|
+| `entryway` | `192.168.1.5` | TP-Link Tapo C201 |
+| `livingroom` | `192.168.1.95` | TP-Link Tapo C201 |
+| `front_door` | `192.168.1.165` | TP-Link Tapo D225 doorbell |
+
+Key paths: `/volume1/docker/mosquitto/` (config, `data/`, `log/`),
+`/volume1/docker/frigate/`, `/volume1/docker/homeassistant/`.
+
+**Operational warnings:**
+
+- ⚠️ **MQTT is anonymous — TEMPORARY.** `allow_anonymous true`. Exposure is
+  limited by the IPv4-only publish, **not** by authentication. Migration is top
+  of the security queue.
+- ⚠️ **Never leave 1883 published dual-stack.** The NAS has globally-routable
+  IPv6 (ISP-delegated; check `ip -6 addr show scope global` — addresses are
+  deliberately not recorded here); a bare `"1883:1883"` publishes on `[::]` too
+  and would expose an anonymous broker to the WAN. Keep the explicit `0.0.0.0:` prefix. Do **not** pin it to
+  `192.168.1.63:` — a specific-IP publish can fail at boot before the interface
+  is up.
+- ⚠️ **An empty `mosquitto.conf` silently breaks everything.**
+  `eclipse-mosquitto:2.0` with no `listener` binds loopback-only *inside the
+  container* and refuses anonymous clients. `ss` on the host still shows
+  `0.0.0.0:1883` — that is docker-proxy, not proof the broker is serving.
+- ⚠️ **The HA `mqtt` / `frigate` config entries are titled `192.168.1.247`** —
+  a stale cosmetic label from the decommissioned ASUS box. Their actual `data`
+  correctly points at `192.168.1.63`. Do not "fix" the titles; never read a
+  config-entry title as configuration.
+- ⚠️ **Frigate HA integration: do not trust `manifest.json` for version.**
+  Upstream's v5.15.5 ships it declaring `5.15.4`, so HACS offers the update
+  perpetually. See `COMPLETED_WORK.md`.
+- Frigate entity availability is **derived from MQTT** — a broker outage marks
+  every Frigate entity `unavailable` at once. Camera entities additionally go
+  unavailable when `camera_fps == 0`.
+- **Unresolved:** `entryway` has a history of ffmpeg/go2rtc failure
+  (`Could not find codec parameters … unspecified size`) that self-recovered on
+  2026-09-02 with no established root cause. The duplicate Tapo entity
+  `camera.entryway_door_hd_stream` is currently `unavailable`
+  (`Operation not permitted` on direct RTSP) — suspected concurrent-session
+  limit, **unconfirmed**. Do not disturb Frigate's working Entryway feed to
+  chase it.
 
 ### Two NAS traps
 
