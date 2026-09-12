@@ -1,8 +1,23 @@
 # CURRENT HANDOFF
 
-*Updated 2026-09-02. Keep this under a minute to read.*
+*Updated 2026-09-11. Keep this under a minute to read.*
 
 ## Just completed
+
+**Loki can mint IVN invitations, and all IVN invitations now expire within 24
+hours — 2026-09-11.** `create_ivn_invite` (owner-only) calls a new private
+admin API on `ivn-join`, published Tailscale-only on **5692** alongside the
+public gateway on 5691; `/internal/*` 404s on the public port. The 24-hour
+maximum is a literal in `app/config.py`, re-checked at DB insert, and an
+over-long request is refused without writing a row. IVN tests 262 -> 383; Loki
++52 (934 total, same 8 pre-existing failures). Deployed and verified live.
+Full detail in `COMPLETED_WORK.md`; operator docs in the Joplin note
+*IVN Media Access — Architecture & Operations*.
+
+**Note:** `/home/razr/ivn-join` is **not** a git repo — rollback is the
+`*.bak-20260911-232719-pre-internal-api` files beside each source file.
+
+## Previously completed
 
 **Home Assistant camera outage — root-caused and repaired end to end, 2026-09-02
 (evening EDT; UTC timestamps fall on 2026-09-03).** All three Frigate camera

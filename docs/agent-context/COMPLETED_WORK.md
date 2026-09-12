@@ -7,6 +7,57 @@ Legend: **DONE** · **PARTIAL** · **UNFINISHED** · **OBSOLETE/HISTORICAL**
 
 ---
 
+## IVN invitations from Loki — private admin API + 24-hour hard maximum
+
+**DONE — 2026-09-11.** Loki can now mint IVN Media Access short-code
+invitations from Discord or Telegram, owner-only, and every IVN invitation
+everywhere now expires within 24 hours.
+
+### Final verified state
+
+| | |
+|---|---|
+| Loki tool | `create_ivn_invite` in `assistant_tools.py`, permission `boss` |
+| Transport | `POST http://100.87.97.120:5692/internal/v1/invitations` (Tailscale) |
+| New listener | `ivn-join` binds 5691 (public) **and** 5692 (private admin) |
+| Ceiling | `MAX_INVITE_HOURS = 24`, a literal in `app/config.py`; config can only shorten |
+| IVN tests | 383 passing (was 262) |
+| Loki tests | 934 total, +52 new; the 8 pre-existing failures unchanged |
+
+### What was built
+
+- **`app/internal_api.py` (new on razr)** holds `mint_invitation()` — the single
+  invitation-creation service. `admin.py new` and the private API both call it,
+  so the CLI and Loki cannot drift on duration or library policy.
+- **24-hour ceiling in three layers**: `resolve_invite_hours()` validates,
+  `app/db.py` re-checks at insert (so no path can persist a longer row), and
+  Loki refuses >24 locally before any request is sent. Out-of-range is
+  **refused, never clamped** — no row is written.
+- **Listener isolation** decided from the accepted connection's local port
+  (`environ["gunicorn.socket"].getsockname()`), not `SERVER_PORT`. Verified
+  empirically against gunicorn 23.0.0 including `Host`-header spoofing. When
+  the listener is undeterminable the request is treated as *not* internal.
+- **Bearer credential** (CSPRNG, `secrets.compare_digest`) in both `.env` files
+  as `IVN_INTERNAL_API_TOKEN`. An empty token makes the API refuse everything
+  rather than run open.
+
+### Verified live
+
+A 1-hour API-minted code was accepted at https://join.ivn-group.cc through to
+the service-choice page, then soft-revoked; minting created **zero** Wizarr
+invitations. A 25-hour request was refused with no row written. A non-owner
+request was denied without reaching the gateway. `/internal/*` returns 404 on
+5691 (with a valid credential, and with a spoofed `Host: internal:5692`).
+
+### Watch out
+
+- **`/home/razr/ivn-join` is not a git repo.** Rollback is the
+  `*.bak-20260911-232719-pre-internal-api` copies beside each file.
+- The gunicorn bind is overridden in `docker-compose.yml` (`command:`), not the
+  Dockerfile — a Dockerfile `CMD` edit alone will not change the listeners.
+
+---
+
 ## MQTT authentication migration — anonymous → authenticated-only
 
 **DONE — 2026-09-03.** Closes the temporary anonymous-MQTT security item opened

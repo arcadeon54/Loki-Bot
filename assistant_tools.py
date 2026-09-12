@@ -22,6 +22,7 @@ Tools:
     home_status       Home Assistant entity states matching a query
     home_control      natural-language Home Assistant command
     work_hours        work-session report (the 90-min tracker)
+    create_ivn_invite IVN Media Access short-code invitation (owner only)
 
 Import this module once at startup (after tools); registration is a side
 effect, mirroring how tools.py self-registers.
@@ -29,7 +30,10 @@ effect, mirroring how tools.py self-registers.
 
 import json
 import logging
+import os
 import re
+
+import aiohttp
 
 from tools import ToolSpec, ToolContext, register
 
@@ -479,6 +483,123 @@ async def _work_hours(args: dict, ctx: ToolContext) -> str:
     return work_tracker.report(days)
 
 
+# ─── IVN Media Access ────────────────────────────────────────────────────────
+# Minting an invitation is a request to the IVN gateway on razr, over Tailscale,
+# against a private listener that is not reachable from the LAN or the internet.
+# Loki is only a caller: it never talks to Wizarr, never touches ivn.db, and
+# never runs anything over SSH or a Docker socket. The gateway stays the sole
+# authority on who gets access to what.
+
+IVN_API_URL = os.getenv("IVN_INTERNAL_API_URL", "").rstrip("/")
+IVN_API_TOKEN = os.getenv("IVN_INTERNAL_API_TOKEN", "")
+
+# Policy, restated here so an over-long request is refused before it becomes a
+# network call. The gateway enforces the same ceiling independently -- this copy
+# is a courtesy to the Boss, NOT the security boundary.
+IVN_MAX_HOURS = 24
+IVN_DEFAULT_HOURS = 24
+
+# Conversational callers do not choose library profiles. Anything beyond the
+# standard set is an owner decision made at the gateway, not in chat.
+IVN_PROFILE = "standard"
+
+IVN_OVER_LIMIT = f"IVN invitations can be created for up to {IVN_MAX_HOURS} hours."
+IVN_FAILED = "I couldn't create the IVN invitation."
+
+
+def _ivn_hours(raw) -> tuple[int | None, str]:
+    """(hours, error). Absent means the default; anything else must be 1..24."""
+    if raw is None or raw == "":
+        return IVN_DEFAULT_HOURS, ""
+    try:
+        hours = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, "Tell me the invitation length in whole hours (1-24)."
+    if hours > IVN_MAX_HOURS:
+        return None, IVN_OVER_LIMIT
+    if hours < 1:
+        return None, "An IVN invitation has to last at least an hour."
+    return hours, ""
+
+
+async def _create_ivn_invite(args: dict, ctx: ToolContext) -> str:
+    hours, err = _ivn_hours(args.get("hours"))
+    if err:
+        # Refused locally: no request is sent, so no invitation can exist.
+        return err
+    if not (IVN_API_URL and IVN_API_TOKEN):
+        log.error("create_ivn_invite: IVN_INTERNAL_API_URL/TOKEN not configured")
+        return IVN_FAILED
+
+    label = str(args.get("label") or "").strip()[:120]
+    payload = {"hours": hours, "profile": IVN_PROFILE, "label": label or None}
+
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{IVN_API_URL}/internal/v1/invitations",
+                json=payload,
+                headers={"Authorization": f"Bearer {IVN_API_TOKEN}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                status = r.status
+                body = await r.text()
+    except aiohttp.ServerTimeoutError:
+        return _ivn_timeout()
+    except TimeoutError:
+        return _ivn_timeout()
+    except aiohttp.ClientError as e:
+        # Refused, DNS, TLS, disconnected mid-body -- all indistinguishable to
+        # the Boss and all equally "it didn't happen".
+        log.error(f"create_ivn_invite: gateway unreachable ({type(e).__name__})")
+        return IVN_FAILED
+
+    if status in (401, 403):
+        log.error(f"create_ivn_invite: gateway rejected Loki's credential (HTTP {status})")
+        return IVN_FAILED
+    if status >= 500:
+        log.error(f"create_ivn_invite: gateway error HTTP {status}")
+        return IVN_FAILED
+
+    try:
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except (ValueError, TypeError):
+        log.error(f"create_ivn_invite: unparseable gateway response (HTTP {status})")
+        return IVN_FAILED
+
+    if status >= 400:
+        # The gateway is the authority on its own policy; surface its reason
+        # only when it is the 24-hour rule, which the Boss can act on.
+        reason = str(data.get("error") or "")
+        log.error(f"create_ivn_invite: gateway refused (HTTP {status}): {reason[:200]}")
+        if data.get("max_hours"):
+            return IVN_OVER_LIMIT
+        return IVN_FAILED
+
+    code = str(data.get("code") or "").strip()
+    if not code:
+        log.error("create_ivn_invite: gateway returned no code")
+        return IVN_FAILED
+
+    shown = data.get("expires_in_hours") or hours
+    return ("IVN Invite\n\n"
+            f"Code: {code}\n"
+            f"Access: {data.get('access') or 'Standard'}\n"
+            f"Expires: {shown}h\n"
+            f"Portal: {data.get('portal') or ''}").rstrip()
+
+
+def _ivn_timeout() -> str:
+    """A timed-out request is AMBIGUOUS: the gateway may already have minted a
+    code we never saw. Retrying would risk a second live invitation, so we stop
+    and say so -- `admin.py list` on razr settles it."""
+    log.error("create_ivn_invite: gateway timed out; NOT retrying (may have been created)")
+    return (f"{IVN_FAILED} The gateway stopped responding, so I can't tell "
+            "whether a code was created — worth checking before trying again.")
+
+
 # ─── Registration ────────────────────────────────────────────────────────────
 
 register(ToolSpec(
@@ -738,4 +859,36 @@ register(ToolSpec(
     handler=_work_hours, permission="boss",
 ))
 
-log.info("Assistant tools registered (memory, notes, home, work)")
+register(ToolSpec(
+    name="create_ivn_invite",
+    description=("Create an IVN Media Access invitation code for the Boss to "
+                 "hand out (Plex/Jellyfin via join.ivn-group.cc). Use for "
+                 "'IVN invite', 'create an IVN invite', 'generate an IVN code', "
+                 "'IVN invite for 6 hours', 'IVN invite for Sarah'. A recipient "
+                 "name is NOT required — call this with no arguments for the "
+                 "normal case. Invitations last at most 24 hours; if the Boss "
+                 "asks for longer, pass the number he actually said and let "
+                 "this tool answer — never silently shorten it to 24, and "
+                 "never invent a label saying you capped it."),
+    parameters={
+        "type": "object",
+        "properties": {
+            "hours": {"type": "integer",
+                      "description": "How long the code stays valid. Omit for "
+                                     "the standard 24 hours. Pass exactly what "
+                                     "the Boss asked for, even if it is more "
+                                     "than 24 — the tool reports the limit."},
+            "label": {"type": "string",
+                      "description": "Optional administrative note, e.g. the "
+                                     "recipient's name if the Boss gave one. "
+                                     "Never required."},
+        },
+    },
+    # boss: the registry hides this tool from everyone else and execute()
+    # re-checks before running it. Telegram reaches it as the paired owner.
+    handler=_create_ivn_invite, permission="boss", timeout=20,
+    # The result carries a live invitation code; keep it out of tool_calls.jsonl.
+    redact_log=True,
+))
+
+log.info("Assistant tools registered (memory, notes, home, work, IVN)")
